@@ -2,6 +2,12 @@
 !.gitignore
 !build-mingw.sh
 !build-msvc.bat
+!README.md
+!README.en.md
+!LICENSE
+!docs/
+docs/*
+!docs/screenshot.png
 !src/
 src/*
 !src/time_tracker.cpp
