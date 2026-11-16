@@ -52,7 +52,8 @@ enum : int {
     CMD_POMODORO_TOGGLE = 126, CMD_POMODORO_PAUSE = 127, CMD_POMODORO_SKIP = 128,
     CMD_POMODORO_ABANDON = 129, CMD_MINI = 130, CMD_POMODORO_SETTINGS = 131, CMD_TOPMOST = 132,
     CMD_AUTOSTART = 133, CMD_POMODORO_START = 134, CMD_SOUND = 135, CMD_POMODORO_ON = 136,
-    CMD_POMODORO_OFF = 137,
+    CMD_POMODORO_OFF = 137, CMD_EXIT = 138, CMD_SHOW = 139, CMD_CLOSE_TO_TRAY = 140, CMD_CALENDAR = 141,
+    CMD_CLOSE = 142,                  // same as the close button
     CMD_TAG_FIRST = 0x1000,           // + tag index: start, switch to, or stop that tag
     CMD_EDIT_TAG_FIRST = 0x2000,      // + tag index: edit that tag
     CMD_EDIT_RECORD_FIRST = 0x3000,   // + row of the record list (newest first)
@@ -64,9 +65,11 @@ constexpr UINT WM_DL_QUERY = WM_APP + 0x40;
 enum : int { Q_TAGS = 0, Q_RECORDS = 1, Q_ACTIVE = 2, Q_READONLY = 3, Q_IS_TODAY = 4,
              Q_SAVE_FAILED = 5, Q_DARK = 6, Q_SELECTED_TAG = 7, Q_LOADED = 8, Q_POMODORO_MODE = 9,
              Q_POMODORO_PHASE = 10, Q_POMODORO_PAUSED = 11, Q_POMODORO_REMAINING = 12,
-             Q_POMODOROS_TODAY = 13, Q_MINI = 14, Q_REST_TAG = 15, Q_TOPMOST = 16 };
+             Q_POMODOROS_TODAY = 13, Q_MINI = 14, Q_REST_TAG = 15, Q_TOPMOST = 16, Q_TRAY = 17,
+             Q_CALENDAR = 18 };
 constexpr UINT WM_DL_LOAD = WM_APP + 1;
 constexpr UINT WM_DL_ACTIVATE = WM_APP + 2;
+constexpr UINT WM_DL_TRAY = WM_APP + 3;       // notification-area icon callback
 
 // Tag dialog (class DayLedgerTagEditor). Post WM_COMMAND with these ids to drive it.
 enum : int { TD_NAME = 201, TD_CUSTOM_COLOR = 203, TD_DELETE = 204, TD_CATEGORY_FIRST = 211,
@@ -84,7 +87,8 @@ enum HitKind : int {
     HK_RECORD_SCROLL, HK_PREV, HK_NEXT, HK_TODAY, HK_THEME, HK_MENU, HK_STOP, HK_RESUME,
     HK_NEW_TAG, HK_ADD_RECORD, HK_WEEK_DAY, HK_SEGMENT, HK_TOAST_ACTION, HK_RETRY, HK_NOW,
     HK_STATUS, HK_MODE_FREE, HK_MODE_POMODORO, HK_POMO_START, HK_POMO_PAUSE, HK_POMO_RESUME,
-    HK_POMO_SKIP, HK_POMO_ABANDON, HK_POMO_SETTINGS, HK_MINI, HK_MINI_EXPAND, HK_DIALOG,
+    HK_POMO_SKIP, HK_POMO_ABANDON, HK_POMO_SETTINGS, HK_MINI, HK_MINI_EXPAND, HK_DATE, HK_CAL_PREV,
+    HK_CAL_NEXT, HK_CAL_DAY, HK_CAL_TODAY, HK_DIALOG,
 };
 
 enum ToastKind : int { TOAST_PLAIN, TOAST_UNDO, TOAST_START_FOCUS };
@@ -114,7 +118,7 @@ struct RecordRow {
 
 struct WeekDay { long long day; tracker::DayStats stats; };
 
-struct Layout { RECT tagsList{}, recordsList{}, main{}; };
+struct Layout { RECT tagsList{}, recordsList{}, main{}, date{}; };
 
 struct Undo {
     bool valid = false, active = false;
@@ -164,6 +168,19 @@ struct App {
     std::vector<Hit> miniHits;
     int miniHot = 0, miniPressed = 0;
     POINT miniCursor{}, miniOrigin{};
+    // notification area
+    bool trayAdded = false, trayV4 = false, closeToTray = true, trayHintShown = false;
+    UINT taskbarCreated = 0;
+    HICON trayIcon = nullptr;           // generated status icon (owned)
+    std::wstring trayKey, trayTip;
+    // date picker
+    HWND calendar = nullptr;
+    long long calendarMonth = 0;
+    std::vector<Hit> calendarHits;
+    int calendarHot = 0, calendarPressed = 0;
+    bool calendarTracking = false;
+    DWORD calendarClosedAt = 0;
+    Surface calendarSurface;
     // window
     Surface surface;
     HACCEL accel = nullptr;
@@ -431,6 +448,8 @@ void LoadSettings() {
     app.pomodoroMode = ReadSetting(L"pomodoro", L"mode", 0) != 0;
     app.soundOn = ReadSetting(L"pomodoro", L"sound", 1) != 0;
     app.topmost = ReadSetting(L"window", L"topmost", 0) != 0;
+    app.closeToTray = ReadSetting(L"window", L"closeToTray", 1) != 0;
+    app.trayHintShown = ReadSetting(L"window", L"trayHint", 0) != 0;
     auto& config = app.pomodoro.config;
     config.focus = std::clamp(ReadSetting(L"pomodoro", L"focus", 25), 1, 180) * app.secondsPerMinute;
     config.shortBreak = std::clamp(ReadSetting(L"pomodoro", L"short", 5), 1, 60) * app.secondsPerMinute;
@@ -473,6 +492,9 @@ void ShowToast(const std::wstring& text, int kind = TOAST_PLAIN, int seconds = 5
 int LastWorkTag();
 int NextFocusTag();
 bool PomodoroCard();
+void TrayUpdate(bool add = false);
+void ExitApp(HWND window);
+void ToggleCalendar();
 
 bool Persist(bool notify) {
     if (app.readOnly) return false;
@@ -623,6 +645,7 @@ void Refresh() {
     }
     if (app.selectedTagId && !model.findTag(app.selectedTagId)) app.selectedTagId = 0;
     UpdateTitle();
+    TrayUpdate();
     InvalidateRect(app.hwnd, nullptr, FALSE);
 }
 
@@ -1007,7 +1030,7 @@ void PaintTimer(Ctx& x, const RECT& r) {
     else PaintFreeTimer(x, r, top, statusRight);
 }
 
-void PaintTagRow(Ctx& x, const RECT& row, int index) {
+void PaintTagRow(Ctx& x, const RECT& row, int index, long long maxSeconds) {
     auto& c = x.c;
     const auto& tag = app.model.tags[static_cast<std::size_t>(index)];
     const bool active = tag.id == app.model.activeTagId;
@@ -1034,15 +1057,20 @@ void PaintTagRow(Ctx& x, const RECT& row, int index) {
     const int editW = hot && !app.readOnly ? S(34) : 0;
     const int durationRight = inner.right - S(12) - editW;
     const int textLeft = inner.left + S(48), textRight = durationRight - S(78);
-    c.Text(tag.name, RECT{textLeft, inner.top + S(6), textRight, inner.top + S(27)},
+    c.Text(tag.name, RECT{textLeft, inner.top + S(4), textRight, inner.top + S(25)},
            active ? x.f.bodyBold : x.f.body, x.p.text);
     std::wstring sub = CategoryName(tag.category);
     if (index < 9) sub += Format(L"  ·  按 %d", index + 1);
     const auto tomatoes = app.today.pomodorosByTag.find(tag.id);
     if (tomatoes != app.today.pomodorosByTag.end()) sub += Format(L"  ·  %d 个番茄", tomatoes->second);
-    c.Text(sub, RECT{textLeft, inner.top + S(26), textRight, inner.top + S(44)}, x.f.caption, x.p.text3);
+    c.Text(sub, RECT{textLeft, inner.top + S(24), textRight, inner.top + S(41)}, x.f.caption, x.p.text3);
     const auto found = app.today.byTag.find(tag.id);
     const long long seconds = found == app.today.byTag.end() ? 0 : found->second;
+    if (seconds > 0 && maxSeconds > 0) {        // today's share, relative to the busiest tag
+        const float barLeft = float(textLeft), full = float(inner.right - S(12) - textLeft);
+        const float barW = std::max(Sf(4), full * static_cast<float>(seconds) / static_cast<float>(maxSeconds));
+        c.Round(barLeft, float(inner.bottom - S(7)), barW, Sf(3), Sf(1.5f), tag.color, 220);
+    }
     c.Text(seconds > 0 ? DurationText(seconds) : L"—", RECT{textRight, inner.top, durationRight, inner.bottom},
            active ? x.f.bodyBold : x.f.label, active ? x.p.text : seconds > 0 ? x.p.text2 : x.p.text3,
            DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
@@ -1073,12 +1101,14 @@ void PaintTags(Ctx& x, const RECT& r) {
                list.top + S(64)}, x.f.label, x.p.text3, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         return;
     }
+    long long busiest = 0;
+    for (const auto& entry : app.today.byTag) busiest = std::max(busiest, entry.second);
     c.PushClip(list);
     for (int i = 0; i < count; ++i) {
         const RECT row{list.left, list.top + i * rowH - app.tagScroll, list.right,
                        list.top + (i + 1) * rowH - app.tagScroll};
         if (row.bottom < list.top || row.top > list.bottom) continue;
-        PaintTagRow(x, row, i);
+        PaintTagRow(x, row, i, busiest);
     }
     c.PopClip();
     PaintScrollbar(x, list, app.tagContent, app.tagScroll, HK_TAG_SCROLL);
@@ -1121,9 +1151,18 @@ void PaintHeader(Ctx& x, const RECT& r) {
     const bool isToday = app.chosenDay == x.today;
     const std::wstring title = DateTitle(app.chosenDay);
     const int titleW = c.Measure(title, x.f.heading).cx;
-    c.Text(title, RECT{r.left, r.top, r.left + titleW + 4, r.bottom}, x.f.heading, x.p.text);
     const std::wstring relative = RelativeDay(app.chosenDay, x.today);
     const int pillW = c.Measure(relative, x.f.labelBold).cx + S(18);
+    // The date opens the date picker; it highlights like a button.
+    const RECT date{r.left - S(10), r.top + S(1), r.left + titleW + S(12) + pillW + S(32), r.bottom - S(1)};
+    const int dateId = Hid(HK_DATE);
+    if (app.calendar) c.Round(date, Sf(10), x.p.pressed);
+    else if (app.hot == dateId) c.Round(date, Sf(10), app.pressed == dateId ? x.p.pressed : x.p.hover);
+    Hot(x, date, dateId, L"选择日期");
+    app.layout.date = date;
+    c.Text(title, RECT{r.left, r.top, r.left + titleW + 4, r.bottom}, x.f.heading, x.p.text);
+    PaintIcon(c, app.calendar ? Icon::ChevronUp : Icon::ChevronDown, float(date.right - S(16)),
+              (r.top + r.bottom) / 2.0f, Sf(15), app.hot == dateId || app.calendar ? x.p.text : x.p.text2);
     const RECT pill{r.left + titleW + S(12), (r.top + r.bottom) / 2 - S(12), r.left + titleW + S(12) + pillW,
                     (r.top + r.bottom) / 2 + S(12)};
     c.Round(pill, Sf(12), isToday ? x.p.accentSoft : x.p.track);
@@ -1250,6 +1289,12 @@ void PaintTimeline(Ctx& x, const RECT& r) {
     const RECT track{r.left + S(20), r.top + S(52), r.right - S(20), r.top + S(52) + S(28)};
     const double width = Wd(track);
     c.Round(track, Sf(6), x.p.track);
+    const int step = width >= S(700) ? 2 : (width >= S(420) ? 3 : 6);
+    for (int h = step; h < 24; h += step) {          // hour grid inside the track
+        const float px = static_cast<float>(track.left + width * h / 24.0);
+        c.Fill(px - Sf(0.5f), float(track.top + S(5)), Sf(1), float(Ht(track) - S(10)),
+               Mix(x.p.track, x.p.text3, x.p.dark ? 0.25 : 0.18));
+    }
     auto xOf = [&](long long t) {
         return static_cast<float>(track.left + width * std::clamp((t - dayStart) / span, 0.0, 1.0));
     };
@@ -1276,7 +1321,6 @@ void PaintTimeline(Ctx& x, const RECT& r) {
         Hot(x, RECT{int(x1), track.top - S(2), std::max(int(x2), int(x1) + S(6)), track.bottom + S(2)},
             Hid(HK_SEGMENT, i), tip);
     }
-    const int step = width >= S(700) ? 2 : (width >= S(420) ? 3 : 6);
     for (int h = 0; h <= 24; h += step) {
         const float px = static_cast<float>(track.left + width * h / 24.0);
         c.Fill(px - Sf(0.5f), float(track.bottom + S(4)), Sf(1), Sf(4), x.p.borderStrong);
@@ -2276,7 +2320,7 @@ public:
     bool autoNext = false, sound = true;
 
 protected:
-    int Height() override { return 398; }
+    int Height() override { return 384; }
     void Build() override {
         for (int i = 0; i < 4; ++i) {
             edits_[i] = MakeEdit(PD_FOCUS + i, std::to_wstring(values[i]), nullptr, 3, true);
@@ -2316,14 +2360,14 @@ protected:
                    p.text3, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
         }
         if (!error_.empty()) {
-            PaintIcon(c, Icon::Alert, Sf(31), Sf(229), Sf(13), p.danger);
-            c.Text(error_, RECT{S(42), S(220), S(Width() - 24), S(238)}, fonts_.label, p.danger);
+            PaintIcon(c, Icon::Alert, Sf(31), Sf(191), Sf(13), p.danger);
+            c.Text(error_, RECT{S(42), S(182), S(Width() - 24), S(200)}, fonts_.label, p.danger);
         }
         const wchar_t* toggles[] = {L"休息结束后自动开始下一个番茄", L"提示音（专注结束、休息结束时）"};
         const bool states[] = {autoNext, sound};
         for (int i = 0; i < 2; ++i) {
             const int id = PD_AUTO + i;
-            const RECT row{S(16), S(246 + i * 40), S(Width() - 16), S(246 + i * 40 + 36)};
+            const RECT row{S(16), S(210 + i * 40), S(Width() - 16), S(210 + i * 40 + 36)};
             const bool hot = hot_ == id;
             if (hot) c.Round(row, Sf(8), p.hover);
             c.Text(toggles[i], RECT{row.left + S(8), row.top, row.right - S(64), row.bottom}, fonts_.body, p.text);
@@ -2417,6 +2461,159 @@ void ResumeTimer() {
     if (id && !app.model.activeTagId) ToggleTag(id);
 }
 
+// ---------------------------------------------------------------- notification area
+
+// The tray icon: the app logo, with a dot in the colour of whatever is being timed.
+HICON MakeTrayIcon(int size, COLORREF badge) {
+    Gdiplus::Bitmap bitmap(size, size, PixelFormat32bppARGB);
+    {
+        Gdiplus::Graphics g(&bitmap);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+        const float w = static_cast<float>(size);
+        Gdiplus::GraphicsPath body;
+        AddRound(body, 0, 0, w, w, w * 0.26f, w * 0.26f, w * 0.26f, w * 0.26f);
+        Gdiplus::LinearGradientBrush gradient(Gdiplus::PointF(0, 0), Gdiplus::PointF(w, w),
+                                              Gp(RGB(84, 104, 255)), Gp(RGB(139, 92, 246)));
+        g.FillPath(&gradient, &body);
+        const float r = w * 0.27f, line = std::max(1.4f, w * 0.1f), c = w * 0.43f;
+        Gdiplus::Pen white(Gdiplus::Color(255, 255, 255, 255), line);
+        white.SetStartCap(Gdiplus::LineCapRound);
+        white.SetEndCap(Gdiplus::LineCapRound);
+        g.DrawArc(&white, c - r, c - r, 2 * r, 2 * r, 0.0f, 360.0f);
+        if (size >= 24) {
+            g.DrawLine(&white, c, c, c, c - r * 0.55f);
+            g.DrawLine(&white, c, c, c + r * 0.45f, c + r * 0.15f);
+        }
+        const float br = w * 0.25f, bx = w - br - w * 0.02f, by = w - br - w * 0.02f;
+        Gdiplus::SolidBrush ring(Gdiplus::Color(255, 255, 255, 255));
+        g.FillEllipse(&ring, bx - br - w * 0.06f, by - br - w * 0.06f, 2 * (br + w * 0.06f), 2 * (br + w * 0.06f));
+        Gdiplus::SolidBrush dot(Gp(badge));
+        g.FillEllipse(&dot, bx - br, by - br, 2 * br, 2 * br);
+    }
+    HICON icon = nullptr;
+    bitmap.GetHICON(&icon);
+    return icon;
+}
+
+// What the tray shows: the status line for the tooltip and, when timing, the badge colour.
+std::wstring TrayStatus(COLORREF& badge, bool& timing) {
+    using tracker::PomodoroPhase;
+    const auto& model = app.model;
+    const auto& p = app.pomodoro;
+    const long long now = Now();
+    timing = false;
+    if (PomodoroCard() && p.phase != PomodoroPhase::Ready) {
+        const long long left = (p.remainingAt(now) + 59) / 60;
+        const auto* tag = model.findTag(p.phase == PomodoroPhase::Break ? p.restTag : p.focusTag);
+        badge = p.paused ? RGB(0xed, 0xa1, 0x00) : tag ? tag->color : tracker::Pomodoro::restColor;
+        timing = true;
+        if (p.paused) return Format(L"已暂停 · 剩 %lld 分", left);
+        if (p.phase == PomodoroPhase::Break) return Format(L"休息中 · 剩 %lld 分", left);
+        return L"专注中：" + (tag ? tag->name : std::wstring()) + Format(L" · 剩 %lld 分", left);
+    }
+    if (const auto* tag = model.findTag(model.activeTagId)) {
+        const long long elapsed = std::max(0LL, now - model.activeSince);
+        badge = tag->color;
+        timing = true;
+        return L"正在记录：" + tag->name + Format(L" · %lld:%02lld", elapsed / 3600, elapsed / 60 % 60);
+    }
+    return L"未在计时";
+}
+
+void TrayFill(NOTIFYICONDATAW& data) {
+    data.cbSize = sizeof(data);
+    data.hWnd = app.hwnd;
+    data.uID = 1;
+}
+
+// Adds the icon, or refreshes its picture and tooltip when the timing state changed.
+void TrayUpdate(bool add) {
+    if (!app.hwnd || (!add && !app.trayAdded)) return;
+    COLORREF badge = 0;
+    bool timing = false;
+    const std::wstring status = TrayStatus(badge, timing);
+    const std::wstring key = timing ? Format(L"%06x", static_cast<unsigned>(badge)) : L"idle";
+    const std::wstring tip = L"时光账本\n" + status;
+    if (!add && key == app.trayKey && tip == app.trayTip) return;
+    NOTIFYICONDATAW data{};
+    TrayFill(data);
+    data.uFlags = NIF_TIP | NIF_SHOWTIP;
+    lstrcpynW(data.szTip, tip.c_str(), ARRAYSIZE(data.szTip));
+    if (add || key != app.trayKey) {
+        HICON next = nullptr;
+        if (timing) next = MakeTrayIcon(GetSystemMetrics(SM_CXSMICON), badge);
+        data.uFlags |= NIF_ICON;
+        data.hIcon = next ? next : app.iconSmall;
+        if (add) {
+            data.uFlags |= NIF_MESSAGE;
+            data.uCallbackMessage = WM_DL_TRAY;
+        }
+        const BOOL done = Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &data);
+        if (add) {
+            app.trayAdded = done != FALSE;
+            if (app.trayAdded) {
+                data.uVersion = NOTIFYICON_VERSION_4;
+                app.trayV4 = Shell_NotifyIconW(NIM_SETVERSION, &data) != FALSE;
+            }
+        }
+        if (app.trayIcon) DestroyIcon(app.trayIcon);
+        app.trayIcon = next;
+        app.trayKey = key;
+    } else {
+        Shell_NotifyIconW(NIM_MODIFY, &data);
+    }
+    app.trayTip = tip;
+}
+
+void TrayRemove() {
+    if (app.trayAdded) {
+        NOTIFYICONDATAW data{};
+        TrayFill(data);
+        Shell_NotifyIconW(NIM_DELETE, &data);
+    }
+    app.trayAdded = false;
+    if (app.trayIcon) DestroyIcon(app.trayIcon);
+    app.trayIcon = nullptr;
+    app.trayKey.clear();
+}
+
+// A notification from the tray icon (Windows 10/11 show it as a toast).
+void TrayBalloon(const std::wstring& title, const std::wstring& text) {
+    if (!app.trayAdded) return;
+    NOTIFYICONDATAW data{};
+    TrayFill(data);
+    data.uFlags = NIF_INFO;
+    lstrcpynW(data.szInfoTitle, title.c_str(), ARRAYSIZE(data.szInfoTitle));
+    lstrcpynW(data.szInfo, text.c_str(), ARRAYSIZE(data.szInfo));
+    data.dwInfoFlags = NIIF_INFO | NIIF_RESPECT_QUIET_TIME;
+    Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
+bool WindowHidden() { return !IsWindowVisible(app.hwnd); }
+
+void ShowMain() {
+    if (!IsWindowVisible(app.hwnd)) ShowWindow(app.hwnd, SW_SHOW);
+    if (IsIconic(app.hwnd)) ShowWindow(app.hwnd, SW_RESTORE);
+    SetForegroundWindow(app.hwnd);
+}
+
+// The close button: into the tray (timing carries on), or the taskbar when there is no tray.
+void HideToTray() {
+    if (app.modal) return;
+    if (!app.trayAdded) {
+        ShowWindow(app.hwnd, SW_MINIMIZE);
+        return;
+    }
+    ShowWindow(app.hwnd, SW_HIDE);
+    if (!app.trayHintShown) {
+        app.trayHintShown = true;
+        SaveSetting(L"window", L"trayHint", 1);
+        TrayBalloon(L"时光账本仍在运行", L"窗口已收进托盘，计时不会中断。单击托盘图标打开，右键可以退出。");
+    }
+}
+
 // ---------------------------------------------------------------- pomodoro
 
 DWORD WINAPI ChimeThread(void* arg) {
@@ -2433,10 +2630,16 @@ void Chime(bool focusDone) {
     if (thread) CloseHandle(thread);
 }
 
-void Attention() {
+// Draws the eye to a finished phase: the mini window pulses, a hidden window notifies from the
+// tray, a background window flashes on the taskbar.
+void Attention(const std::wstring& message) {
     app.pulseUntil = Now() + 2;
     if (app.miniMode && app.mini) {
         InvalidateRect(app.mini, nullptr, FALSE);
+        return;
+    }
+    if (WindowHidden()) {
+        TrayBalloon(L"时光账本 · 番茄钟", message);
         return;
     }
     if (GetForegroundWindow() != app.hwnd) {
@@ -2462,17 +2665,16 @@ void AfterPomodoro(const tracker::PomodoroEvents& events) {
     if (events.restTagCreated) SaveSetting(L"pomodoro", L"restTag", p.restTag);
     if (events.focusCompleted) {
         Chime(true);
-        Attention();
-        if (events.breakEnded)
-            ShowToast(L"完成一个番茄，休息也已结束", events.focusStarted ? TOAST_PLAIN : TOAST_START_FOCUS, 30);
-        else
-            ShowToast(std::wstring(L"完成一个番茄！") + (events.longBreak ? L"长休息 " : L"休息 ") +
-                      DurationText(p.length()), TOAST_PLAIN, 8);
+        const std::wstring note = events.breakEnded ? std::wstring(L"完成一个番茄，休息也已结束") :
+            std::wstring(L"完成一个番茄！") + (events.longBreak ? L"长休息 " : L"休息 ") + DurationText(p.length());
+        Attention(note);
+        ShowToast(note, events.breakEnded && !events.focusStarted ? TOAST_START_FOCUS : TOAST_PLAIN,
+                  events.breakEnded ? 30 : 8);
     } else if (events.breakEnded) {
         Chime(false);
-        Attention();
-        ShowToast(events.focusStarted ? L"休息结束，已开始下一个番茄" : L"休息结束，开始下一个番茄吧",
-                  events.focusStarted ? TOAST_PLAIN : TOAST_START_FOCUS, 30);
+        const std::wstring note = events.focusStarted ? L"休息结束，已开始下一个番茄" : L"休息结束，开始下一个番茄吧";
+        Attention(note);
+        ShowToast(note, events.focusStarted ? TOAST_PLAIN : TOAST_START_FOCUS, 30);
     } else if (events.interrupted) {
         ShowToast(L"电脑离开期间番茄已中断，已专注的时间照常记录", TOAST_PLAIN, 10);
     }
@@ -2963,6 +3165,7 @@ void ShowMainMenu(POINT screen) {
     AppendMenuW(menu, MF_STRING | (app.miniMode ? MF_CHECKED : 0), CMD_MINI, L"迷你悬浮窗\tM");
     AppendMenuW(menu, MF_STRING | (app.topmost ? MF_CHECKED : 0), CMD_TOPMOST, L"窗口置顶");
     AppendMenuW(menu, MF_STRING | (AutoStartEnabled() ? MF_CHECKED : 0), CMD_AUTOSTART, L"开机自动启动");
+    AppendMenuW(menu, MF_STRING | (app.closeToTray ? MF_CHECKED : 0), CMD_CLOSE_TO_TRAY, L"关闭窗口时收进托盘");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (app.model.sessions.empty() ? MF_GRAYED : 0), CMD_EXPORT, L"导出全部记录 (CSV)…");
     AppendMenuW(menu, MF_STRING | (app.dataDir.empty() ? MF_GRAYED : 0), CMD_OPEN_FOLDER, L"打开数据文件夹");
@@ -2971,7 +3174,66 @@ void ShowMainMenu(POINT screen) {
     AppendMenuW(menu, MF_STRING, CMD_SHORTCUTS, L"键盘快捷键\tF1");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, CMD_ABOUT, L"关于时光账本");
+    AppendMenuW(menu, MF_STRING, CMD_EXIT, L"退出时光账本\tCtrl+Q");
     PopupAt(menu, screen, [](int command) { PostMessageW(app.hwnd, WM_COMMAND, static_cast<WPARAM>(command), 0); });
+}
+
+// Right click on the tray icon: status, show, the timing actions, tags, mini window, exit.
+void ShowTrayMenu(POINT at) {
+    using tracker::PomodoroPhase;
+    const auto& model = app.model;
+    const auto& p = app.pomodoro;
+    COLORREF badge = 0;
+    bool timing = false;
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, TrayStatus(badge, timing).c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, CMD_SHOW, L"显示主窗口");
+    AppendMenuW(menu, MF_STRING | (app.miniMode ? MF_CHECKED : 0), CMD_MINI, L"迷你悬浮窗");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    const UINT gray = app.readOnly ? MF_GRAYED : 0;
+    if (PomodoroCard()) {
+        if (p.phase == PomodoroPhase::Ready) {
+            const auto* tag = model.findTag(NextFocusTag());
+            AppendMenuW(menu, MF_STRING | gray | (tag ? 0 : MF_GRAYED), CMD_POMODORO_START,
+                        tag ? (L"开始专注「" + tag->name + L"」").c_str() : L"开始专注");
+        } else {
+            AppendMenuW(menu, MF_STRING | gray, CMD_POMODORO_PAUSE, p.paused ? L"继续" : L"暂停");
+            AppendMenuW(menu, MF_STRING | gray, CMD_POMODORO_SKIP,
+                        p.phase == PomodoroPhase::Focus ? L"跳过，直接休息" : L"跳过休息");
+            AppendMenuW(menu, MF_STRING | gray, CMD_POMODORO_ABANDON,
+                        p.phase == PomodoroPhase::Focus ? L"放弃这个番茄" : L"结束休息");
+        }
+    } else if (const auto* tag = model.findTag(model.activeTagId)) {
+        AppendMenuW(menu, MF_STRING | gray, CMD_STOP, (L"停止「" + tag->name + L"」").c_str());
+    } else if (const auto* last = model.findTag(LastWorkTag())) {
+        AppendMenuW(menu, MF_STRING | gray, CMD_SPACE, (L"继续「" + last->name + L"」").c_str());
+    }
+    HMENU tags = CreatePopupMenu();
+    const std::size_t shown = std::min<std::size_t>(model.tags.size(), 20);
+    for (std::size_t i = 0; i < shown; ++i) {
+        const auto& tag = model.tags[i];
+        std::wstring label = tag.name;
+        if (i < 9) label += Format(L"\t%d", static_cast<int>(i) + 1);
+        AppendMenuW(tags, MF_STRING | gray | (tag.id == model.activeTagId ? MF_CHECKED : 0),
+                    static_cast<UINT_PTR>(CMD_TAG_FIRST + static_cast<int>(i)), label.c_str());
+    }
+    AppendMenuW(menu, MF_POPUP | (shown ? 0 : MF_GRAYED), reinterpret_cast<UINT_PTR>(tags),
+                app.pomodoroMode ? L"专注于标签" : L"切换到标签");
+    AppendMenuW(menu, MF_STRING | (app.pomodoroMode ? MF_CHECKED : 0), CMD_POMODORO_TOGGLE, L"番茄钟模式");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, CMD_EXIT, L"退出时光账本");
+    SetForegroundWindow(app.hwnd);           // so the menu closes when the user clicks elsewhere
+    int command = 0;
+    {
+        ModalScope modal;
+        const UINT align = GetSystemMetrics(SM_MENUDROPALIGNMENT) ? TPM_RIGHTALIGN : TPM_LEFTALIGN;
+        command = static_cast<int>(TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY |
+                                                    TPM_BOTTOMALIGN | align, at.x, at.y, app.hwnd, nullptr));
+    }
+    PostMessageW(app.hwnd, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+    if (command) PostMessageW(app.hwnd, WM_COMMAND, static_cast<WPARAM>(command), 0);
 }
 
 void ShowTagMenu(int index, POINT screen) {
@@ -3299,7 +3561,7 @@ LRESULT CALLBACK MiniProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         DestroyMenu(menu);
         if (command == 1) SetMiniMode(false);
         else if (command == 2) SetPomodoroMode(!app.pomodoroMode);
-        else if (command == 3) PostMessageW(app.hwnd, WM_CLOSE, 0, 0);
+        else if (command == 3) PostMessageW(app.hwnd, WM_COMMAND, CMD_EXIT, 0);
         return 0;
     }
     case WM_DPICHANGED: {
@@ -3317,6 +3579,252 @@ LRESULT CALLBACK MiniProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         app.miniSurface.Release();
         app.miniFonts.Release();
         app.mini = nullptr;
+        break;
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+
+// ---------------------------------------------------------------- date picker
+
+// A month calendar under the date title. Days with records carry a dot; future days are inert.
+constexpr int kCalW = 304, kCalH = 348;
+
+long long MonthStart(long long time) {
+    auto t = LocalTm(time);
+    t.tm_mday = 1;
+    t.tm_hour = t.tm_min = t.tm_sec = 0;
+    t.tm_isdst = -1;
+    return static_cast<long long>(std::mktime(&t));
+}
+
+long long ShiftMonth(long long month, int delta) {
+    auto t = LocalTm(month);
+    t.tm_mon += delta;
+    t.tm_mday = 1;
+    t.tm_hour = t.tm_min = t.tm_sec = 0;
+    t.tm_isdst = -1;
+    return static_cast<long long>(std::mktime(&t));
+}
+
+long long CalendarFirstCell() {           // weeks start on Monday
+    return ShiftDay(app.calendarMonth, -((LocalTm(app.calendarMonth).tm_wday + 6) % 7));
+}
+
+void PaintCalendar(Canvas& c, int w, int h) {
+    app.calendarHits.clear();
+    const Palette& p = app.pal;
+    const Fonts& f = app.fonts;
+    c.Fill(0, 0, float(w), float(h), p.surface);
+    if (WindowsBuild() < 22000) {
+        c.Fill(0, 0, float(w), 1, p.borderStrong);
+        c.Fill(0, float(h - 1), float(w), 1, p.borderStrong);
+        c.Fill(0, 0, 1, float(h), p.borderStrong);
+        c.Fill(float(w - 1), 0, 1, float(h), p.borderStrong);
+    }
+    const long long today = TodayStart();
+    const auto month = LocalTm(app.calendarMonth);
+    c.Text(Format(L"%d年%d月", month.tm_year + 1900, month.tm_mon + 1), RECT{S(18), S(12), w - S(96), S(44)},
+           f.title, p.text);
+    auto arrow = [&](const RECT& r, Icon icon, int id, bool enabled, const wchar_t* tip) {
+        const bool hot = enabled && app.calendarHot == id;
+        if (hot) c.Round(r, Sf(8), app.calendarPressed == id ? p.pressed : p.hover);
+        PaintIcon(c, icon, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, Sf(16),
+                  enabled ? (hot ? p.text : p.text2) : p.text3, enabled ? 255 : 110);
+        if (enabled) app.calendarHits.push_back({r, id, tip});
+    };
+    const RECT next{w - S(12) - S(32), S(12), w - S(12), S(44)};
+    const RECT prev{next.left - S(36), S(12), next.left - S(4), S(44)};
+    arrow(prev, Icon::ChevronLeft, Hid(HK_CAL_PREV), true, L"上个月");
+    arrow(next, Icon::ChevronRight, Hid(HK_CAL_NEXT), app.calendarMonth < MonthStart(today), L"下个月");
+    const int gridLeft = S(12), cellW = (w - S(24)) / 7, cellH = S(36), headerTop = S(52);
+    static const wchar_t* names[] = {L"一", L"二", L"三", L"四", L"五", L"六", L"日"};
+    for (int i = 0; i < 7; ++i)
+        c.Text(names[i], RECT{gridLeft + i * cellW, headerTop, gridLeft + (i + 1) * cellW, headerTop + S(22)},
+               f.caption, i >= 5 ? p.text2 : p.text3, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    const long long first = CalendarFirstCell(), last = ShiftDay(first, 42);
+    std::vector<bool> marked(42, false);
+    auto mark = [&](long long start, long long end) {
+        if (end <= first || start >= last) return;
+        for (long long d = DayStart(std::max(start, first)); d < std::min(end, last); d = ShiftDay(d, 1)) {
+            const int index = DaysBetween(first, d);
+            if (index >= 0 && index < 42) marked[static_cast<std::size_t>(index)] = true;
+        }
+    };
+    for (const auto& session : app.model.sessions) mark(session.start, session.end);
+    if (app.model.activeTagId) mark(app.model.activeSince, std::max(Now(), app.model.activeSince + 1));
+    const int gridTop = headerTop + S(24);
+    for (int i = 0; i < 42; ++i) {
+        const long long day = ShiftDay(first, i);
+        const auto t = LocalTm(day);
+        const RECT cell{gridLeft + (i % 7) * cellW, gridTop + (i / 7) * cellH, gridLeft + (i % 7 + 1) * cellW,
+                        gridTop + (i / 7 + 1) * cellH};
+        const float cx = (cell.left + cell.right) / 2.0f, cy = (cell.top + cell.bottom) / 2.0f;
+        const bool inMonth = t.tm_mon == month.tm_mon, future = day > today;
+        const bool selected = day == app.chosenDay, isToday = day == today;
+        const int id = Hid(HK_CAL_DAY, i);
+        const bool hot = !future && app.calendarHot == id;
+        const float radius = Sf(15);
+        if (selected) c.Circle(cx, cy, radius, p.accent);
+        else if (hot) c.Circle(cx, cy, radius, app.calendarPressed == id ? p.pressed : p.hover);
+        if (isToday && !selected) c.Ring(cx, cy, radius - Sf(0.75f), p.accent, Sf(1.5f));
+        COLORREF ink = selected ? p.onAccent : inMonth ? p.text : p.text3;
+        if (future) ink = Mix(p.text3, p.surface, 0.5);
+        c.Text(Format(L"%d", t.tm_mday), RECT{cell.left, static_cast<int>(cy) - S(12), cell.right,
+               static_cast<int>(cy) + S(8)}, selected || isToday ? f.bodyBold : f.body, ink,
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (marked[static_cast<std::size_t>(i)])
+            c.Circle(cx, cy + Sf(9), Sf(2), selected ? p.onAccent : inMonth ? p.accent : p.text3);
+        if (!future) app.calendarHits.push_back({cell, id, L""});
+    }
+    const RECT back{S(12), h - S(12) - S(34), w - S(12), h - S(12)};
+    const int backId = Hid(HK_CAL_TODAY);
+    const bool hot = app.calendarHot == backId;
+    PaintButton(c, f, Sf(1), back, L"回到今天", static_cast<int>(Icon::Undo), Btn::Ghost, hot,
+                hot && app.calendarPressed == backId, true);
+    app.calendarHits.push_back({back, backId, L""});
+}
+
+void CloseCalendar() {
+    if (app.calendar) PostMessageW(app.calendar, WM_CLOSE, 0, 0);
+}
+
+void ToggleCalendar() {
+    if (app.calendar) {
+        CloseCalendar();
+        return;
+    }
+    if (GetTickCount() - app.calendarClosedAt < 300) return;    // the click that just closed it
+    app.calendarMonth = MonthStart(app.chosenDay);
+    const int w = S(kCalW), h = S(kCalH);
+    POINT at{app.layout.date.left, app.layout.date.bottom + S(6)};
+    ClientToScreen(app.hwnd, &at);
+    MONITORINFO monitor{};
+    monitor.cbSize = sizeof(monitor);
+    if (GetMonitorInfoW(MonitorFromWindow(app.hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        const RECT& work = monitor.rcWork;
+        at.x = std::clamp<LONG>(at.x, work.left, std::max<LONG>(work.left, work.right - w));
+        at.y = std::clamp<LONG>(at.y, work.top, std::max<LONG>(work.top, work.bottom - h));
+    }
+    app.calendar = CreateWindowExW(WS_EX_TOOLWINDOW, L"DayLedgerCalendar", L"选择日期", WS_POPUP, at.x, at.y, w, h,
+                                   app.hwnd, nullptr, app.instance, nullptr);
+    if (!app.calendar) return;
+    using SetAttribute = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    static SetAttribute set = LoadProc<SetAttribute>(SystemLibrary(L"dwmapi.dll"), "DwmSetWindowAttribute");
+    if (set) {
+        const DWORD round = 2;                     // DWMWCP_ROUND on Windows 11
+        set(app.calendar, 33, &round, sizeof(round));
+    }
+    ShowWindow(app.calendar, SW_SHOW);
+    SetFocus(app.calendar);
+    InvalidateRect(app.hwnd, nullptr, FALSE);
+}
+
+void CalendarActivate(int id) {
+    const long long today = TodayStart();
+    switch (KindOf(id)) {
+    case HK_CAL_PREV:
+        app.calendarMonth = ShiftMonth(app.calendarMonth, -1);
+        break;
+    case HK_CAL_NEXT:
+        if (app.calendarMonth < MonthStart(today)) app.calendarMonth = ShiftMonth(app.calendarMonth, 1);
+        break;
+    case HK_CAL_DAY: {
+        const long long day = ShiftDay(CalendarFirstCell(), IndexOf(id));
+        if (day <= today) {
+            CloseCalendar();
+            GoToDay(day);
+        }
+        return;
+    }
+    case HK_CAL_TODAY:
+        CloseCalendar();
+        GoToDay(today);
+        return;
+    default: return;
+    }
+    if (app.calendar) InvalidateRect(app.calendar, nullptr, FALSE);
+}
+
+LRESULT CALLBACK CalendarProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto hitAt = [](POINT pt) {
+        for (auto it = app.calendarHits.rbegin(); it != app.calendarHits.rend(); ++it)
+            if (PtInRect(&it->rect, pt)) return it->id;
+        return 0;
+    };
+    switch (message) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC target = BeginPaint(window, &ps);
+        RECT client{};
+        GetClientRect(window, &client);
+        if (client.right > 0 && client.bottom > 0 && app.calendarSurface.Ensure(client.right, client.bottom)) {
+            {
+                Canvas canvas(app.calendarSurface);
+                PaintCalendar(canvas, client.right, client.bottom);
+            }
+            BitBlt(target, 0, 0, client.right, client.bottom, app.calendarSurface.Dc(), 0, 0, SRCCOPY);
+        }
+        EndPaint(window, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (!app.calendarTracking) {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
+            TrackMouseEvent(&track);
+            app.calendarTracking = true;
+        }
+        const int hit = hitAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (hit != app.calendarHot) {
+            app.calendarHot = hit;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        app.calendarTracking = false;
+        app.calendarHot = 0;
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONDBLCLK:
+        app.calendarPressed = hitAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (app.calendarPressed) SetCapture(window);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP: {
+        const int pressed = app.calendarPressed;
+        app.calendarPressed = 0;
+        if (GetCapture() == window) ReleaseCapture();
+        const int hit = hitAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        InvalidateRect(window, nullptr, FALSE);
+        if (pressed && pressed == hit) CalendarActivate(hit);
+        return 0;
+    }
+    case WM_MOUSEWHEEL:
+        CalendarActivate(Hid(GET_WHEEL_DELTA_WPARAM(wp) > 0 ? HK_CAL_PREV : HK_CAL_NEXT));
+        return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) CloseCalendar();
+        else if (wp == VK_PRIOR || wp == VK_LEFT) CalendarActivate(Hid(HK_CAL_PREV));
+        else if (wp == VK_NEXT || wp == VK_RIGHT) CalendarActivate(Hid(HK_CAL_NEXT));
+        else if (wp == VK_HOME) CalendarActivate(Hid(HK_CAL_TODAY));
+        return 0;
+    case WM_ACTIVATE:
+        if (LOWORD(wp) == WA_INACTIVE) {            // a click anywhere else closes the picker
+            app.calendarClosedAt = GetTickCount();
+            CloseCalendar();
+        }
+        return 0;
+    case WM_CLOSE:
+        DestroyWindow(window);
+        return 0;
+    case WM_NCDESTROY:
+        app.calendar = nullptr;
+        app.calendarHot = app.calendarPressed = 0;
+        app.calendarTracking = false;
+        app.calendarSurface.Release();
+        if (app.hwnd) InvalidateRect(app.hwnd, nullptr, FALSE);
         break;
     }
     return DefWindowProcW(window, message, wp, lp);
@@ -3375,6 +3883,7 @@ void Activate(int id) {
         app.toast.clear();
         break;
     case HK_RETRY: Persist(true); break;
+    case HK_DATE: ToggleCalendar(); break;
     case HK_MODE_FREE: SetPomodoroMode(false); break;
     case HK_MODE_POMODORO: SetPomodoroMode(true); break;
     case HK_POMO_START: PomodoroStart(); break;
@@ -3429,6 +3938,15 @@ void Command(int id) {
     case CMD_MINI: SetMiniMode(!app.miniMode); break;
     case CMD_TOPMOST: SetTopmost(!app.topmost); break;
     case CMD_AUTOSTART: ToggleAutoStart(); break;
+    case CMD_EXIT: ExitApp(app.hwnd); break;
+    case CMD_CLOSE: PostMessageW(app.hwnd, WM_CLOSE, 0, 0); break;
+    case CMD_SHOW: ShowMain(); break;
+    case CMD_CLOSE_TO_TRAY:
+        app.closeToTray = !app.closeToTray;
+        SaveSetting(L"window", L"closeToTray", app.closeToTray ? 1 : 0);
+        ShowToast(app.closeToTray ? L"关闭窗口时会收进托盘，计时继续" : L"关闭窗口时将退出程序");
+        break;
+    case CMD_CALENDAR: ToggleCalendar(); break;
     case CMD_SOUND:
         app.soundOn = !app.soundOn;
         SaveSetting(L"pomodoro", L"sound", app.soundOn ? 1 : 0);
@@ -3471,7 +3989,7 @@ void ScrollList(int kind, int delta) {
     }
 }
 
-void CloseApp(HWND window) {
+void ExitApp(HWND window) {
     if (app.closing || app.modal) return;
     app.closing = true;
     if (!app.readOnly) {
@@ -3512,9 +4030,22 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         SetTimer(window, TID_TICK, 1000, nullptr);
         return 0;
     case WM_DL_ACTIVATE:
-        if (IsIconic(window)) ShowWindow(window, SW_RESTORE);
-        SetForegroundWindow(window);
+        ShowMain();
         return 0;
+    case WM_DL_TRAY: {
+        const UINT event = LOWORD(lp);
+        POINT at{GET_X_LPARAM(wp), GET_Y_LPARAM(wp)};
+        if (!app.trayV4) GetCursorPos(&at);
+        if (event == NIN_SELECT || event == NIN_KEYSELECT || event == NIN_BALLOONUSERCLICK ||
+            (!app.trayV4 && event == WM_LBUTTONUP)) {
+            if (app.modal) ShowMain();
+            else if (IsWindowVisible(window) && !IsIconic(window) && GetForegroundWindow() == window) HideToTray();
+            else ShowMain();
+        } else if (event == (app.trayV4 ? static_cast<UINT>(WM_CONTEXTMENU) : static_cast<UINT>(WM_RBUTTONUP))) {
+            if (!app.modal) ShowTrayMenu(at);
+        }
+        return 0;
+    }
     case WM_DL_QUERY:
         switch (static_cast<int>(wp)) {
         case Q_TAGS: return static_cast<LRESULT>(app.model.tags.size());
@@ -3534,6 +4065,8 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         case Q_MINI: return app.miniMode;
         case Q_REST_TAG: return app.pomodoro.restTag;
         case Q_TOPMOST: return app.topmost;
+        case Q_TRAY: return app.trayAdded;
+        case Q_CALENDAR: return app.calendar != nullptr;
         default: return -1;
         }
     case WM_SIZE:
@@ -3725,13 +4258,16 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             SavePlacement();
         }
         return 0;
-    case WM_CLOSE:
-        CloseApp(window);
+    case WM_CLOSE:                   // the close button: into the tray unless the user turned that off
+        if (app.closeToTray) HideToTray();
+        else ExitApp(window);
         return 0;
     case WM_DESTROY:
         KillTimer(window, TID_TICK);
         KillTimer(window, TID_TIP);
         if (app.mini) DestroyWindow(app.mini);
+        if (app.calendar) DestroyWindow(app.calendar);
+        TrayRemove();
         RemovePropW(window, L"DayLedgerKey");
         PostQuitMessage(0);
         return 0;
@@ -3739,6 +4275,12 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         app.surface.Release();
         app.fonts.Release();
         break;
+    }
+    if (app.taskbarCreated && message == app.taskbarCreated) {    // Explorer restarted: add the icon again
+        app.trayAdded = false;
+        app.trayKey.clear();
+        TrayUpdate(true);
+        return 0;
     }
     return DefWindowProcW(window, message, wp, lp);
 }
@@ -3800,6 +4342,7 @@ HACCEL CreateAccelerators() {
         {FVIRTKEY | FCONTROL, 'Z', CMD_UNDO}, {FVIRTKEY | FCONTROL, 'S', CMD_RETRY_SAVE},
         {FVIRTKEY, 'P', CMD_POMODORO_TOGGLE}, {FVIRTKEY, 'S', CMD_POMODORO_SKIP},
         {FVIRTKEY, 'R', CMD_POMODORO_ABANDON}, {FVIRTKEY, 'M', CMD_MINI},
+        {FVIRTKEY | FCONTROL, 'Q', CMD_EXIT}, {FVIRTKEY | FCONTROL, 'W', CMD_CLOSE},
     };
     for (int i = 0; i < 9; ++i) {
         keys.push_back({FVIRTKEY, static_cast<WORD>('1' + i), static_cast<WORD>(CMD_TAG_FIRST + i)});
@@ -3866,6 +4409,14 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
         dialog.lpszClassName = name;
         if (!RegisterClassExW(&dialog)) return 12;
     }
+    WNDCLASSEXW calendarClass{};
+    calendarClass.cbSize = sizeof(calendarClass);
+    calendarClass.style = CS_DBLCLKS | CS_DROPSHADOW;
+    calendarClass.lpfnWndProc = CalendarProc;
+    calendarClass.hInstance = instance;
+    calendarClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    calendarClass.lpszClassName = L"DayLedgerCalendar";
+    if (!RegisterClassExW(&calendarClass)) return 12;
     WNDCLASSEXW miniClass{};
     miniClass.cbSize = sizeof(miniClass);
     miniClass.style = CS_DBLCLKS;
@@ -3916,6 +4467,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     UpdateWindow(window);
     if (app.topmost) SetTopmost(true, false);
     AutoStartEnabled(true);                  // repoint the Run value if the exe has moved
+    app.taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    TrayUpdate(true);
     app.accel = CreateAccelerators();
 
     MSG message{};

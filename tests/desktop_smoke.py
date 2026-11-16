@@ -29,7 +29,7 @@ CMD_PREV_DAY, CMD_NEXT_DAY, CMD_TODAY = 101, 102, 103
 CMD_NEW_TAG, CMD_STOP, CMD_ADD_RECORD, CMD_UNDO = 106, 110, 111, 112
 CMD_THEME_LIGHT, CMD_THEME_DARK = 121, 122
 CMD_POMODORO_PAUSE, CMD_POMODORO_ABANDON, CMD_MINI, CMD_POMODORO_START = 127, 129, 130, 134
-CMD_POMODORO_ON, CMD_POMODORO_OFF = 136, 137
+CMD_POMODORO_ON, CMD_POMODORO_OFF, CMD_EXIT, CMD_SHOW = 136, 137, 138, 139
 PHASE_READY, PHASE_FOCUS, PHASE_BREAK = 0, 1, 2
 # With DAYLEDGER_TEST_SECONDS_PER_MINUTE=1 these "minutes" last one second each.
 POMODORO_SETTINGS = "[pomodoro]\nfocus=5\nshort=2\nlong=2\nevery=4\n"
@@ -61,6 +61,7 @@ class Desktop:
             "IsWindow": ([W.HWND], W.BOOL),
             "IsWindowVisible": ([W.HWND], W.BOOL),
             "IsWindowEnabled": ([W.HWND], W.BOOL),
+            "IsIconic": ([W.HWND], W.BOOL),
             "GetWindowRect": ([W.HWND, C.POINTER(W.RECT)], W.BOOL),
             "GetClientRect": ([W.HWND, C.POINTER(W.RECT)], W.BOOL),
             "ClientToScreen": ([W.HWND, C.POINTER(W.POINT)], W.BOOL),
@@ -369,6 +370,18 @@ def exercise(d, main, p, timeout, data, check):
     until(lambda: q(Q_POMODORO_MODE) == 0)
     check("mini_window_and_mode_switch")
 
+    d.command(main, CMD_TAG_FIRST + 0)
+    until(lambda: q(Q_ACTIVE) == 1)
+    d.post(main, WM_CLOSE)  # the close button keeps the app (and the timer) running
+    until(lambda: not d.u.IsWindowVisible(main) or d.u.IsIconic(main))
+    time.sleep(0.5)
+    need(p.poll() is None and q(Q_ACTIVE) == 1 and parse_tracker(data)["active"] == 1, "Closing stopped the timer")
+    d.command(main, CMD_SHOW)
+    until(lambda: d.u.IsWindowVisible(main) and not d.u.IsIconic(main))
+    d.command(main, CMD_STOP)
+    until(lambda: q(Q_ACTIVE) == 0)
+    check("close_button_hides_to_tray_and_keeps_timing")
+
     scale = d.u.GetDpiForWindow(main) / 96
     outer, client = d.rect(main), d.rect(main, True)
     frame_w, frame_h = outer[2] - outer[0] - client[2], outer[3] - outer[1] - client[3]
@@ -412,7 +425,7 @@ def main():
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
             def close():
-                d.post(window, WM_CLOSE)
+                d.command(window, CMD_EXIT)  # the close button only hides the window
                 need(p.wait(timeout=args.timeout) == 0, "Nonzero graceful shutdown")
 
             try:
@@ -459,7 +472,7 @@ def main():
                         if h != window:
                             d.post(h, WM_CLOSE)
                     if window and d.u.IsWindow(window):
-                        d.post(window, WM_CLOSE)
+                        d.post(window, WM_COMMAND, CMD_EXIT)
                     try:
                         p.wait(timeout=args.timeout)
                     except subprocess.TimeoutExpired:
