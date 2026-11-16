@@ -25,10 +25,15 @@ namespace tracker {
 
 enum class Category { Work = 0, Play = 1, Other = 2 };
 struct Tag { int id; std::wstring name; unsigned color; Category category; };
-struct Session { int tagId; long long start; long long end; };
+// Session flags. A completed pomodoro is the record that ran until its focus countdown ended.
+constexpr unsigned SessionPomodoro = 1u;
+constexpr unsigned SessionKnownFlags = SessionPomodoro;
+struct Session { int tagId; long long start; long long end; unsigned flags = 0; };
 struct DayStats {
     long long work = 0, play = 0, other = 0, total = 0;
     std::map<int, long long> byTag;
+    int pomodoros = 0;                  // completed pomodoros that ended inside the range
+    std::map<int, int> pomodorosByTag;
 };
 
 enum class Recovery { EndAtLastSaved, Continue, Discard };
@@ -101,21 +106,24 @@ public:
         return {};
     }
 
-    EditResult addSession(int tagId, long long start, long long end, long long now) {
+    EditResult addSession(int tagId, long long start, long long end, long long now,
+                          unsigned flags = 0) {
         const auto result = checkRange(tagId, start, end, now);
         if (!result) return result;
         if (sessions.size() >= maxSessions) return {EditStatus::InvalidRange};
-        insertSorted({tagId, start, end});
+        insertSorted({tagId, start, end, flags & SessionKnownFlags});
         return {};
     }
 
+    // Edits keep the record's flags: a retagged or re-timed pomodoro still counts.
     EditResult updateSession(std::size_t index, int tagId, long long start, long long end,
                              long long now) {
         if (index >= sessions.size()) return {EditStatus::NotFound};
         const auto result = checkRange(tagId, start, end, now, static_cast<long long>(index));
         if (!result) return result;
+        const unsigned flags = sessions[index].flags;
         sessions.erase(sessions.begin() + static_cast<std::ptrdiff_t>(index));
-        insertSorted({tagId, start, end});
+        insertSorted({tagId, start, end, flags});
         return {};
     }
 
@@ -179,9 +187,10 @@ public:
         activeSince = boundary;
     }
 
-    void stop(long long now) {
+    // Ends the running segment at `now`; `flags` marks the record (e.g. a completed pomodoro).
+    void stop(long long now, unsigned flags = 0) {
         if (!activeTagId || !validTime(now)) return;
-        if (now > activeSince) sessions.push_back({activeTagId, activeSince, now});
+        if (now > activeSince) sessions.push_back({activeTagId, activeSince, now, flags & SessionKnownFlags});
         activeTagId = 0;
         activeSince = 0;
     }
@@ -224,7 +233,14 @@ public:
                 case Category::Other: result.other += duration; break;
             }
         };
-        for (const auto& session : sessions) add(session.tagId, session.start, session.end);
+        for (const auto& session : sessions) {
+            add(session.tagId, session.start, session.end);
+            if ((session.flags & SessionPomodoro) && session.end > dayStart && session.end <= upper &&
+                findTag(session.tagId)) {
+                ++result.pomodoros;
+                ++result.pomodorosByTag[session.tagId];
+            }
+        }
         if (activeTagId) add(activeTagId, activeSince, (std::min)(now, maxTime));
         return result;
     }
@@ -236,8 +252,12 @@ public:
             in.seekg(0);
             std::array<char, 8> magic{};
             if (!in.read(magic.data(), magic.size())) return false;
-            const bool current = magic == fileMagic;
-            if (!current && magic != legacyMagic) return false;
+            // TRACKER3 adds per-session flags; TRACKER2 added the last-saved checkpoint.
+            int version = 0;
+            if (magic == fileMagic) version = 3;
+            else if (magic == version2Magic) version = 2;
+            else if (magic == legacyMagic) version = 1;
+            else return false;
             std::uint64_t count = 0, value = 0;
             Model candidate;
             candidate.tags.clear();
@@ -267,6 +287,10 @@ public:
                 session.start = static_cast<long long>(value);
                 if (!readNumber(in, value, 8) || value > static_cast<std::uint64_t>(maxTime)) return false;
                 session.end = static_cast<long long>(value);
+                if (version >= 3) {
+                    if (!readNumber(in, value, 4) || (value & ~std::uint64_t(SessionKnownFlags))) return false;
+                    session.flags = static_cast<unsigned>(value);
+                }
                 candidate.sessions.push_back(session);
             }
             if (!readNumber(in, value, 4) || value > maxId) return false;
@@ -274,7 +298,7 @@ public:
             if (!readNumber(in, value, 8) || value > static_cast<std::uint64_t>(maxTime)) return false;
             candidate.activeSince = static_cast<long long>(value);
             candidate.lastSaved = 0;
-            if (current) {
+            if (version >= 2) {
                 if (!readNumber(in, value, 8) || value > static_cast<std::uint64_t>(maxTime)) return false;
                 candidate.lastSaved = static_cast<long long>(value);
             }
@@ -317,6 +341,7 @@ public:
                 writeNumber(out, session.tagId, 4);
                 writeNumber(out, session.start, 8);
                 writeNumber(out, session.end, 8);
+                writeNumber(out, session.flags, 4);
             }
             writeNumber(out, candidate.activeTagId, 4);
             writeNumber(out, candidate.activeSince, 8);
@@ -345,7 +370,8 @@ private:
     static constexpr long long maxFileBytes = 64 * 1024 * 1024;
     static constexpr long long maxTime = 253402300799LL;
     static constexpr std::uint64_t maxId = (std::numeric_limits<int>::max)();
-    inline static constexpr std::array<char, 8> fileMagic{'T','R','A','C','K','E','R','2'};
+    inline static constexpr std::array<char, 8> fileMagic{'T','R','A','C','K','E','R','3'};
+    inline static constexpr std::array<char, 8> version2Magic{'T','R','A','C','K','E','R','2'};
     inline static constexpr std::array<char, 8> legacyMagic{'T','R','A','C','K','E','R','1'};
 
     static bool validTime(long long time) { return time >= 0 && time <= maxTime; }
@@ -431,7 +457,8 @@ private:
         long long previousEnd = 0;
         for (const auto& session : sessions) {
             if (!ids.count(session.tagId) || !validTime(session.start) || !validTime(session.end) ||
-                session.end <= session.start || session.start < previousEnd) return false;
+                session.end <= session.start || session.start < previousEnd ||
+                (session.flags & ~SessionKnownFlags)) return false;
             previousEnd = session.end;
         }
         if (!validTime(lastSaved)) return false;

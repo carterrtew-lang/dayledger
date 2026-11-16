@@ -22,10 +22,18 @@ VIOLET = 0xD65062  # COLORREF (0x00BBGGRR) of preset swatch 6, #6250d6
 
 # Automation interface of TimeTracker.exe (see the command enum in src/time_tracker.cpp).
 WM_DL_QUERY = 0x8000 + 0x40
-Q_TAGS, Q_RECORDS, Q_ACTIVE, Q_READONLY, Q_IS_TODAY, Q_SAVE_FAILED, Q_DARK, Q_SELECTED, Q_LOADED = range(9)
+(Q_TAGS, Q_RECORDS, Q_ACTIVE, Q_READONLY, Q_IS_TODAY, Q_SAVE_FAILED, Q_DARK, Q_SELECTED, Q_LOADED,
+ Q_POMODORO_MODE, Q_POMODORO_PHASE, Q_POMODORO_PAUSED, Q_POMODORO_REMAINING, Q_POMODOROS_TODAY,
+ Q_MINI, Q_REST_TAG) = range(16)
 CMD_PREV_DAY, CMD_NEXT_DAY, CMD_TODAY = 101, 102, 103
 CMD_NEW_TAG, CMD_STOP, CMD_ADD_RECORD, CMD_UNDO = 106, 110, 111, 112
 CMD_THEME_LIGHT, CMD_THEME_DARK = 121, 122
+CMD_POMODORO_PAUSE, CMD_POMODORO_ABANDON, CMD_MINI, CMD_POMODORO_START = 127, 129, 130, 134
+CMD_POMODORO_ON, CMD_POMODORO_OFF = 136, 137
+PHASE_READY, PHASE_FOCUS, PHASE_BREAK = 0, 1, 2
+# With DAYLEDGER_TEST_SECONDS_PER_MINUTE=1 these "minutes" last one second each.
+POMODORO_SETTINGS = "[pomodoro]\nfocus=5\nshort=2\nlong=2\nevery=4\n"
+FOCUS_SECONDS, BREAK_SECONDS = 5, 2
 CMD_TAG_FIRST, CMD_EDIT_TAG_FIRST, CMD_DELETE_RECORD_FIRST = 0x1000, 0x2000, 0x4000
 IDOK, IDCANCEL = 1, 2
 TD_NAME, TD_CUSTOM_COLOR, TD_CATEGORY_OTHER, TD_COLOR_FIRST = 201, 203, 213, 220
@@ -153,9 +161,10 @@ def wait(probe, timeout, process):
 
 
 def parse_tracker(path):
-    """Read the versioned little-endian ledger with UTF-8 names."""
+    """Read the versioned little-endian ledger with UTF-8 names (TRACKER3 adds session flags)."""
     data, offset = path.read_bytes(), 8
-    need(data[:8] in (b"TRACKER1", b"TRACKER2"), "Invalid tracker header")
+    need(data[:8] in (b"TRACKER1", b"TRACKER2", b"TRACKER3"), "Invalid tracker header")
+    version = data[7] - ord("0")
 
     def number(size=4):
         nonlocal offset
@@ -175,14 +184,16 @@ def parse_tracker(path):
         tags.append(dict(id=identifier, color=color, category=category, name=name))
     count = number()
     need(count <= 1000000, "Invalid session count")
-    sessions = [dict(tag=number(), start=number(8), end=number(8)) for _ in range(count)]
+    sessions = [dict(tag=number(), start=number(8), end=number(8), flags=number() if version >= 3 else 0)
+                for _ in range(count)]
     active, since = number(), number(8)
-    last_saved = number(8) if data[:8] == b"TRACKER2" else 0
+    last_saved = number(8) if version >= 2 else 0
     need(offset == len(data), "Unexpected trailing bytes")
     ids = {t["id"] for t in tags}
     need(len(ids) == len(tags) and all(0 < i <= 0x7FFFFFFF for i in ids), "Invalid tag IDs")
     need(all(t["color"] <= 0xFFFFFF and t["category"] <= 2 and "\0" not in t["name"]
              for t in tags), "Invalid tag values")
+    need(all(s["flags"] in (0, 1) for s in sessions), "Unknown session flags")
     previous = 0
     for s in sorted(sessions, key=lambda s: s["start"]):
         need(s["tag"] in ids and previous <= s["start"] < s["end"] <= 253402300799,
@@ -315,6 +326,49 @@ def exercise(d, main, p, timeout, data, check):
     until(lambda: q(Q_DARK) == 0)
     check("theme_switch")
 
+    d.command(main, CMD_POMODORO_ON)
+    until(lambda: q(Q_POMODORO_MODE) == 1 and q(Q_POMODORO_PHASE) == PHASE_READY)
+    d.command(main, CMD_TAG_FIRST + 0)  # focus on the first tag
+    until(lambda: q(Q_POMODORO_PHASE) == PHASE_FOCUS and q(Q_ACTIVE) == 1)
+    until(lambda: q(Q_POMODORO_PHASE) == PHASE_BREAK)
+    ledger, rest = parse_tracker(data), q(Q_REST_TAG)
+    need(any(t["id"] == rest and t["name"] == "休息" and t["category"] == 2 for t in ledger["tags"]),
+         "Rest tag not created")
+    need(ledger["active"] == rest, "Break not recorded under the rest tag")
+    done = [s for s in ledger["sessions"] if s["flags"] & 1]
+    need(len(done) == 1 and done[0]["tag"] == 1 and done[0]["end"] - done[0]["start"] == FOCUS_SECONDS,
+         "Completed focus not recorded and flagged")
+    until(lambda: q(Q_POMODORO_PHASE) == PHASE_READY)  # the break ends and waits for the user
+    ledger = parse_tracker(data)
+    need(ledger["active"] == 0 and any(s["tag"] == rest and s["end"] - s["start"] == BREAK_SECONDS
+                                       for s in ledger["sessions"]), "Break not saved")
+    need(q(Q_POMODOROS_TODAY) == 1, "Pomodoro count wrong")
+    check("pomodoro_focus_break_ready_cycle")
+
+    d.command(main, CMD_POMODORO_START)
+    until(lambda: q(Q_POMODORO_PHASE) == PHASE_FOCUS and q(Q_ACTIVE) == 1)
+    d.command(main, CMD_POMODORO_PAUSE)
+    until(lambda: q(Q_POMODORO_PAUSED) == 1 and q(Q_ACTIVE) == 0)
+    held = q(Q_POMODORO_REMAINING)
+    time.sleep(1.3)
+    need(q(Q_POMODORO_REMAINING) == held, "Paused countdown moved")
+    d.command(main, CMD_POMODORO_PAUSE)  # resume
+    until(lambda: q(Q_POMODORO_PAUSED) == 0 and q(Q_ACTIVE) == 1)
+    d.command(main, CMD_POMODORO_ABANDON)
+    until(lambda: q(Q_POMODORO_PHASE) == PHASE_READY and q(Q_ACTIVE) == 0)
+    need(q(Q_POMODOROS_TODAY) == 1 and len([s for s in parse_tracker(data)["sessions"] if s["flags"]]) == 1,
+         "Abandoned pomodoro counted")
+    check("pomodoro_pause_resume_abandon")
+
+    d.command(main, CMD_MINI)
+    mini = until(lambda: d.top(p.pid, "DayLedgerMini"))
+    need(q(Q_MINI) == 1, "Mini mode not reported")
+    d.command(main, CMD_MINI)
+    until(lambda: q(Q_MINI) == 0 and not d.u.IsWindowVisible(mini) and d.u.IsWindowVisible(main))
+    d.command(main, CMD_POMODORO_OFF)
+    until(lambda: q(Q_POMODORO_MODE) == 0)
+    check("mini_window_and_mode_switch")
+
     scale = d.u.GetDpiForWindow(main) / 96
     outer, client = d.rect(main), d.rect(main, True)
     frame_w, frame_h = outer[2] - outer[0] - client[2], outer[3] - outer[1] - client[3]
@@ -325,7 +379,7 @@ def exercise(d, main, p, timeout, data, check):
          f"Minimum client dimensions wrong: {client}")
     check("minimum_client_size_enforced")
     final = parse_tracker(data)
-    return final, rows
+    return final, q(Q_RECORDS)
 
 
 def main():
@@ -347,8 +401,11 @@ def main():
         need(exe.is_file(), f"Executable unavailable: {exe}")
         d = Desktop()
         with tempfile.TemporaryDirectory(prefix="time-tracker-smoke-") as isolated:
-            env = dict(os.environ, LOCALAPPDATA=isolated, APPDATA=isolated, TEMP=isolated, TMP=isolated)
+            env = dict(os.environ, LOCALAPPDATA=isolated, APPDATA=isolated, TEMP=isolated, TMP=isolated,
+                       DAYLEDGER_TEST_SECONDS_PER_MINUTE="1")
             data = Path(isolated) / "DayLedger" / "tracker.dat"
+            data.parent.mkdir()
+            (data.parent / "settings.ini").write_text(POMODORO_SETTINGS, encoding="ascii")
 
             def launch():
                 return subprocess.Popen([str(exe)], cwd=str(exe.parent), env=env,
