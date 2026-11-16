@@ -1,0 +1,5 @@
+// RT_MANIFEST = 24, id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID
+// Because the manifest is embedded here, the linkers must NOT generate one
+// (/MANIFEST:NO on MSVC; MinGW never does).
+1 24 "app.manifest"
+// 1 ICON "app.ico"   // optional; the class picks it up via LoadIconW(hinst, MAKEINTRESOURCEW(1))

@@ -1,0 +1,15 @@
+*
+!.gitignore
+!build-mingw.sh
+!build-msvc.bat
+!src/
+src/*
+!src/main.cpp
+!src/time_tracker.cpp
+!src/tracker_model.h
+!src/app.manifest
+!src/resource.rc
+!tests/
+tests/*
+!tests/tracker_model_test.cpp
+!tests/desktop_smoke.py
