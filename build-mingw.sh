@@ -1,9 +1,11 @@
 #!/bin/sh
 # Native Windows builds (MinGW-w64).
-#   ./build-mingw.sh            -> build/TimeTracker.exe
+#   ./build-mingw.sh            -> build/TimeTracker.exe (DayLedger)
 #   ./build-mingw.sh legacy     -> build/pomodoro.exe (CRT-free)
 #   CRT=1 ./build-mingw.sh legacy -> build/pomodoro-crt.exe
 # Environment: CXX (default g++), WINDRES (default windres), USE_ZIG_RC=1 to use "zig rc".
+# Cross-compiling from Linux works too, e.g.
+#   CXX=x86_64-w64-mingw32-g++-posix WINDRES=x86_64-w64-mingw32-windres ./build-mingw.sh
 # Run from the project directory (the script cd's to its own location first).
 set -e
 cd "$(dirname "$0")"
@@ -11,14 +13,18 @@ CXX=${CXX:-g++}
 WINDRES=${WINDRES:-windres}
 mkdir -p build
 
-if [ -n "$USE_ZIG_RC" ]; then
-  zig rc src/resource.rc -o build/res.res; RES=build/res.res
-else
-  # -I src: the .rc references app.manifest relative to its own directory
-  "$WINDRES" -I src -O coff -o build/res.o src/resource.rc; RES=build/res.o
-fi
+# compile_rc <script> <basename>: sets RES to the compiled resource object.
+compile_rc() {
+  if [ -n "$USE_ZIG_RC" ]; then
+    zig rc "$1" -o "build/$2.res"; RES="build/$2.res"
+  else
+    # -I src: the .rc files reference their icon and manifest relative to their own directory
+    "$WINDRES" -I src -O coff -o "build/$2.o" "$1"; RES="build/$2.o"
+  fi
+}
 
 if [ "$1" != "legacy" ]; then
+  compile_rc src/time_tracker.rc time_tracker_res
   DM=$($CXX -print-file-name=default-manifest.o 2>/dev/null || true)
   STARTFILES=""; ENDFILES=""
   if [ -n "$DM" ] && [ -f "$DM" ]; then
@@ -27,10 +33,12 @@ if [ "$1" != "legacy" ]; then
   fi
   "$CXX" -std=c++17 -O2 -s -static -mwindows -DUNICODE -D_UNICODE -DWIN32_LEAN_AND_MEAN \
        -Wall -Wextra $STARTFILES -o build/TimeTracker.exe src/time_tracker.cpp $RES \
-       -luser32 -lgdi32 -lcomdlg32 -lcomctl32 -lshell32 -lole32 -luuid $ENDFILES
+       -luser32 -lgdi32 -lgdiplus -lcomdlg32 -lcomctl32 -lshell32 -lole32 -luuid -ladvapi32 $ENDFILES
   ls -l build/TimeTracker.exe
   exit 0
 fi
+
+compile_rc src/resource.rc res
 
 if [ "$CRT" = "1" ]; then
   # (4) MinGW-w64 with CRT (static libgcc/libstdc++, links the system CRT DLL) -> ~30-80 KB

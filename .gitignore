@@ -7,9 +7,15 @@ src/*
 !src/main.cpp
 !src/time_tracker.cpp
 !src/tracker_model.h
+!src/ui_kit.h
 !src/app.manifest
+!src/app.ico
 !src/resource.rc
+!src/time_tracker.rc
 !tests/
 tests/*
 !tests/tracker_model_test.cpp
 !tests/desktop_smoke.py
+!tools/
+tools/*
+!tools/make_icon.py

@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Control-ID desktop smoke. Windows Python and interactive desktop required; no installs."""
+"""Desktop smoke for the custom-drawn TimeTracker.exe. Windows Python and interactive desktop
+required; no installs. The window has no native controls, so the test drives the app through its
+automation interface (WM_COMMAND ids and the WM_DL_QUERY state message) and verifies every step
+against the binary ledger written to an isolated LOCALAPPDATA."""
 import argparse
 import ctypes as C
 from ctypes import wintypes as W
@@ -13,8 +16,21 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-COUNT, BM_CLICK, WM_CLOSE = 0x1004, 0xF5, 0x10
-NAME, RENAMED, COLOR = "桌面冒烟中文标签", "中文标签已重命名", 0xE06831
+WM_CLOSE, WM_COMMAND = 0x10, 0x111
+NAME, RENAMED = "桌面冒烟中文标签", "中文标签已重命名"
+VIOLET = 0xD65062  # COLORREF (0x00BBGGRR) of preset swatch 6, #6250d6
+
+# Automation interface of TimeTracker.exe (see the command enum in src/time_tracker.cpp).
+WM_DL_QUERY = 0x8000 + 0x40
+Q_TAGS, Q_RECORDS, Q_ACTIVE, Q_READONLY, Q_IS_TODAY, Q_SAVE_FAILED, Q_DARK, Q_SELECTED, Q_LOADED = range(9)
+CMD_PREV_DAY, CMD_NEXT_DAY, CMD_TODAY = 101, 102, 103
+CMD_NEW_TAG, CMD_STOP, CMD_ADD_RECORD, CMD_UNDO = 106, 110, 111, 112
+CMD_THEME_LIGHT, CMD_THEME_DARK = 121, 122
+CMD_TAG_FIRST, CMD_EDIT_TAG_FIRST, CMD_DELETE_RECORD_FIRST = 0x1000, 0x2000, 0x4000
+IDOK, IDCANCEL = 1, 2
+TD_NAME, TD_CUSTOM_COLOR, TD_CATEGORY_OTHER, TD_COLOR_FIRST = 201, 203, 213, 220
+RD_START, RD_END, RD_TAG_FIRST = 302, 303, 0x1000
+MIN_CLIENT = (880, 600)
 
 
 def need(value, message):
@@ -62,9 +78,12 @@ class Desktop:
     def post(self, hwnd, msg, wp=0, lp=0):
         need(self.u.PostMessageW(hwnd, msg, wp, lp), f"PostMessage {msg:#x} failed")
 
-    def click(self, hwnd):
-        need(self.u.IsWindowEnabled(hwnd), "Click target disabled")
-        self.post(hwnd, BM_CLICK)  # Never synchronously enter a modal loop.
+    def command(self, hwnd, identifier):
+        """Posted, never sent: a command may enter a modal loop (dialogs, colour picker)."""
+        self.post(hwnd, WM_COMMAND, identifier)
+
+    def query(self, hwnd, what):
+        return self.send(hwnd, WM_DL_QUERY, what)
 
     def control(self, hwnd, identifier):
         return need(self.u.GetDlgItem(hwnd, identifier), f"Missing control {identifier}")
@@ -99,37 +118,26 @@ class Desktop:
         self.u.EnumWindows(collect, 0)
         return found
 
+    def children(self, hwnd):
+        found = []
+
+        @self.callback
+        def collect(child, _):
+            found.append(int(child))
+            return True
+
+        self.u.EnumChildWindows(hwnd, collect, 0)
+        return found
+
     def top(self, pid, cls, owner=None):
         return next((h for h in self.windows(pid) if self.cls(h) == cls
                      and (owner is None or self.u.GetWindow(h, 4) == owner)), None)
-
-    def warning_button(self, warning):
-        buttons = []
-
-        @self.callback
-        def collect(hwnd, _):
-            if self.cls(hwnd) == "Button" and self.u.IsWindowVisible(hwnd):
-                buttons.append(hwnd)
-            return True
-
-        self.u.EnumChildWindows(warning, collect, 0)
-        return buttons[0] if len(buttons) == 1 else None
 
     def rect(self, hwnd, client=False):
         r = W.RECT()
         need((self.u.GetClientRect if client else self.u.GetWindowRect)(hwnd, C.byref(r)),
              "Cannot read rectangle")
         return r.left, r.top, r.right, r.bottom
-
-    def key(self, hwnd, key):
-        self.post(hwnd, 0x100, key, 1)
-        self.post(hwnd, 0x101, key, 0xC0000001)
-
-    def row(self, hwnd, index):
-        scale = self.u.GetDpiForWindow(hwnd) / 96
-        point = round(60 * scale) | (round((24 + index * 22 + 11) * scale) << 16)
-        self.post(hwnd, 0x201, 1, point)
-        self.post(hwnd, 0x202, 0, point)
 
 
 def wait(probe, timeout, process):
@@ -186,29 +194,29 @@ def parse_tracker(path):
 
 
 def exercise(d, main, p, timeout, data, check):
-    c = lambda i: d.control(main, i)
     until = lambda probe: wait(probe, timeout, p)
-    tags, records = c(104), c(105)
-    for i in range(101, 111):
-        need(d.cls(c(i)) == ("SysListView32" if i in (104, 105) else "Button"),
-             f"Incorrect control class {i}")
-    until(lambda: d.send(tags, COUNT) == 3)
-    need(d.send(records, COUNT) == 0, "Fresh ledger has records")
-    need(d.u.IsWindowEnabled(c(109)) and not d.u.IsWindowEnabled(c(110)), "Initial buttons wrong")
-    check("isolated_defaults_and_native_controls")
+    q = lambda what: d.query(main, what)
+    until(lambda: q(Q_LOADED) == 1)
+    need(q(Q_TAGS) == 3 and q(Q_RECORDS) == 0 and q(Q_ACTIVE) == 0 and q(Q_READONLY) == 0,
+         "Fresh ledger state wrong")
+    need(not d.children(main), "Main window should be fully custom drawn")
+    check("isolated_defaults_custom_drawn_window")
 
-    def editor(identifier):
-        d.click(c(identifier))
-        return until(lambda: d.top(p.pid, "DayLedgerTagEditor", main))
+    def editor(identifier, cls="DayLedgerTagEditor"):
+        d.command(main, identifier)
+        return until(lambda: d.top(p.pid, cls, main))
 
-    def finish(e, identifier=1):
-        d.click(d.control(e, identifier))
+    def finish(e, identifier=IDOK):
+        d.command(e, identifier)
         until(lambda: not d.u.IsWindow(e) and d.u.IsWindowEnabled(main))
+        d.send(main, 0)  # WM_NULL is answered only after the command (and its save) has finished
 
-    e = editor(106)
-    d.set_text(d.control(e, 201), NAME)
-    need(d.send(d.control(e, 202), 0x14E, 2) == 2, "Category selection failed")
-    d.click(d.control(e, 203))
+    e = editor(CMD_NEW_TAG)
+    need(not d.u.IsWindowEnabled(main), "Tag editor not modal")
+    d.set_text(d.control(e, TD_NAME), NAME)
+    d.command(e, TD_CATEGORY_OTHER)
+    d.command(e, TD_COLOR_FIRST + 6)
+    d.command(e, TD_CUSTOM_COLOR)
     picker = until(lambda: d.top(p.pid, "#32770", e))
     for identifier in (706, 707, 708):  # Standard ChooseColor RGB edits.
         need(d.cls(d.control(picker, identifier)) == "Edit", "Missing native RGB edit")
@@ -217,103 +225,107 @@ def exercise(d, main, p, timeout, data, check):
     until(lambda: not d.u.IsWindow(picker) and d.u.IsWindowEnabled(e))
     check("native_choose_color_inspected_and_canceled")
     finish(e)
-    until(lambda: d.send(tags, COUNT) == 4)
+    until(lambda: q(Q_TAGS) == 4)
     added = next(t for t in parse_tracker(data)["tags"] if t["name"] == NAME)
-    need(added["category"] == 2 and added["color"] == COLOR, "Tag category/color lost")
+    need(added["category"] == 2 and added["color"] == VIOLET, "Tag category/color lost")
+    need(q(Q_SELECTED) == added["id"], "New tag not selected")
     check("add_chinese_tag_category_color_persisted")
 
-    e = editor(107)
-    need(d.text(d.control(e, 201)) == NAME, "Wrong selected tag after add")
-    d.set_text(d.control(e, 201), RENAMED)
+    index = 3  # tags keep their order; the new tag is the fourth
+    e = editor(CMD_EDIT_TAG_FIRST + index)
+    need(d.text(d.control(e, TD_NAME)) == NAME, "Editor opened the wrong tag")
+    d.set_text(d.control(e, TD_NAME), RENAMED)
     finish(e)
     renamed = next(t for t in parse_tracker(data)["tags"] if t["id"] == added["id"])
     need(renamed == dict(added, name=RENAMED), "Rename lost values")
     check("edit_rename_persisted")
 
     before = parse_tracker(data)
-    e = editor(107)
-    d.set_text(d.control(e, 201), "")
-    d.click(d.control(e, 1))
-    warning = until(lambda: d.top(p.pid, "#32770", e))
-    need(d.text(warning) == "检查标签名称" and not d.u.IsWindowEnabled(e), "Wrong warning")
-    warning_ok = until(lambda: d.warning_button(warning))
-    d.click(warning_ok)
-    until(lambda: not d.u.IsWindow(warning) and d.u.IsWindowEnabled(e))
-    need(d.u.IsWindow(e), "Invalid name closed editor")
-    finish(e, 2)
+    e = editor(CMD_EDIT_TAG_FIRST + index)
+    d.set_text(d.control(e, TD_NAME), "   ")
+    d.command(e, IDOK)
+    d.send(e, 0)  # WM_NULL: queue barrier after the posted IDOK
+    time.sleep(0.3)
+    need(d.u.IsWindow(e) and d.u.IsWindowEnabled(e), "Blank name closed or blocked the editor")
+    need(not d.top(p.pid, "#32770", e), "Blank name should be reported inline, not in a message box")
+    finish(e, IDCANCEL)
     need(parse_tracker(data) == before, "Canceled edit changed ledger")
-    check("empty_name_modal_warning_dismiss_and_cancel")
+    check("blank_name_inline_error_and_cancel")
 
-    def start(expected):
-        d.click(c(109))
-        until(lambda: d.u.IsWindowEnabled(c(110)) and "暂停" in d.text(c(109)))
-        need(not d.u.IsWindowEnabled(c(108)), "Active tag deletion allowed")
+    def start(position, expected):
+        d.command(main, CMD_TAG_FIRST + position)
+        until(lambda: q(Q_ACTIVE) == expected)
         need(parse_tracker(data)["active"] == expected, "Wrong active tag saved")
 
-    def pause():
-        d.click(c(109))
-        until(lambda: not d.u.IsWindowEnabled(c(110)))
-        need(parse_tracker(data)["active"] == 0, "Pause not saved")
+    def stop():
+        d.command(main, CMD_STOP)
+        until(lambda: q(Q_ACTIVE) == 0)
+        need(parse_tracker(data)["active"] == 0, "Stop not saved")
 
-    start(added["id"])
+    start(index, added["id"])
     time.sleep(1.3)  # Required elapsed whole second; not a painted-clock assertion.
-    pause()
-    until(lambda: d.send(records, COUNT) > 0)
+    stop()
+    until(lambda: q(Q_RECORDS) > 0)
     need(any(s["tag"] == added["id"] and s["end"] - s["start"] >= 1
              for s in parse_tracker(data)["sessions"]), "No positive-duration session")
-    check("start_elapsed_second_pause_record_count")
+    check("start_elapsed_second_stop_record_count")
 
-    # Pointer-free selection: mouse client coordinates and native list keyboard.
-    d.row(tags, 0)
-    d.key(tags, 0x24)  # VK_HOME
-    until(lambda: d.u.IsWindowEnabled(c(109)))
-    # WM_NULL is a synchronous queue barrier after the posted mouse/key pair.
-    d.send(tags, 0)
-    start(1)
+    start(0, 1)
     time.sleep(1.3)
-    d.key(tags, 0x24)
-    d.key(tags, 0x28)  # VK_DOWN
-    until(lambda: d.u.IsWindowEnabled(c(109)))
-    start(2)
+    start(1, 2)
     need(any(s["tag"] == 1 for s in parse_tracker(data)["sessions"]), "Switch not saved")
     time.sleep(1.3)
-    pause()
+    d.command(main, CMD_TAG_FIRST + 1)  # the running tag's command stops it
+    until(lambda: q(Q_ACTIVE) == 0)
     final = parse_tracker(data)
-    need(len(final["sessions"]) >= 2 and {1, 2, added["id"]} <=
-         {s["tag"] for s in final["sessions"]}, "Missing switched sessions")
-    check("keyboard_switch_and_pause_binary_nonoverlap")
+    need(final["active"] == 0 and len(final["sessions"]) >= 3 and
+         {1, 2, added["id"]} <= {s["tag"] for s in final["sessions"]}, "Missing switched sessions")
+    check("switch_and_toggle_stop_binary_nonoverlap")
 
-    rows = d.send(records, COUNT)
-    d.click(c(101))
-    until(lambda: d.send(records, COUNT) == 0)
-    d.click(c(102))
-    until(lambda: d.send(records, COUNT) == rows)
-    need(not d.u.IsWindowEnabled(c(102)) and not d.u.IsWindowEnabled(c(103)), "Today navigation should be disabled")
+    rows = q(Q_RECORDS)
+    d.command(main, CMD_PREV_DAY)
+    until(lambda: q(Q_IS_TODAY) == 0 and q(Q_RECORDS) == 0)
+    e = editor(CMD_ADD_RECORD, "DayLedgerRecordEditor")
+    d.command(e, RD_TAG_FIRST + 0)
+    d.set_text(d.control(e, RD_START), "10:00")
+    d.set_text(d.control(e, RD_END), "10:30")
+    finish(e)
+    until(lambda: q(Q_RECORDS) == 1)
+    manual = [s for s in parse_tracker(data)["sessions"] if s["end"] - s["start"] == 1800 and s["tag"] == 1]
+    need(len(manual) == 1, "Manual record not saved")
+    d.command(main, CMD_DELETE_RECORD_FIRST + 0)
+    until(lambda: q(Q_RECORDS) == 0)
+    need(manual[0] not in parse_tracker(data)["sessions"], "Deleted record still saved")
+    d.command(main, CMD_UNDO)
+    until(lambda: q(Q_RECORDS) == 1)
+    need(manual[0] in parse_tracker(data)["sessions"], "Undo did not restore the record")
+    check("manual_record_add_delete_undo")
+
+    d.command(main, CMD_NEXT_DAY)
+    until(lambda: q(Q_IS_TODAY) == 1 and q(Q_RECORDS) == rows)
+    d.command(main, CMD_NEXT_DAY)  # no future days
+    d.command(main, CMD_PREV_DAY)
+    d.command(main, CMD_TODAY)
+    until(lambda: q(Q_IS_TODAY) == 1 and q(Q_RECORDS) == rows)
     check("previous_next_today_navigation")
+
+    d.command(main, CMD_THEME_DARK)
+    until(lambda: q(Q_DARK) == 1)
+    d.command(main, CMD_THEME_LIGHT)
+    until(lambda: q(Q_DARK) == 0)
+    check("theme_switch")
 
     scale = d.u.GetDpiForWindow(main) / 96
     outer, client = d.rect(main), d.rect(main, True)
-    width = round(850 * scale) + outer[2] - outer[0] - client[2]
-    height = round(650 * scale) + outer[3] - outer[1] - client[3]
-    need(d.u.MoveWindow(main, outer[0], outer[1], width, height, True), "Resize failed")
+    frame_w, frame_h = outer[2] - outer[0] - client[2], outer[3] - outer[1] - client[3]
+    need(d.u.MoveWindow(main, outer[0], outer[1], 500 + frame_w, 400 + frame_h, True), "Resize failed")
     d.text(main)  # Queue/layout barrier, not a painted text assertion.
     client = d.rect(main, True)
-    need(abs(client[2] - 850 * scale) <= 1 and abs(client[3] - 650 * scale) <= 1,
-         "Minimum client dimensions wrong")
-    origin = W.POINT(0, 0)
-    need(d.u.ClientToScreen(main, C.byref(origin)), "Client origin unavailable")
-    rectangles = []
-    for i in range(101, 111):
-        l, t, r, b = d.rect(c(i))
-        box = l - origin.x, t - origin.y, r - origin.x, b - origin.y
-        need(0 <= box[0] < box[2] <= client[2] and 0 <= box[1] < box[3] <= client[3],
-             f"Clipped/empty control {i}: {box}")
-        for j, other in rectangles:
-            need(min(box[2], other[2]) <= max(box[0], other[0]) or
-                 min(box[3], other[3]) <= max(box[1], other[1]), f"Controls {i}/{j} overlap")
-        rectangles.append((i, box))
-    check("minimum_size_child_bounds_no_overlap")
-    return final
+    need(abs(client[2] - MIN_CLIENT[0] * scale) <= 1 and abs(client[3] - MIN_CLIENT[1] * scale) <= 1,
+         f"Minimum client dimensions wrong: {client}")
+    check("minimum_client_size_enforced")
+    final = parse_tracker(data)
+    return final, rows
 
 
 def main():
@@ -352,7 +364,7 @@ def main():
                 window = wait(lambda: d.top(p.pid, "DayLedgerNativeWindow"), args.timeout, p)
                 check("visible_main_window")
                 if not args.inspect_only:
-                    expected = exercise(d, window, p, args.timeout, data, check)
+                    expected, rows = exercise(d, window, p, args.timeout, data, check)
                 stage = "screenshot"
                 from PIL import ImageGrab
                 output = args.screenshot.resolve()
@@ -373,16 +385,17 @@ def main():
                     stage = "reopen persisted ledger"
                     p = launch()
                     window = wait(lambda: d.top(p.pid, "DayLedgerNativeWindow"), args.timeout, p)
-                    wait(lambda: d.send(d.control(window, 104), COUNT) == len(saved["tags"])
-                         and d.send(d.control(window, 105), COUNT) == len(saved["sessions"]), args.timeout, p)
-                    need(not d.u.IsWindowEnabled(d.control(window, 110)), "Reopened timer active")
-                    need(d.u.IsWindowEnabled(d.control(window, 106)), "Reopened ledger read-only")
+                    wait(lambda: d.query(window, Q_LOADED) == 1 and
+                         d.query(window, Q_TAGS) == len(saved["tags"]) and
+                         d.query(window, Q_RECORDS) == rows, args.timeout, p)
+                    need(d.query(window, Q_ACTIVE) == 0, "Reopened timer active")
+                    need(d.query(window, Q_READONLY) == 0, "Reopened ledger read-only")
                     check("reopen_same_isolated_directory_tag_and_record_rows")
                     close()
                     need(parse_tracker(data) == saved, "Reopen changed persisted ledger")
                     check("reopened_graceful_shutdown_binary_unchanged")
                     result["persisted"] = dict(tags=len(saved["tags"]), sessions=len(saved["sessions"]),
-                                               active=0, chinese_tag=RENAMED, category=2, color=hex(COLOR))
+                                               active=0, chinese_tag=RENAMED, category=2, color=hex(VIOLET))
             finally:
                 if p is not None and p.poll() is None:
                     for h in d.windows(p.pid):
