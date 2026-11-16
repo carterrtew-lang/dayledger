@@ -33,21 +33,109 @@ struct DayStats {
 
 enum class Recovery { EndAtLastSaved, Continue, Discard };
 
+// Outcome of a record edit. `conflict` names the overlapping record (an index into
+// Model::sessions), or -2 for the running segment, when status is Overlap.
+enum class EditStatus { Ok, UnknownTag, InvalidRange, InFuture, Overlap, NotFound, NotRunning };
+struct EditResult {
+    EditStatus status = EditStatus::Ok;
+    int conflict = -1;
+    explicit operator bool() const { return status == EditStatus::Ok; }
+};
+
 class Model {
 public:
     std::vector<Tag> tags;
-    std::vector<Session> sessions;
+    std::vector<Session> sessions;   // kept sorted by start, never overlapping
     int activeTagId = 0;
     long long activeSince = 0;
     long long lastSaved = 0;
 
-    Model() : tags{{1, L"\u5de5\u4f5c", 0x00D99A45u, Category::Work},
-                   {2, L"\u5a31\u4e50", 0x0085BA60u, Category::Play},
-                   {3, L"\u5176\u4ed6", 0x00B09A91u, Category::Other}} {}
+    // COLORREF values (0x00BBGGRR) of the default work / play / other hues.
+    Model() : tags{{1, L"\u5de5\u4f5c", 0x00D6782Au, Category::Work},
+                   {2, L"\u5a31\u4e50", 0x003468EBu, Category::Play},
+                   {3, L"\u5176\u4ed6", 0x007AAF1Bu, Category::Other}} {}
 
     const Tag* findTag(int id) const {
         for (const auto& tag : tags) if (tag.id == id) return &tag;
         return nullptr;
+    }
+
+    int tagIndex(int id) const {
+        for (std::size_t i = 0; i < tags.size(); ++i) if (tags[i].id == id) return static_cast<int>(i);
+        return -1;
+    }
+
+    // Moves a tag one place up (delta < 0) or down (delta > 0); the order is persisted.
+    bool moveTag(int id, int delta) {
+        const int from = tagIndex(id);
+        const int to = from + (delta < 0 ? -1 : 1);
+        if (from < 0 || delta == 0 || to < 0 || to >= static_cast<int>(tags.size())) return false;
+        std::swap(tags[static_cast<std::size_t>(from)], tags[static_cast<std::size_t>(to)]);
+        return true;
+    }
+
+    std::size_t sessionCount(int tagId) const {
+        return static_cast<std::size_t>(std::count_if(sessions.begin(), sessions.end(),
+            [tagId](const Session& session) { return session.tagId == tagId; }));
+    }
+
+    // The tag of the running segment, otherwise of the most recent record (0 when none).
+    int lastUsedTag() const {
+        if (activeTagId) return activeTagId;
+        return sessions.empty() ? 0 : sessions.back().tagId;
+    }
+
+    // Validates [start, end) for a record of tagId against every record except `ignore`
+    // and against the running segment. Records may not reach past `now`.
+    EditResult checkRange(int tagId, long long start, long long end, long long now,
+                          long long ignore = -1) const {
+        if (!findTag(tagId)) return {EditStatus::UnknownTag};
+        if (!validTime(start) || !validTime(end) || end <= start) return {EditStatus::InvalidRange};
+        if (validTime(now) && end > now) return {EditStatus::InFuture};
+        for (std::size_t i = 0; i < sessions.size(); ++i) {
+            if (static_cast<long long>(i) == ignore) continue;
+            if (start < sessions[i].end && sessions[i].start < end)
+                return {EditStatus::Overlap, static_cast<int>(i)};
+        }
+        if (activeTagId && end > activeSince) return {EditStatus::Overlap, -2};
+        return {};
+    }
+
+    EditResult addSession(int tagId, long long start, long long end, long long now) {
+        const auto result = checkRange(tagId, start, end, now);
+        if (!result) return result;
+        if (sessions.size() >= maxSessions) return {EditStatus::InvalidRange};
+        insertSorted({tagId, start, end});
+        return {};
+    }
+
+    EditResult updateSession(std::size_t index, int tagId, long long start, long long end,
+                             long long now) {
+        if (index >= sessions.size()) return {EditStatus::NotFound};
+        const auto result = checkRange(tagId, start, end, now, static_cast<long long>(index));
+        if (!result) return result;
+        sessions.erase(sessions.begin() + static_cast<std::ptrdiff_t>(index));
+        insertSorted({tagId, start, end});
+        return {};
+    }
+
+    bool removeSession(std::size_t index) {
+        if (index >= sessions.size()) return false;
+        sessions.erase(sessions.begin() + static_cast<std::ptrdiff_t>(index));
+        return true;
+    }
+
+    // Re-labels and/or re-times the running segment. It must still start after every record.
+    EditResult updateActive(int tagId, long long since, long long now) {
+        if (!activeTagId) return {EditStatus::NotRunning};
+        if (!findTag(tagId)) return {EditStatus::UnknownTag};
+        if (!validTime(since)) return {EditStatus::InvalidRange};
+        if (validTime(now) && since > now) return {EditStatus::InFuture};
+        for (std::size_t i = 0; i < sessions.size(); ++i)
+            if (sessions[i].end > since) return {EditStatus::Overlap, static_cast<int>(i)};
+        activeTagId = tagId;
+        activeSince = since;
+        return {};
     }
 
     int addTag(const std::wstring& name, unsigned color, Category category) {
@@ -261,6 +349,11 @@ private:
     inline static constexpr std::array<char, 8> legacyMagic{'T','R','A','C','K','E','R','1'};
 
     static bool validTime(long long time) { return time >= 0 && time <= maxTime; }
+    void insertSorted(const Session& session) {
+        const auto at = std::upper_bound(sessions.begin(), sessions.end(), session,
+            [](const Session& a, const Session& b) { return a.start < b.start; });
+        sessions.insert(at, session);
+    }
     static void cleanup(const std::filesystem::path& path) noexcept {
         std::error_code error;
         if (!path.empty()) std::filesystem::remove(path, error);

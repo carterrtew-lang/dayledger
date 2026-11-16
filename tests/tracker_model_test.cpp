@@ -127,6 +127,60 @@ void tagTests() {
     check(!model.removeTag(999), "unknown remove fails");
 }
 
+void editingTests() {
+    using tracker::EditStatus;
+    tracker::Model model;
+    check(model.lastUsedTag() == 0, "no last tag on empty ledger");
+    model.start(1, 100);
+    model.start(2, 200);
+    model.stop(300);
+    // Records: [100,200) tag 1, [200,300) tag 2.
+    check(model.lastUsedTag() == 2 && model.sessionCount(1) == 1, "last used and per-tag count");
+
+    auto result = model.addSession(3, 300, 400, 1000);
+    check(result && model.sessions.size() == 3 && model.sessions[2].tagId == 3, "append manual record");
+    result = model.addSession(3, 40, 90, 1000);
+    check(result && model.sessions.front().start == 40, "manual record inserted in start order");
+    result = model.addSession(3, 150, 250, 1000);
+    check(result.status == EditStatus::Overlap && result.conflict == 1, "overlap names the conflict");
+    check(model.addSession(3, 500, 600, 550).status == EditStatus::InFuture, "future record rejected");
+    check(model.addSession(3, 600, 600, 1000).status == EditStatus::InvalidRange, "empty record rejected");
+    check(model.addSession(99, 600, 700, 1000).status == EditStatus::UnknownTag, "unknown tag rejected");
+    check(static_cast<bool>(model.addSession(3, 90, 100, 1000)), "touching records allowed");
+    check(model.sessions.size() == 5, "five records");
+
+    // Records: [40,90) 3, [90,100) 3, [100,200) 1, [200,300) 2, [300,400) 3.
+    check(model.updateSession(2, 2, 100, 190, 1000) && model.sessions[2].end == 190 &&
+          model.sessions[2].tagId == 2, "shrink and retag a record");
+    check(model.updateSession(2, 2, 100, 210, 1000).status == EditStatus::Overlap,
+          "growing into the next record rejected");
+    check(static_cast<bool>(model.updateSession(0, 3, 0, 90, 1000)) && model.sessions[0].start == 0,
+          "move start earlier");
+    check(model.updateSession(9, 3, 0, 90, 1000).status == EditStatus::NotFound, "unknown record index");
+    check(model.updateSession(4, 3, 450, 500, 1000) && model.sessions.back().start == 450,
+          "moving a record keeps start order");
+    check(model.removeSession(1) && model.sessions.size() == 4 && !model.removeSession(9),
+          "remove record by index");
+
+    model.start(1, 1000);
+    check(model.addSession(3, 900, 1100, 2000).status == EditStatus::Overlap,
+          "record cannot overlap the running segment");
+    result = model.addSession(3, 900, 1100, 2000);
+    check(result.conflict == -2, "running segment conflict marker");
+    check(model.updateActive(2, 950, 1200) && model.activeTagId == 2 && model.activeSince == 950,
+          "running segment retagged and moved earlier");
+    check(model.updateActive(2, 480, 1200).status == EditStatus::Overlap, "running start cannot overlap");
+    check(model.updateActive(2, 1300, 1200).status == EditStatus::InFuture, "running start not in future");
+    check(model.updateActive(77, 960, 1200).status == EditStatus::UnknownTag, "running retag needs a tag");
+    check(model.stats(0, 2000, 1200).total == 90 + 90 + 100 + 50 + 250, "edited totals");
+    model.stop(1200);
+    check(model.updateActive(1, 1100, 1300).status == EditStatus::NotRunning, "nothing running");
+
+    check(model.moveTag(3, -1) && model.tags[1].id == 3 && model.tagIndex(3) == 1, "move tag up");
+    check(!model.moveTag(1, -1) && !model.moveTag(99, 1), "move tag at edge or unknown");
+    check(model.moveTag(3, 1) && model.tags[2].id == 3, "move tag down");
+}
+
 void persistenceTests(const std::filesystem::path& directory) {
     const auto path = directory / L"\u65f6\u95f4-\u8bb0\u5f55.bin";
     const auto corruptPath = directory / L"corrupt.bin";
@@ -225,6 +279,7 @@ int main() {
         TempFiles files;
         timingTests();
         tagTests();
+        editingTests();
         persistenceTests(files.directory);
         tracker::Model recovery;
         recovery.start(1, 100);
