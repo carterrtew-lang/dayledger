@@ -1,5 +1,6 @@
-// DayLedger (时光账本) - a native Win32 day ledger: one-click tag timers, a daily work / play /
-// other breakdown, a 24-hour timeline, an editable record list and a weekly chart.
+// DayLedger (时光账本) - a native Win32 day ledger: one-click tag timers with an optional pomodoro
+// rhythm, a daily work / play / other breakdown, a 24-hour timeline, an editable record list, a
+// weekly chart and a floating mini window.
 // Everything in the main window is custom drawn (GDI+ shapes, GDI ClearType text); only the
 // text fields in the dialogs are native EDIT controls.
 // Link: user32 gdi32 gdiplus comdlg32 comctl32 shell32 ole32 uuid advapi32.
@@ -30,6 +31,7 @@
 #include <string>
 #include <vector>
 #include "tracker_model.h"
+#include "pomodoro.h"
 #include "ui_kit.h"
 
 namespace {
@@ -47,6 +49,10 @@ enum : int {
     CMD_RETRY_SAVE = 114, CMD_TAG_UP = 115, CMD_TAG_DOWN = 116, CMD_EXPORT = 117,
     CMD_OPEN_FOLDER = 118, CMD_SHORTCUTS = 119, CMD_THEME_SYSTEM = 120, CMD_THEME_LIGHT = 121,
     CMD_THEME_DARK = 122, CMD_MENU = 123, CMD_SPACE = 124, CMD_ABOUT = 125,
+    CMD_POMODORO_TOGGLE = 126, CMD_POMODORO_PAUSE = 127, CMD_POMODORO_SKIP = 128,
+    CMD_POMODORO_ABANDON = 129, CMD_MINI = 130, CMD_POMODORO_SETTINGS = 131, CMD_TOPMOST = 132,
+    CMD_AUTOSTART = 133, CMD_POMODORO_START = 134, CMD_SOUND = 135, CMD_POMODORO_ON = 136,
+    CMD_POMODORO_OFF = 137,
     CMD_TAG_FIRST = 0x1000,           // + tag index: start, switch to, or stop that tag
     CMD_EDIT_TAG_FIRST = 0x2000,      // + tag index: edit that tag
     CMD_EDIT_RECORD_FIRST = 0x3000,   // + row of the record list (newest first)
@@ -56,7 +62,9 @@ enum : int {
 // SendMessage(main, WM_DL_QUERY, what, 0) reads window state (automation interface).
 constexpr UINT WM_DL_QUERY = WM_APP + 0x40;
 enum : int { Q_TAGS = 0, Q_RECORDS = 1, Q_ACTIVE = 2, Q_READONLY = 3, Q_IS_TODAY = 4,
-             Q_SAVE_FAILED = 5, Q_DARK = 6, Q_SELECTED_TAG = 7, Q_LOADED = 8 };
+             Q_SAVE_FAILED = 5, Q_DARK = 6, Q_SELECTED_TAG = 7, Q_LOADED = 8, Q_POMODORO_MODE = 9,
+             Q_POMODORO_PHASE = 10, Q_POMODORO_PAUSED = 11, Q_POMODORO_REMAINING = 12,
+             Q_POMODOROS_TODAY = 13, Q_MINI = 14, Q_REST_TAG = 15, Q_TOPMOST = 16 };
 constexpr UINT WM_DL_LOAD = WM_APP + 1;
 constexpr UINT WM_DL_ACTIVATE = WM_APP + 2;
 
@@ -65,6 +73,9 @@ enum : int { TD_NAME = 201, TD_CUSTOM_COLOR = 203, TD_DELETE = 204, TD_CATEGORY_
              TD_COLOR_FIRST = 220 };
 // Record dialog (class DayLedgerRecordEditor).
 enum : int { RD_START = 302, RD_END = 303, RD_DELETE = 304, RD_TAG_FIRST = 0x1000 };
+// Pomodoro settings dialog (class DayLedgerPomodoroSettings).
+enum : int { PD_FOCUS = 401, PD_SHORT = 402, PD_LONG = 403, PD_EVERY = 404, PD_AUTO = 405, PD_SOUND = 406,
+             PD_DEFAULTS = 407 };
 
 enum : UINT_PTR { TID_TICK = 1, TID_TIP = 2 };
 
@@ -72,8 +83,11 @@ enum HitKind : int {
     HK_NONE, HK_TAG, HK_TAG_EDIT, HK_TAG_SCROLL, HK_RECORD, HK_RECORD_EDIT, HK_RECORD_DELETE,
     HK_RECORD_SCROLL, HK_PREV, HK_NEXT, HK_TODAY, HK_THEME, HK_MENU, HK_STOP, HK_RESUME,
     HK_NEW_TAG, HK_ADD_RECORD, HK_WEEK_DAY, HK_SEGMENT, HK_TOAST_ACTION, HK_RETRY, HK_NOW,
-    HK_STATUS, HK_DIALOG,
+    HK_STATUS, HK_MODE_FREE, HK_MODE_POMODORO, HK_POMO_START, HK_POMO_PAUSE, HK_POMO_RESUME,
+    HK_POMO_SKIP, HK_POMO_ABANDON, HK_POMO_SETTINGS, HK_MINI, HK_MINI_EXPAND, HK_DIALOG,
 };
+
+enum ToastKind : int { TOAST_PLAIN, TOAST_UNDO, TOAST_START_FOCUS };
 constexpr int Hid(int kind, int index = 0) { return (kind << 20) | (index & 0xFFFFF); }
 constexpr int KindOf(int id) { return id >> 20; }
 constexpr int IndexOf(int id) { return id & 0xFFFFF; }
@@ -132,10 +146,24 @@ struct App {
     int tagScroll = 0, recordScroll = 0, tagContent = 0, recordContent = 0;
     int dragKind = 0, dragStartY = 0, dragStartScroll = 0;
     // feedback
-    std::wstring toast, toastAction;
-    long long toastUntil = 0;
+    std::wstring toast;
+    int toastKind = TOAST_PLAIN;
+    long long toastUntil = 0, pulseUntil = 0;
     Undo undo;
     int modal = 0;
+    // pomodoro
+    tracker::Pomodoro pomodoro;
+    bool pomodoroMode = false, soundOn = true, topmost = false;
+    long long secondsPerMinute = 60;    // test hook: DAYLEDGER_TEST_SECONDS_PER_MINUTE
+    // floating mini window
+    HWND mini = nullptr;
+    bool miniMode = false, miniDragging = false, miniTracking = false;
+    UINT miniDpi = 96;
+    Fonts miniFonts;
+    Surface miniSurface;
+    std::vector<Hit> miniHits;
+    int miniHot = 0, miniPressed = 0;
+    POINT miniCursor{}, miniOrigin{};
     // window
     Surface surface;
     HACCEL accel = nullptr;
@@ -390,10 +418,26 @@ void ApplyTheme() {
 void SaveSetting(const wchar_t* section, const wchar_t* key, long long value) {
     if (app.settingsPath.empty() || app.readOnly) return;
     WritePrivateProfileStringW(section, key, std::to_wstring(value).c_str(), app.settingsPath.c_str());
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, app.settingsPath.c_str());   // flush the profile cache
 }
 int ReadSetting(const wchar_t* section, const wchar_t* key, int fallback) {
     if (app.settingsPath.empty()) return fallback;
     return static_cast<int>(GetPrivateProfileIntW(section, key, fallback, app.settingsPath.c_str()));
+}
+
+// Durations are stored in minutes; the test hook can shrink a minute to a few seconds.
+void LoadSettings() {
+    app.themeMode = std::clamp(ReadSetting(L"ui", L"theme", 0), 0, 2);
+    app.pomodoroMode = ReadSetting(L"pomodoro", L"mode", 0) != 0;
+    app.soundOn = ReadSetting(L"pomodoro", L"sound", 1) != 0;
+    app.topmost = ReadSetting(L"window", L"topmost", 0) != 0;
+    auto& config = app.pomodoro.config;
+    config.focus = std::clamp(ReadSetting(L"pomodoro", L"focus", 25), 1, 180) * app.secondsPerMinute;
+    config.shortBreak = std::clamp(ReadSetting(L"pomodoro", L"short", 5), 1, 60) * app.secondsPerMinute;
+    config.longBreak = std::clamp(ReadSetting(L"pomodoro", L"long", 15), 1, 120) * app.secondsPerMinute;
+    config.longEvery = std::clamp(ReadSetting(L"pomodoro", L"every", 4), 2, 12);
+    config.autoNext = ReadSetting(L"pomodoro", L"autoNext", 0) != 0;
+    app.pomodoro.restTag = ReadSetting(L"pomodoro", L"restTag", 0);
 }
 
 void SavePlacement() {
@@ -425,7 +469,10 @@ bool RestorePlacement(bool& maximized) {
 // ---------------------------------------------------------------- persistence
 
 void Refresh();
-void ShowToast(const std::wstring& text, const std::wstring& action = {}, int seconds = 5);
+void ShowToast(const std::wstring& text, int kind = TOAST_PLAIN, int seconds = 5);
+int LastWorkTag();
+int NextFocusTag();
+bool PomodoroCard();
 
 bool Persist(bool notify) {
     if (app.readOnly) return false;
@@ -532,7 +579,15 @@ void LoadData() {
 
 void UpdateTitle() {
     std::wstring title = L"时光账本";
-    if (const auto* tag = app.model.findTag(app.model.activeTagId)) {
+    const auto& p = app.pomodoro;
+    if (app.pomodoroMode && p.phase != tracker::PomodoroPhase::Ready) {
+        const long long left = p.remainingAt(Now());
+        const std::wstring rest = Format(L"剩 %lld 分", (left + 59) / 60);
+        if (p.paused) title = L"已暂停 · " + rest + L" — 时光账本";
+        else if (p.phase == tracker::PomodoroPhase::Break) title = L"休息中 · " + rest + L" — 时光账本";
+        else if (const auto* tag = app.model.findTag(app.model.activeTagId))
+            title = L"专注中 · " + tag->name + L" · " + rest + L" — 时光账本";
+    } else if (const auto* tag = app.model.findTag(app.model.activeTagId)) {
         const long long elapsed = std::max(0LL, Now() - app.model.activeSince);
         title = tag->name + Format(L" · %lld:%02lld — 时光账本", elapsed / 3600, elapsed / 60 % 60);
     }
@@ -571,11 +626,19 @@ void Refresh() {
     InvalidateRect(app.hwnd, nullptr, FALSE);
 }
 
-void ShowToast(const std::wstring& text, const std::wstring& action, int seconds) {
+void ShowToast(const std::wstring& text, int kind, int seconds) {
     app.toast = text;
-    app.toastAction = action;
+    app.toastKind = kind;
     app.toastUntil = Now() + seconds;
     InvalidateRect(app.hwnd, nullptr, FALSE);
+}
+
+const wchar_t* ToastActionLabel(int kind) {
+    switch (kind) {
+    case TOAST_UNDO: return L"撤销";
+    case TOAST_START_FOCUS: return L"开始专注";
+    default: return L"";
+    }
 }
 
 // ---------------------------------------------------------------- drawing helpers
@@ -698,9 +761,9 @@ void PaintLogo(Canvas& c, const RECT& r) {
 }
 
 // The running clock: each digit in a fixed-width cell so ticking never shifts the layout.
-void PaintClock(Ctx& x, long long seconds, int left, int top, COLORREF color) {
+void PaintClock(Ctx& x, const std::wstring& text, int left, int top, COLORREF color) {
     int cx = left;
-    for (wchar_t ch : ClockText(seconds)) {
+    for (wchar_t ch : text) {
         const int w = ch == L':' ? x.f.clockColon : x.f.clockCell;
         x.c.Text(std::wstring(1, ch), RECT{cx, top, cx + w, top + x.f.clockHeight}, x.f.clock, color,
                  DT_CENTER | DT_TOP | DT_SINGLELINE);
@@ -741,62 +804,207 @@ void PaintBrand(Ctx& x, const RECT& r) {
     const RECT logo{r.left, r.top + (Ht(r) - size) / 2, r.left + size, r.top + (Ht(r) - size) / 2 + size};
     PaintLogo(x.c, logo);
     const int tx = logo.right + S(12);
-    x.c.Text(L"时光账本", RECT{tx, logo.top - S(2), r.right - S(80), logo.top + S(21)}, x.f.brand, x.p.text);
-    x.c.Text(L"DayLedger · 每一分钟都算数", RECT{tx, logo.top + S(19), r.right - S(80), logo.bottom + S(3)},
+    x.c.Text(L"时光账本", RECT{tx, logo.top - S(2), r.right - S(118), logo.top + S(21)}, x.f.brand, x.p.text);
+    x.c.Text(L"DayLedger · 每一分钟都算数", RECT{tx, logo.top + S(19), r.right - S(118), logo.bottom + S(3)},
              x.f.caption, x.p.text3);
     const RECT menu{r.right - S(34), logo.top + S(1), r.right, logo.bottom + S(-1)};
     const RECT theme{menu.left - S(38), menu.top, menu.left - S(4), menu.bottom};
+    const RECT miniButton{theme.left - S(38), menu.top, theme.left - S(4), menu.bottom};
+    IconButton(x, miniButton, Icon::MiniWindow, Hid(HK_MINI), L"迷你悬浮窗（M）");
     IconButton(x, theme, x.p.dark ? Icon::Sun : Icon::Moon, Hid(HK_THEME),
                x.p.dark ? L"切换到浅色主题" : L"切换到深色主题");
     IconButton(x, menu, Icon::More, Hid(HK_MENU), L"更多：导出、主题、快捷键");
 }
 
-void PaintTimer(Ctx& x, const RECT& r) {
+// "18:42" for a countdown; hours appear only for very long phases.
+std::wstring CountdownText(long long seconds) {
+    seconds = std::max(0LL, seconds);
+    if (seconds >= 6000) return ClockText(seconds);
+    return Format(L"%02lld:%02lld", seconds / 60, seconds % 60);
+}
+
+void PaintModeSwitch(Ctx& x, const RECT& r) {
+    auto& c = x.c;
+    c.Round(r, Sf(9), x.p.dark ? x.p.bg : x.p.track);
+    const int partW = (Wd(r) - S(4)) / 2;
+    for (int i = 0; i < 2; ++i) {
+        const bool selected = (i == 1) == app.pomodoroMode;
+        const int id = Hid(i ? HK_MODE_POMODORO : HK_MODE_FREE);
+        const RECT part{r.left + S(2) + i * partW, r.top + S(2), r.left + S(2) + (i + 1) * partW, r.bottom - S(2)};
+        if (selected) c.Round(part, Sf(7), x.p.dark ? x.p.pressed : x.p.surface);
+        else if (app.hot == id) c.Round(part, Sf(7), x.p.dark ? x.p.hover : x.p.pressed);
+        c.Text(i ? L"番茄钟" : L"计时", part, selected ? x.f.labelBold : x.f.label, selected ? x.p.text : x.p.text2,
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (!selected)
+            Hot(x, part, id, i ? L"番茄钟：专注 " + DurationText(app.pomodoro.config.focus) + L"，然后休息（P）"
+                               : std::wstring(L"自由计时（P）"));
+    }
+}
+
+void PaintFreeTimer(Ctx& x, const RECT& r, int top, int statusRight) {
     auto& c = x.c;
     const auto& model = app.model;
     const auto* active = model.findTag(model.activeTagId);
-    const COLORREF tint = active ? active->color : x.p.text3;
-    const COLORREF fill = active ? Mix(x.p.surface, tint, x.p.dark ? 0.15 : 0.075) : x.p.surface;
-    const COLORREF border = active ? Mix(x.p.border, tint, x.p.dark ? 0.45 : 0.32) : x.p.border;
-    c.Shadow(r, Sf(16), x.p.shadow);
-    c.Bordered(r, Sf(16), fill, border);
     const int left = r.left + S(20), right = r.right - S(20);
-    int y = r.top + S(18);
-    // status row
+    int y = top;
     if (active) {
-        c.Circle(left + Sf(4), y + Sf(10), Sf(7), tint, 50);
-        c.Circle(left + Sf(4), y + Sf(10), Sf(4), tint);
-    } else c.Circle(left + Sf(4), y + Sf(10), Sf(4), x.p.text3);
-    c.Text(active ? L"正在记录" : L"未在计时", RECT{left + S(16), y, right - S(120), y + S(20)}, x.f.labelBold,
+        c.Circle(left + Sf(4), y + Sf(12), Sf(7), active->color, 50);
+        c.Circle(left + Sf(4), y + Sf(12), Sf(4), active->color);
+    } else c.Circle(left + Sf(4), y + Sf(12), Sf(4), x.p.text3);
+    c.Text(active ? L"正在记录" : L"未在计时", RECT{left + S(16), y, statusRight, y + S(24)}, x.f.labelBold,
            active ? x.p.text2 : x.p.text3);
-    if (active) {
-        const auto found = app.today.byTag.find(active->id);
-        const long long total = found == app.today.byTag.end() ? 0 : found->second;
-        c.Text(L"今日累计 " + DurationText(total), RECT{right - S(150), y, right, y + S(20)}, x.f.label, x.p.text3,
-               DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    }
-    y += S(28);
+    y += S(32);
     c.Text(active ? active->name : L"选择一个标签，开始记录", RECT{left, y, right, y + S(28)}, x.f.name,
            active ? x.p.text : x.p.text2);
     y += S(30);
-    PaintClock(x, active ? x.now - model.activeSince : 0, left - S(2), y, active ? x.p.text : x.p.text3);
+    PaintClock(x, ClockText(active ? x.now - model.activeSince : 0), left - S(2), y, active ? x.p.text : x.p.text3);
     y += S(60);
     std::wstring meta;
-    if (active) meta = HM(model.activeSince) + L" 开始 · 计入「" + CategoryName(active->category) + L"」";
-    else meta = L"单击下方标签开始计时，或按数字键 1–9";
+    if (active) {
+        const auto found = app.today.byTag.find(active->id);
+        meta = HM(model.activeSince) + L" 开始 · 今日累计 " +
+               DurationText(found == app.today.byTag.end() ? 0 : found->second);
+    } else meta = L"单击下方标签开始计时，或按数字键 1–9";
     c.Text(meta, RECT{left, y, right, y + S(20)}, x.f.label, x.p.text2);
     const RECT button{left, r.bottom - S(18) - S(40), right, r.bottom - S(18)};
     if (active) {
         Button(x, button, L"停止计时", static_cast<int>(Icon::Stop), Btn::Secondary, Hid(HK_STOP), !app.readOnly,
                L"停止当前计时（空格）");
-    } else if (const auto* last = model.findTag(model.lastUsedTag())) {
-        Button(x, button, L"继续「" + last->name + L"」", static_cast<int>(Icon::Play), Btn::Tinted,
-               Hid(HK_RESUME), !app.readOnly, L"从现在开始继续上一个标签（空格）", last->color);
-    } else if (!model.tags.empty()) {
-        const auto& first = model.tags.front();
-        Button(x, button, L"开始「" + first.name + L"」", static_cast<int>(Icon::Play), Btn::Tinted,
-               Hid(HK_RESUME), !app.readOnly, L"从现在开始计时（空格）", first.color);
+    } else if (const auto* last = model.findTag(LastWorkTag())) {
+        const bool fresh = model.sessions.empty();
+        Button(x, button, (fresh ? L"开始「" : L"继续「") + last->name + L"」", static_cast<int>(Icon::Play),
+               Btn::Tinted, Hid(HK_RESUME), !app.readOnly, L"从现在开始计时（空格）", last->color);
     }
+}
+
+void PaintPomodoroTimer(Ctx& x, const RECT& r, int top, int statusRight) {
+    using tracker::PomodoroPhase;
+    auto& c = x.c;
+    const auto& model = app.model;
+    const auto& p = app.pomodoro;
+    const int left = r.left + S(20), right = r.right - S(20);
+    const bool focus = p.phase == PomodoroPhase::Focus, rest = p.phase == PomodoroPhase::Break;
+    const int focusId = focus ? (p.running() ? model.activeTagId : p.focusTag) : NextFocusTag();
+    const auto* focusTag = model.findTag(focusId);
+    const auto* restTag = model.findTag(p.restTag);
+    const COLORREF restColor = restTag ? restTag->color : tracker::Pomodoro::restColor;
+    const COLORREF color = rest ? restColor : focusTag ? focusTag->color : x.p.accent;
+    const int done = app.today.pomodoros;
+    // status row
+    int y = top;
+    std::wstring status;
+    if (focus) status = p.paused ? L"专注已暂停" : Format(L"专注中 · 第 %d 个", done + 1);
+    else if (rest) status = p.paused ? L"休息已暂停" : (p.longBreak ? L"长休息中" : L"休息中");
+    else status = L"准备专注";
+    if (p.running()) {
+        c.Circle(left + Sf(4), y + Sf(12), Sf(7), color, 50);
+        c.Circle(left + Sf(4), y + Sf(12), Sf(4), color);
+    } else c.Circle(left + Sf(4), y + Sf(12), Sf(4), p.paused ? RGB(0xed, 0xa1, 0x00) : x.p.text3);
+    c.Text(status, RECT{left + S(16), y, statusRight, y + S(24)}, x.f.labelBold, p.running() ? x.p.text2 : x.p.text3);
+    y += S(32);
+    std::wstring name;
+    if (rest) name = p.longBreak ? L"长休息，走动一下" : L"休息一下";
+    else if (focusTag) name = focusTag->name;
+    else name = L"选择一个标签开始专注";
+    // progress ring on the right, today's tomatoes inside
+    const float ringR = Sf(31), ringW = Sf(6);
+    const float rcx = right - ringR - Sf(2), rcy = y + Sf(52);
+    c.Text(name, RECT{left, y, static_cast<int>(rcx - ringR) - S(8), y + S(28)}, x.f.name,
+           focusTag || rest ? x.p.text : x.p.text2);
+    c.Sector(rcx, rcy, ringR, ringR - ringW, 0.0f, 360.0f, x.p.dark ? x.p.pressed : x.p.track);
+    const long long length = std::max(1LL, p.length()), remainingSec = p.remainingAt(x.now);
+    if (p.phase != PomodoroPhase::Ready) {
+        const float sweep = 360.0f * static_cast<float>(length - remainingSec) / static_cast<float>(length);
+        c.Sector(rcx, rcy, ringR, ringR - ringW, -90.0f, std::max(0.5f, sweep), p.paused ? x.p.text3 : color);
+    }
+    PaintTomato(c, rcx, rcy - Sf(6), Sf(17));
+    c.Text(Format(L"×%d", done), RECT{static_cast<int>(rcx - ringR), static_cast<int>(rcy + Sf(5)),
+           static_cast<int>(rcx + ringR), static_cast<int>(rcy + Sf(21))}, x.f.labelBold, x.p.text2,
+           DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    Hot(x, RECT{int(rcx - ringR), int(rcy - ringR), int(rcx + ringR), int(rcy + ringR)}, Hid(HK_STATUS),
+        Format(L"今天完成 %d 个番茄", done));
+    y += S(30);
+    PaintClock(x, CountdownText(remainingSec), left - S(2), y, p.running() ? x.p.text : x.p.text3);
+    y += S(60);
+    const auto& config = p.config;
+    std::wstring meta;
+    if (p.phase == PomodoroPhase::Ready)
+        meta = L"专注 " + DurationText(config.focus) + L" · 休息 " + DurationText(config.shortBreak) +
+               Format(L" · 每 %d 个长休息", config.longEvery);
+    else if (p.paused) meta = L"剩余 " + DurationText(remainingSec) + L" · 继续后接着倒计时";
+    else if (focus) {
+        const bool longNext = p.cycle + 1 >= config.longEvery;
+        meta = std::wstring(L"完成后") + (longNext ? L"长休息 " : L"休息 ") +
+               DurationText(longNext ? config.longBreak : config.shortBreak) + L" · 单击标签可切换";
+    } else meta = Format(L"休息结束后开始第 %d 个番茄", done + 1);
+    c.Text(meta, RECT{left, y, right, y + S(20)}, x.f.label, x.p.text2);
+    const RECT row{left, r.bottom - S(18) - S(40), right, r.bottom - S(18)};
+    const bool writable = !app.readOnly;
+    if (p.phase == PomodoroPhase::Ready) {
+        Button(x, row, focusTag ? L"开始专注「" + focusTag->name + L"」" : std::wstring(L"开始专注"),
+               static_cast<int>(Icon::Play), Btn::Tinted, Hid(HK_POMO_START), writable && focusTag,
+               L"开始一个番茄（空格）", color);
+        return;
+    }
+    const int gap = S(8);
+    if (p.paused) {
+        const int split = row.left + (Wd(row) - gap) * 62 / 100;
+        Button(x, RECT{row.left, row.top, split, row.bottom}, rest ? L"继续休息" : L"继续",
+               static_cast<int>(Icon::Play), Btn::Tinted, Hid(HK_POMO_RESUME), writable, L"继续倒计时（空格）", color);
+        Button(x, RECT{split + gap, row.top, row.right, row.bottom}, rest ? L"结束" : L"放弃",
+               static_cast<int>(Icon::Close), Btn::Secondary, Hid(HK_POMO_ABANDON), writable,
+               rest ? L"结束休息（R）" : L"放弃这个番茄，已专注的时间照常记录（R）");
+        return;
+    }
+    if (focus) {
+        const int w = (Wd(row) - 2 * gap) / 3;
+        Button(x, RECT{row.left, row.top, row.left + w, row.bottom}, L"暂停", static_cast<int>(Icon::Pause),
+               Btn::Secondary, Hid(HK_POMO_PAUSE), writable, L"暂停（空格）");
+        Button(x, RECT{row.left + w + gap, row.top, row.left + 2 * w + gap, row.bottom}, L"跳过",
+               static_cast<int>(Icon::SkipForward), Btn::Secondary, Hid(HK_POMO_SKIP), writable,
+               L"不计这个番茄，直接休息（S）");
+        Button(x, RECT{row.left + 2 * (w + gap), row.top, row.right, row.bottom}, L"放弃",
+               static_cast<int>(Icon::Close), Btn::Secondary, Hid(HK_POMO_ABANDON), writable,
+               L"放弃这个番茄，已专注的时间照常记录（R）");
+        return;
+    }
+    const int split = row.left + (Wd(row) - gap) * 62 / 100;
+    Button(x, RECT{row.left, row.top, split, row.bottom}, L"跳过休息", static_cast<int>(Icon::SkipForward),
+           Btn::Secondary, Hid(HK_POMO_SKIP), writable, L"马上开始下一个番茄（S）");
+    Button(x, RECT{split + gap, row.top, row.right, row.bottom}, L"结束", static_cast<int>(Icon::Close),
+           Btn::Secondary, Hid(HK_POMO_ABANDON), writable, L"结束休息（R）");
+}
+
+void PaintTimer(Ctx& x, const RECT& r) {
+    auto& c = x.c;
+    const auto& model = app.model;
+    const bool pomodoro = PomodoroCard();
+    const auto& p = app.pomodoro;
+    COLORREF tint = x.p.text3;
+    bool tinted = false;
+    if (pomodoro && p.running()) {
+        const auto* tag = model.findTag(model.activeTagId);
+        tint = tag ? tag->color : tracker::Pomodoro::restColor;
+        tinted = true;
+    } else if (const auto* tag = !pomodoro ? model.findTag(model.activeTagId) : nullptr) {
+        tint = tag->color;
+        tinted = true;
+    }
+    const COLORREF fill = tinted ? Mix(x.p.surface, tint, x.p.dark ? 0.15 : 0.075) : x.p.surface;
+    const COLORREF border = tinted ? Mix(x.p.border, tint, x.p.dark ? 0.45 : 0.32) : x.p.border;
+    c.Shadow(r, Sf(16), x.p.shadow);
+    c.Bordered(r, Sf(16), fill, border);
+    const int top = r.top + S(16);
+    const RECT mode{r.right - S(20) - S(118), top, r.right - S(20), top + S(26)};
+    PaintModeSwitch(x, mode);
+    int statusRight = mode.left - S(8);
+    if (app.pomodoroMode) {
+        const RECT gear{mode.left - S(4) - S(26), top, mode.left - S(4), top + S(26)};
+        IconButton(x, gear, Icon::Sliders, Hid(HK_POMO_SETTINGS), L"番茄钟设置", true, 16);
+        statusRight = gear.left - S(4);
+    }
+    if (pomodoro) PaintPomodoroTimer(x, r, top, statusRight);
+    else PaintFreeTimer(x, r, top, statusRight);
 }
 
 void PaintTagRow(Ctx& x, const RECT& row, int index) {
@@ -811,16 +1019,18 @@ void PaintTagRow(Ctx& x, const RECT& row, int index) {
     if (down) c.Round(inner, Sf(10), active ? Mix(x.p.pressed, tag.color, 0.18) : x.p.pressed);
     else if (hot && !active) c.Round(inner, Sf(10), x.p.hover);
     const float cx = inner.left + Sf(24), cy = (inner.top + inner.bottom) / 2.0f;
+    const bool pomodoro = app.pomodoroMode;
     if (active || hot) {
         c.Circle(cx, cy, Sf(13), tag.color);
         if (active && !hot) c.Circle(cx, cy, Sf(4), InkOn(tag.color));
-        else PaintIcon(c, active ? Icon::Stop : Icon::Play, cx + (active ? 0 : Sf(0.8f)), cy, Sf(13),
-                       InkOn(tag.color));
+        else if (active) PaintIcon(c, pomodoro ? Icon::Pause : Icon::Stop, cx, cy, Sf(13), InkOn(tag.color));
+        else PaintIcon(c, Icon::Play, cx + Sf(0.8f), cy, Sf(13), InkOn(tag.color));
     } else {
         c.Circle(cx, cy, Sf(6), tag.color);
     }
-    Hot(x, inner, rowId, active ? L"单击停止计时" :
-        (index < 9 ? Format(L"单击开始计时 · 快捷键 %d", index + 1) : std::wstring(L"单击开始计时")));
+    const std::wstring verb = pomodoro ? L"单击开始专注" : L"单击开始计时";
+    Hot(x, inner, rowId, active ? (pomodoro ? L"单击暂停" : L"单击停止计时") :
+        (index < 9 ? verb + Format(L" · 快捷键 %d", index + 1) : verb));
     const int editW = hot && !app.readOnly ? S(34) : 0;
     const int durationRight = inner.right - S(12) - editW;
     const int textLeft = inner.left + S(48), textRight = durationRight - S(78);
@@ -828,6 +1038,8 @@ void PaintTagRow(Ctx& x, const RECT& row, int index) {
            active ? x.f.bodyBold : x.f.body, x.p.text);
     std::wstring sub = CategoryName(tag.category);
     if (index < 9) sub += Format(L"  ·  按 %d", index + 1);
+    const auto tomatoes = app.today.pomodorosByTag.find(tag.id);
+    if (tomatoes != app.today.pomodorosByTag.end()) sub += Format(L"  ·  %d 个番茄", tomatoes->second);
     c.Text(sub, RECT{textLeft, inner.top + S(26), textRight, inner.top + S(44)}, x.f.caption, x.p.text3);
     const auto found = app.today.byTag.find(tag.id);
     const long long seconds = found == app.today.byTag.end() ? 0 : found->second;
@@ -976,7 +1188,8 @@ void PaintSummary(Ctx& x, const RECT& r) {
     auto& c = x.c;
     Card(x, r);
     const bool isToday = app.chosenDay == x.today;
-    CardTitle(x, r, isToday ? L"今日概览" : L"当日概览");
+    CardTitle(x, r, isToday ? L"今日概览" : L"当日概览",
+              app.day.pomodoros ? Format(L"完成 %d 个番茄", app.day.pomodoros) : std::wstring());
     if (app.day.total > 0 || app.prevDay.total > 0) {
         const std::wstring delta = L"较前一天  工作 " + Delta(app.day.work, app.prevDay.work) + L"  ·  娱乐 " +
                                    Delta(app.day.play, app.prevDay.play);
@@ -1057,7 +1270,9 @@ void PaintTimeline(Ctx& x, const RECT& r) {
         const std::wstring tip = tag->name + L" · " + CategoryName(tag->category) + L"\n" +
             StartText(row.start, dayStart, dayEnd) + L" – " +
             (row.active ? std::wstring(L"现在") : EndText(row.end, dayStart, dayEnd)) +
-            L"\n本日 " + DurationText(to - from) + L" · 单击编辑";
+            L"\n本日 " + DurationText(to - from) +
+            (row.session >= 0 && (app.model.sessions[static_cast<std::size_t>(row.session)].flags &
+                                  tracker::SessionPomodoro) ? L" · 完成一个番茄" : L"") + L" · 单击编辑";
         Hot(x, RECT{int(x1), track.top - S(2), std::max(int(x2), int(x1) + S(6)), track.bottom + S(2)},
             Hid(HK_SEGMENT, i), tip);
     }
@@ -1120,6 +1335,12 @@ void PaintRecordRow(Ctx& x, const RECT& row, int index) {
     c.Text(tag->name, RECT{nameLeft, inner.top, nameLeft + nameW + 1, inner.bottom}, x.f.body, x.p.text,
            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     int after = nameLeft + nameW + S(8);
+    const bool tomato = item.session >= 0 &&
+        (app.model.sessions[static_cast<std::size_t>(item.session)].flags & tracker::SessionPomodoro);
+    if (tomato && after + S(16) <= nameRight) {
+        PaintTomato(c, after + Sf(7), cy, Sf(15));
+        after += S(22);
+    }
     if (item.active) {
         const std::wstring live = L"进行中";
         const int pw = c.Measure(live, x.f.labelBold).cx + S(16);
@@ -1245,7 +1466,8 @@ void PaintWeek(Ctx& x, const RECT& r) {
             std::wstring tip = MonthDay(day.day) + L" " + WeekdayShort(LocalTm(day.day).tm_wday);
             if (day.stats.total > 0)
                 tip += L"\n工作 " + DurationText(day.stats.work) + L" · 娱乐 " + DurationText(day.stats.play) +
-                       L" · 其他 " + DurationText(day.stats.other) + L"\n合计 " + DurationText(day.stats.total);
+                       L" · 其他 " + DurationText(day.stats.other) + L"\n合计 " + DurationText(day.stats.total) +
+                       (day.stats.pomodoros ? Format(L" · 番茄 %d 个", day.stats.pomodoros) : std::wstring());
             else tip += L"\n没有记录";
             if (!selected) tip += L"\n单击查看这一天";
             Hot(x, band, id, tip);
@@ -1266,8 +1488,9 @@ void PaintWeek(Ctx& x, const RECT& r) {
 void PaintToast(Ctx& x, const RECT& main, int height) {
     if (app.toast.empty() || x.now > app.toastUntil) return;
     auto& c = x.c;
+    const std::wstring actionLabel = ToastActionLabel(app.toastKind);
     const int textW = c.Measure(app.toast, x.f.body).cx;
-    const int actionW = app.toastAction.empty() ? 0 : c.Measure(app.toastAction, x.f.bodyBold).cx;
+    const int actionW = actionLabel.empty() ? 0 : c.Measure(actionLabel, x.f.bodyBold).cx;
     const int w = textW + S(40) + (actionW ? actionW + S(24) : 0), h = S(42);
     const int left = (main.left + main.right) / 2 - w / 2, top = height - S(28) - h;
     const RECT box{left, top, left + w, top + h};
@@ -1277,8 +1500,8 @@ void PaintToast(Ctx& x, const RECT& main, int height) {
     if (actionW) {
         const RECT action{left + S(20) + textW + S(12), top + S(5), box.right - S(8), box.bottom - S(5)};
         if (app.hot == Hid(HK_TOAST_ACTION)) c.Round(action, Sf(16), x.p.toastText, 30);
-        c.Text(app.toastAction, action, x.f.bodyBold, x.p.toastAction, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        Hot(x, action, Hid(HK_TOAST_ACTION), L"Ctrl+Z");
+        c.Text(actionLabel, action, x.f.bodyBold, x.p.toastAction, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        Hot(x, action, Hid(HK_TOAST_ACTION), app.toastKind == TOAST_UNDO ? L"Ctrl+Z" : L"空格");
     }
 }
 
@@ -2035,6 +2258,131 @@ private:
     bool ok_ = false, startError_ = false, endError_ = false, nextDay_ = false;
 };
 
+// ---- pomodoro settings dialog
+
+class PomodoroDialog : public Dialog {
+public:
+    PomodoroDialog() {
+        const auto& c = app.pomodoro.config;
+        const long long unit = app.secondsPerMinute;
+        values[0] = static_cast<int>(c.focus / unit);
+        values[1] = static_cast<int>(c.shortBreak / unit);
+        values[2] = static_cast<int>(c.longBreak / unit);
+        values[3] = c.longEvery;
+        autoNext = c.autoNext;
+        sound = app.soundOn;
+    }
+    int values[4]{25, 5, 15, 4};       // focus, short break, long break (minutes); long break every N
+    bool autoNext = false, sound = true;
+
+protected:
+    int Height() override { return 398; }
+    void Build() override {
+        for (int i = 0; i < 4; ++i) {
+            edits_[i] = MakeEdit(PD_FOCUS + i, std::to_wstring(values[i]), nullptr, 3, true);
+            SetWindowLongPtrW(edits_[i], GWL_STYLE, GetWindowLongPtrW(edits_[i], GWL_STYLE) | ES_NUMBER);
+        }
+    }
+    RECT Field(int i) {
+        const int x = 24 + (i % 2) * 208, y = 46 + (i / 2) * 86;
+        return RECT{S(x), S(y), S(x + 184), S(y + 42)};
+    }
+    void Place() override {
+        for (int i = 0; i < 4; ++i) {
+            RECT r = Field(i);
+            r.right -= S(58);           // room for the unit inside the field
+            PlaceEdit(edits_[i], r);
+        }
+    }
+    void PaintSwitch(Canvas& c, const RECT& r, bool on, bool hot) {
+        const Palette& p = app.pal;
+        if (on) c.Round(r, Sf(12), hot ? p.accentHover : p.accent);
+        else c.Bordered(r, Sf(12), hot ? p.pressed : p.track, p.borderStrong);
+        const float knob = Sf(8.5f), cy = (r.top + r.bottom) / 2.0f;
+        const float cx = on ? r.right - Sf(12) : r.left + Sf(12);
+        c.Circle(cx, cy, knob, on ? p.onAccent : (p.dark ? p.text2 : p.surface));
+        if (!on && !p.dark) c.Ring(cx, cy, knob, p.borderStrong, Sf(1));
+    }
+    void Draw(Canvas& c) override {
+        const Palette& p = app.pal;
+        static const wchar_t* labels[] = {L"专注时长", L"短休息", L"长休息", L"长休息间隔"};
+        static const wchar_t* units[] = {L"分钟", L"分钟", L"分钟", L"个番茄"};
+        for (int i = 0; i < 4; ++i) {
+            const RECT field = Field(i);
+            c.Text(labels[i], RECT{field.left, field.top - S(24), field.right, field.top - S(4)}, fonts_.labelBold,
+                   p.text2);
+            PaintField(c, field, edits_[i], errorField_ == i);
+            c.Text(units[i], RECT{field.right - S(64), field.top, field.right - S(12), field.bottom}, fonts_.body,
+                   p.text3, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+        if (!error_.empty()) {
+            PaintIcon(c, Icon::Alert, Sf(31), Sf(229), Sf(13), p.danger);
+            c.Text(error_, RECT{S(42), S(220), S(Width() - 24), S(238)}, fonts_.label, p.danger);
+        }
+        const wchar_t* toggles[] = {L"休息结束后自动开始下一个番茄", L"提示音（专注结束、休息结束时）"};
+        const bool states[] = {autoNext, sound};
+        for (int i = 0; i < 2; ++i) {
+            const int id = PD_AUTO + i;
+            const RECT row{S(16), S(246 + i * 40), S(Width() - 16), S(246 + i * 40 + 36)};
+            const bool hot = hot_ == id;
+            if (hot) c.Round(row, Sf(8), p.hover);
+            c.Text(toggles[i], RECT{row.left + S(8), row.top, row.right - S(64), row.bottom}, fonts_.body, p.text);
+            PaintSwitch(c, RECT{row.right - S(8) - S(42), row.top + S(7), row.right - S(8), row.bottom - S(7)},
+                        states[i], hot);
+            AddHit(hits_, c, row, id);
+        }
+        const int top = S(Height() - 24 - 38), bottom = S(Height() - 24);
+        c.Fill(0, float(top - S(18)), float(S(Width())), Sf(1), p.border);
+        const RECT save{S(Width() - 24 - 92), top, S(Width() - 24), bottom};
+        const RECT cancel{save.left - S(10) - S(84), top, save.left - S(10), bottom};
+        DialogButton(c, save, L"保存", -1, Btn::Primary, IDOK);
+        DialogButton(c, cancel, L"取消", -1, Btn::Secondary, IDCANCEL);
+        DialogButton(c, RECT{S(16), top, S(16 + 104), bottom}, L"恢复默认", static_cast<int>(Icon::Undo), Btn::Ghost,
+                     PD_DEFAULTS);
+    }
+    void Click(int id) override {
+        if (id == PD_AUTO) autoNext = !autoNext;
+        else if (id == PD_SOUND) sound = !sound;
+        else if (id == PD_DEFAULTS) {
+            const int defaults[] = {25, 5, 15, 4};
+            for (int i = 0; i < 4; ++i) SetWindowTextW(edits_[i], std::to_wstring(defaults[i]).c_str());
+            autoNext = false;
+            sound = true;
+        } else if (id == IDOK) Accept();
+        else if (id == IDCANCEL) Finish(IDCANCEL);
+        Redraw();
+    }
+    void Changed(int) override {
+        if (!error_.empty()) { error_.clear(); errorField_ = -1; Redraw(); }
+    }
+    void Accept() override {
+        static const int low[] = {1, 1, 1, 2}, high[] = {180, 60, 120, 12};
+        static const wchar_t* names[] = {L"专注时长", L"短休息", L"长休息", L"长休息间隔"};
+        int parsed[4];
+        for (int i = 0; i < 4; ++i) {
+            const std::wstring text = Trim(WindowText(edits_[i]));
+            const bool digits = !text.empty() && text.size() <= 3 &&
+                std::all_of(text.begin(), text.end(), [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; });
+            parsed[i] = digits ? std::stoi(text) : -1;
+            if (parsed[i] < low[i] || parsed[i] > high[i]) {
+                error_ = Format(L"%ls需在 %d–%d 之间", names[i], low[i], high[i]);
+                errorField_ = i;
+                SetFocus(edits_[i]);
+                SendMessageW(edits_[i], EM_SETSEL, 0, -1);
+                Redraw();
+                return;
+            }
+        }
+        std::copy(parsed, parsed + 4, values);
+        Finish(IDOK);
+    }
+
+private:
+    HWND edits_[4]{};
+    std::wstring error_;
+    int errorField_ = -1;
+};
+
 // ---------------------------------------------------------------- actions
 
 void ToggleTag(int id) {
@@ -2054,10 +2402,168 @@ void StopTimer() {
     Refresh();
 }
 
+// The most recent tag that is not the pomodoro break tag (what "continue" offers).
+int LastWorkTag() {
+    const auto& model = app.model;
+    const int rest = app.pomodoro.restTag;
+    for (auto it = model.sessions.rbegin(); it != model.sessions.rend(); ++it)
+        if (it->tagId != rest && model.findTag(it->tagId)) return it->tagId;
+    for (const auto& tag : model.tags) if (tag.id != rest) return tag.id;
+    return 0;
+}
+
 void ResumeTimer() {
-    int id = app.model.lastUsedTag();
-    if (!id && !app.model.tags.empty()) id = app.model.tags.front().id;
+    const int id = LastWorkTag();
     if (id && !app.model.activeTagId) ToggleTag(id);
+}
+
+// ---------------------------------------------------------------- pomodoro
+
+DWORD WINAPI ChimeThread(void* arg) {
+    if (reinterpret_cast<INT_PTR>(arg) == 1) { Beep(784, 140); Beep(988, 140); Beep(1319, 260); }  // focus done
+    else { Beep(1319, 160); Beep(988, 260); }                                                       // break over
+    return 0;
+}
+
+// Beep() blocks while it plays, so the chime runs on a short-lived thread.
+void Chime(bool focusDone) {
+    if (!app.soundOn) return;
+    HANDLE thread = CreateThread(nullptr, 0, ChimeThread,
+                                 reinterpret_cast<void*>(static_cast<INT_PTR>(focusDone ? 1 : 0)), 0, nullptr);
+    if (thread) CloseHandle(thread);
+}
+
+void Attention() {
+    app.pulseUntil = Now() + 2;
+    if (app.miniMode && app.mini) {
+        InvalidateRect(app.mini, nullptr, FALSE);
+        return;
+    }
+    if (GetForegroundWindow() != app.hwnd) {
+        FLASHWINFO flash{sizeof(flash), app.hwnd, FLASHW_ALL | FLASHW_TIMERNOFG, 3, 0};
+        FlashWindowEx(&flash);
+    }
+}
+
+// The tag a new focus phase offers: the last focus tag, else the latest record that was not a break.
+int NextFocusTag() {
+    const auto& p = app.pomodoro;
+    if (app.model.findTag(p.focusTag) && p.focusTag != p.restTag) return p.focusTag;
+    return LastWorkTag();
+}
+
+bool PomodoroCard() {     // the timer card shows the pomodoro rhythm (not a free-running record)
+    return app.pomodoroMode && !(app.pomodoro.phase == tracker::PomodoroPhase::Ready && app.model.activeTagId);
+}
+
+// Sound, notes and saving after any pomodoro step.
+void AfterPomodoro(const tracker::PomodoroEvents& events) {
+    const auto& p = app.pomodoro;
+    if (events.restTagCreated) SaveSetting(L"pomodoro", L"restTag", p.restTag);
+    if (events.focusCompleted) {
+        Chime(true);
+        Attention();
+        if (events.breakEnded)
+            ShowToast(L"完成一个番茄，休息也已结束", events.focusStarted ? TOAST_PLAIN : TOAST_START_FOCUS, 30);
+        else
+            ShowToast(std::wstring(L"完成一个番茄！") + (events.longBreak ? L"长休息 " : L"休息 ") +
+                      DurationText(p.length()), TOAST_PLAIN, 8);
+    } else if (events.breakEnded) {
+        Chime(false);
+        Attention();
+        ShowToast(events.focusStarted ? L"休息结束，已开始下一个番茄" : L"休息结束，开始下一个番茄吧",
+                  events.focusStarted ? TOAST_PLAIN : TOAST_START_FOCUS, 30);
+    } else if (events.interrupted) {
+        ShowToast(L"电脑离开期间番茄已中断，已专注的时间照常记录", TOAST_PLAIN, 10);
+    }
+    Persist(true);
+    Refresh();
+}
+
+void PomodoroStart() {
+    if (!GuardWritable()) return;
+    const int tag = NextFocusTag();
+    if (!tag) {
+        ShowToast(L"请先新建一个标签");
+        return;
+    }
+    app.selectedTagId = tag;
+    AfterPomodoro(app.pomodoro.focus(app.model, tag, Now()));
+}
+
+void PomodoroPauseResume() {
+    if (!GuardWritable()) return;
+    auto& p = app.pomodoro;
+    const long long now = Now();
+    if (p.running()) {
+        p.pause(app.model, now);
+        AfterPomodoro({});
+    } else if (p.paused) {
+        AfterPomodoro(p.resume(app.model, now));
+    } else {
+        PomodoroStart();
+    }
+}
+
+void PomodoroSkip() {
+    if (!GuardWritable() || app.pomodoro.phase == tracker::PomodoroPhase::Ready) return;
+    AfterPomodoro(app.pomodoro.skip(app.model, Now()));
+}
+
+void PomodoroAbandon() {
+    if (!GuardWritable() || app.pomodoro.phase == tracker::PomodoroPhase::Ready) return;
+    const bool focus = app.pomodoro.phase == tracker::PomodoroPhase::Focus;
+    app.pomodoro.abandon(app.model, Now());
+    ShowToast(focus ? L"已放弃这个番茄，已专注的时间照常记录" : L"已结束休息");
+    AfterPomodoro({});
+}
+
+// A tag click in pomodoro mode: focus on it (switching or ending a break), or pause it if it is running.
+void ClickTag(int id) {
+    if (!app.pomodoroMode) {
+        ToggleTag(id);
+        return;
+    }
+    if (!GuardWritable() || !app.model.findTag(id)) return;
+    app.selectedTagId = id;
+    auto& p = app.pomodoro;
+    const long long now = Now();
+    if (p.running() && app.model.activeTagId == id) {
+        p.pause(app.model, now);
+        AfterPomodoro({});
+        return;
+    }
+    AfterPomodoro(p.focus(app.model, id, now));
+}
+
+void SetPomodoroMode(bool on) {
+    if (on == app.pomodoroMode) return;
+    auto& p = app.pomodoro;
+    tracker::PomodoroEvents events;
+    p.leave();
+    if (on) {
+        app.pomodoroMode = true;
+        p.focusTag = NextFocusTag();
+        const int running = app.model.activeTagId;
+        if (running && running != p.restTag && !app.readOnly)
+            events = p.focus(app.model, running, Now());    // the running record becomes the first focus
+    } else {
+        app.pomodoroMode = false;   // a running record keeps running as an ordinary timer
+    }
+    SaveSetting(L"pomodoro", L"mode", on ? 1 : 0);
+    ShowToast(on ? L"番茄钟：专注 " + DurationText(p.config.focus) + L"，休息 " + DurationText(p.config.shortBreak)
+                 : std::wstring(L"已切回自由计时"));
+    AfterPomodoro(events);
+}
+
+// Space: pause / resume the pomodoro, or stop / resume an ordinary timer.
+void SpaceAction() {
+    if (PomodoroCard()) {
+        PomodoroPauseResume();
+        return;
+    }
+    if (app.model.activeTagId) StopTimer();
+    else ResumeTimer();
 }
 
 void GoToDay(long long day) {
@@ -2156,9 +2662,10 @@ void DeleteRow(int rowIndex) {
         if (!model.activeTagId) return;
         RememberUndo(true, {model.activeTagId, model.activeSince, model.activeSince});
         model.resolveRecovery(tracker::Recovery::Discard);
+        app.pomodoro.abandon(model, Now());
         Persist(true);
         Refresh();
-        ShowToast(L"已放弃正在进行的计时", L"撤销", 8);
+        ShowToast(L"已放弃正在进行的计时", TOAST_UNDO, 8);
         return;
     }
     if (row.session < 0 || row.session >= static_cast<int>(model.sessions.size())) return;
@@ -2168,7 +2675,7 @@ void DeleteRow(int rowIndex) {
     RememberUndo(false, session);
     Persist(true);
     Refresh();
-    ShowToast(L"已删除一条记录", L"撤销", 8);
+    ShowToast(L"已删除一条记录", TOAST_UNDO, 8);
 }
 
 void UndoDelete() {
@@ -2187,7 +2694,8 @@ void UndoDelete() {
             restored = true;
         }
     } else {
-        restored = static_cast<bool>(model.addSession(undo.session.tagId, undo.session.start, undo.session.end, Now()));
+        restored = static_cast<bool>(model.addSession(undo.session.tagId, undo.session.start, undo.session.end, Now(),
+                                                      undo.session.flags));
     }
     if (!restored) {
         ShowToast(L"无法撤销：这段时间已被其他记录占用");
@@ -2308,16 +2816,18 @@ void ExportCsv() {
         ModalScope modal;
         if (!GetSaveFileNameW(&ofn)) return;
     }
-    std::wstring csv = L"日期,开始,结束,时长(分钟),标签,分类\r\n";
-    auto line = [&](int tagId, long long start, long long end, bool running) {
+    std::wstring csv = L"日期,开始,结束,时长(分钟),标签,分类,番茄\r\n";
+    auto line = [&](int tagId, long long start, long long end, bool running, bool tomato) {
         const auto* tag = app.model.findTag(tagId);
         const auto d = LocalTm(start);
         csv += Format(L"%04d-%02d-%02d,", d.tm_year + 1900, d.tm_mon + 1, d.tm_mday) + Stamp(start) + L"," +
                (running ? std::wstring(L"进行中") : Stamp(end)) + L"," + Format(L"%.1f", (end - start) / 60.0) + L"," +
-               CsvField(tag ? tag->name : L"?") + L"," + (tag ? CategoryName(tag->category) : L"") + L"\r\n";
+               CsvField(tag ? tag->name : L"?") + L"," + (tag ? CategoryName(tag->category) : L"") + L"," +
+               (tomato ? L"1" : L"0") + L"\r\n";
     };
-    for (const auto& s : app.model.sessions) line(s.tagId, s.start, s.end, false);
-    if (app.model.activeTagId) line(app.model.activeTagId, app.model.activeSince, Now(), true);
+    for (const auto& s : app.model.sessions)
+        line(s.tagId, s.start, s.end, false, (s.flags & tracker::SessionPomodoro) != 0);
+    if (app.model.activeTagId) line(app.model.activeTagId, app.model.activeSince, Now(), true, false);
     std::ofstream out(std::filesystem::path(file), std::ios::binary | std::ios::trunc);
     const std::string bytes = "\xEF\xBB\xBF" + Utf8(csv);   // BOM so Excel reads UTF-8
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -2334,7 +2844,10 @@ void ShowShortcuts() {
     ModalScope modal;
     MessageBoxW(app.hwnd,
         L"1 – 9\t开始 / 切换 / 停止对应标签\n"
-        L"空格\t停止计时，或继续上一个标签\n"
+        L"空格\t停止计时，或继续上一个标签（番茄钟：暂停 / 继续）\n"
+        L"P\t切换番茄钟模式\n"
+        L"S / R\t番茄钟：跳过当前阶段 / 放弃\n"
+        L"M\t迷你悬浮窗\n"
         L"← / →\t前一天 / 后一天\n"
         L"Home\t回到今天\n"
         L"Ctrl+N\t新建标签\n"
@@ -2349,6 +2862,79 @@ void ShowAbout() {
     const std::wstring text = L"时光账本 · DayLedger\n\n记录每天的时间去向：多少用在工作，多少用在娱乐。\n\n数据保存在本机：\n" +
         (app.dataPath.empty() ? std::wstring(L"（不可用）") : app.dataPath);
     MessageBoxW(app.hwnd, text.c_str(), L"关于时光账本", MB_OK | MB_ICONINFORMATION);
+}
+
+void EditPomodoroSettings() {
+    PomodoroDialog dialog;
+    if (dialog.Run(L"DayLedgerPomodoroSettings", L"番茄钟设置") != IDOK) return;
+    auto& config = app.pomodoro.config;
+    config.focus = dialog.values[0] * app.secondsPerMinute;
+    config.shortBreak = dialog.values[1] * app.secondsPerMinute;
+    config.longBreak = dialog.values[2] * app.secondsPerMinute;
+    config.longEvery = dialog.values[3];
+    config.autoNext = dialog.autoNext;
+    app.soundOn = dialog.sound;
+    static const wchar_t* keys[] = {L"focus", L"short", L"long", L"every"};
+    for (int i = 0; i < 4; ++i) SaveSetting(L"pomodoro", keys[i], dialog.values[i]);
+    SaveSetting(L"pomodoro", L"autoNext", dialog.autoNext ? 1 : 0);
+    SaveSetting(L"pomodoro", L"sound", dialog.sound ? 1 : 0);
+    ShowToast(app.pomodoro.phase == tracker::PomodoroPhase::Ready ? L"番茄钟设置已保存"
+                                                                   : L"番茄钟设置已保存，从下一个阶段开始生效");
+    Refresh();
+}
+
+void SetTopmost(bool on, bool announce = true) {
+    app.topmost = on;
+    SetWindowPos(app.hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SaveSetting(L"window", L"topmost", on ? 1 : 0);
+    if (announce) ShowToast(on ? L"窗口已置顶" : L"已取消置顶");
+}
+
+// Run at sign-in: one per-user value under HKCU\...\Run holding the quoted exe path.
+constexpr const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr const wchar_t* kRunValue = L"DayLedger";
+
+std::wstring RunCommand() {
+    std::vector<wchar_t> path(32768);
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+    return L"\"" + std::wstring(path.data(), length) + L"\"";
+}
+
+// Whether the Run value exists; when `repoint` is set, a value left by a moved exe is updated.
+bool AutoStartEnabled(bool repoint = false) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE | (repoint ? KEY_SET_VALUE : 0), &key) !=
+        ERROR_SUCCESS) return false;
+    std::vector<wchar_t> value(2048);
+    DWORD size = static_cast<DWORD>((value.size() - 1) * sizeof(wchar_t)), type = 0;
+    const bool on = RegQueryValueExW(key, kRunValue, nullptr, &type, reinterpret_cast<BYTE*>(value.data()), &size) ==
+        ERROR_SUCCESS && type == REG_SZ;
+    if (on && repoint) {
+        const std::wstring command = RunCommand();
+        if (CompareStringOrdinal(value.data(), -1, command.c_str(), -1, TRUE) != CSTR_EQUAL)
+            RegSetValueExW(key, kRunValue, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
+                           static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    }
+    RegCloseKey(key);
+    return on;
+}
+
+void ToggleAutoStart() {
+    const bool want = !AutoStartEnabled();
+    HKEY key = nullptr;
+    bool ok = false;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+        if (want) {
+            const std::wstring command = RunCommand();
+            ok = RegSetValueExW(key, kRunValue, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
+                                static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
+        } else {
+            const LONG result = RegDeleteValueW(key, kRunValue);
+            ok = result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
+        }
+        RegCloseKey(key);
+    }
+    ShowToast(!ok ? L"无法修改开机启动设置" : want ? L"已设置开机自动启动" : L"已取消开机自动启动");
 }
 
 template <typename Handler> void PopupAt(HMENU menu, POINT screen, Handler&& handle) {
@@ -2370,6 +2956,14 @@ void ShowMainMenu(POINT screen) {
     AppendMenuW(theme, MF_STRING | (app.themeMode == 0 ? MF_CHECKED : 0), CMD_THEME_SYSTEM, L"跟随系统");
     AppendMenuW(theme, MF_STRING | (app.themeMode == 1 ? MF_CHECKED : 0), CMD_THEME_LIGHT, L"浅色");
     AppendMenuW(theme, MF_STRING | (app.themeMode == 2 ? MF_CHECKED : 0), CMD_THEME_DARK, L"深色");
+    AppendMenuW(menu, MF_STRING | (app.pomodoroMode ? MF_CHECKED : 0), CMD_POMODORO_TOGGLE, L"番茄钟模式\tP");
+    AppendMenuW(menu, MF_STRING, CMD_POMODORO_SETTINGS, L"番茄钟设置…");
+    AppendMenuW(menu, MF_STRING | (app.soundOn ? MF_CHECKED : 0), CMD_SOUND, L"提示音");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (app.miniMode ? MF_CHECKED : 0), CMD_MINI, L"迷你悬浮窗\tM");
+    AppendMenuW(menu, MF_STRING | (app.topmost ? MF_CHECKED : 0), CMD_TOPMOST, L"窗口置顶");
+    AppendMenuW(menu, MF_STRING | (AutoStartEnabled() ? MF_CHECKED : 0), CMD_AUTOSTART, L"开机自动启动");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (app.model.sessions.empty() ? MF_GRAYED : 0), CMD_EXPORT, L"导出全部记录 (CSV)…");
     AppendMenuW(menu, MF_STRING | (app.dataDir.empty() ? MF_GRAYED : 0), CMD_OPEN_FOLDER, L"打开数据文件夹");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -2460,6 +3054,274 @@ void PromptAway(long long from, long long now) {
     Refresh();
 }
 
+// ---------------------------------------------------------------- mini window
+
+// A small always-on-top strip that shows what is being timed. It replaces the main window
+// (which is minimized) until it is expanded again or the main window is restored.
+constexpr int kMiniW = 256, kMiniH = 54;
+int MS(int v) { return MulDiv(v, static_cast<int>(app.miniDpi), 96); }
+float MSf(float v) { return v * static_cast<float>(app.miniDpi) / 96.0f; }
+
+struct MiniInfo {
+    std::wstring name, status, time;
+    COLORREF color = 0;
+    bool live = false;
+    double progress = -1;
+};
+
+MiniInfo MiniState(long long now) {
+    using tracker::PomodoroPhase;
+    MiniInfo info;
+    const auto& model = app.model;
+    const auto& p = app.pomodoro;
+    if (PomodoroCard()) {
+        const bool rest = p.phase == PomodoroPhase::Break;
+        const auto* tag = model.findTag(rest ? p.restTag :
+                                        (p.phase == PomodoroPhase::Focus ? p.focusTag : NextFocusTag()));
+        info.color = tag ? tag->color : (rest ? tracker::Pomodoro::restColor : app.pal.accent);
+        info.name = rest ? std::wstring(L"休息一下") : tag ? tag->name : std::wstring(L"番茄钟");
+        info.time = CountdownText(p.remainingAt(now));
+        info.live = p.running();
+        if (p.phase == PomodoroPhase::Ready) info.status = L"准备专注 · 单击开始";
+        else if (p.paused) info.status = L"已暂停 · 单击继续";
+        else if (rest) info.status = p.longBreak ? L"长休息中 · 单击暂停" : L"休息中 · 单击暂停";
+        else info.status = Format(L"专注中 · 第 %d 个", app.today.pomodoros + 1);
+        if (p.phase != PomodoroPhase::Ready)
+            info.progress = 1.0 - static_cast<double>(p.remainingAt(now)) / static_cast<double>(std::max(1LL, p.length()));
+    } else if (const auto* tag = model.findTag(model.activeTagId)) {
+        info.color = tag->color;
+        info.name = tag->name;
+        info.time = ClockText(now - model.activeSince);
+        info.live = true;
+        info.status = L"正在记录 · 单击停止";
+    } else {
+        info.color = app.pal.text3;
+        info.name = L"未在计时";
+        info.time = ClockText(0);
+        const auto* last = model.findTag(LastWorkTag());
+        info.status = last ? L"单击继续「" + last->name + L"」" : std::wstring();
+    }
+    return info;
+}
+
+void PaintMini(Canvas& c, int w, int h) {
+    app.miniHits.clear();
+    const Palette& pal = app.pal;
+    const auto& f = app.miniFonts;
+    const long long now = Now();
+    const MiniInfo info = MiniState(now);
+    COLORREF bg = pal.surface;
+    if (now <= app.pulseUntil) bg = Mix(pal.surface, info.color, pal.dark ? 0.38 : 0.24);
+    else if (info.live) bg = Mix(pal.surface, info.color, pal.dark ? 0.12 : 0.06);
+    c.Fill(0, 0, float(w), float(h), bg);
+    if (WindowsBuild() < 22000) {           // Windows 11 draws a rounded border itself
+        c.Fill(0, 0, float(w), 1, pal.borderStrong);
+        c.Fill(0, float(h - 1), float(w), 1, pal.borderStrong);
+        c.Fill(0, 0, 1, float(h), pal.borderStrong);
+        c.Fill(float(w - 1), 0, 1, float(h), pal.borderStrong);
+    }
+    const float cy = h / 2.0f - (info.progress >= 0 ? MSf(1) : 0);
+    if (info.live) c.Circle(MSf(19), cy, MSf(8), info.color, 60);
+    c.Circle(MSf(19), cy, MSf(4.5f), info.color);
+    const RECT expand{w - MS(8) - MS(28), static_cast<int>(cy) - MS(14), w - MS(8), static_cast<int>(cy) + MS(14)};
+    const bool hot = app.miniHot == Hid(HK_MINI_EXPAND);
+    if (hot) c.Round(expand, MSf(7), pal.dark ? pal.pressed : pal.hover);
+    PaintIcon(c, Icon::Expand, (expand.left + expand.right) / 2.0f, cy, MSf(15), hot ? pal.text : pal.text2);
+    app.miniHits.push_back({expand, Hid(HK_MINI_EXPAND), L""});
+    const int timeW = c.Measure(info.time, f.numM).cx;
+    const int timeRight = expand.left - MS(8);
+    c.Text(info.time, RECT{timeRight - timeW - MS(2), 0, timeRight, h}, f.numM, info.live ? pal.text : pal.text3,
+           DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    const int textRight = timeRight - timeW - MS(10);
+    c.Text(info.name, RECT{MS(34), static_cast<int>(cy) - MS(19), textRight, static_cast<int>(cy) + MS(1)},
+           f.bodyBold, pal.text);
+    c.Text(info.status, RECT{MS(34), static_cast<int>(cy) + MS(1), textRight, static_cast<int>(cy) + MS(18)},
+           f.caption, pal.text3);
+    if (info.progress >= 0) {
+        c.Fill(0, h - MSf(3), float(w), MSf(3), pal.dark ? pal.pressed : pal.track);
+        c.Fill(0, h - MSf(3), static_cast<float>(w * std::clamp(info.progress, 0.0, 1.0)), MSf(3), info.color);
+    }
+}
+
+int MiniHitAt(POINT pt) {
+    for (auto it = app.miniHits.rbegin(); it != app.miniHits.rend(); ++it) if (PtInRect(&it->rect, pt)) return it->id;
+    return 0;
+}
+
+void SaveMiniPosition() {
+    RECT r{};
+    if (!app.mini || !GetWindowRect(app.mini, &r)) return;
+    SaveSetting(L"mini", L"x", r.left);
+    SaveSetting(L"mini", L"y", r.top);
+    SaveSetting(L"mini", L"saved", 1);
+}
+
+void PlaceMini() {
+    const int w = MS(kMiniW), h = MS(kMiniH);
+    POINT at{ReadSetting(L"mini", L"x", 0), ReadSetting(L"mini", L"y", 0)};
+    const RECT saved{at.x, at.y, at.x + w, at.y + h};
+    if (!ReadSetting(L"mini", L"saved", 0) || !MonitorFromRect(&saved, MONITOR_DEFAULTTONULL)) {
+        MONITORINFO monitor{};
+        monitor.cbSize = sizeof(monitor);
+        GetMonitorInfoW(MonitorFromWindow(app.hwnd, MONITOR_DEFAULTTOPRIMARY), &monitor);
+        at = POINT{monitor.rcWork.right - w - MS(16), monitor.rcWork.top + MS(16)};
+    }
+    SetWindowPos(app.mini, HWND_TOPMOST, at.x, at.y, w, h, SWP_NOACTIVATE);
+}
+
+void SetMiniMode(bool on) {
+    if (on == app.miniMode) return;
+    if (on) {
+        if (!app.mini) {
+            app.miniDpi = app.dpi;
+            app.miniFonts.Create(app.miniDpi, app.numberFace);
+            app.mini = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"DayLedgerMini", L"时光账本", WS_POPUP,
+                                       0, 0, MS(kMiniW), MS(kMiniH), nullptr, nullptr, app.instance, nullptr);
+            if (!app.mini) return;
+            using SetAttribute = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+            static SetAttribute set = LoadProc<SetAttribute>(SystemLibrary(L"dwmapi.dll"), "DwmSetWindowAttribute");
+            if (set) {
+                const DWORD round = 2;                 // DWMWCP_ROUND
+                set(app.mini, 33, &round, sizeof(round));
+            }
+        }
+        app.miniMode = true;
+        PlaceMini();
+        ShowWindow(app.mini, SW_SHOWNOACTIVATE);
+        InvalidateRect(app.mini, nullptr, FALSE);
+        ShowWindow(app.hwnd, SW_MINIMIZE);
+    } else {
+        app.miniMode = false;
+        if (app.mini) ShowWindow(app.mini, SW_HIDE);
+        if (IsIconic(app.hwnd)) ShowWindow(app.hwnd, SW_RESTORE);
+        SetForegroundWindow(app.hwnd);
+    }
+}
+
+LRESULT CALLBACK MiniProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC target = BeginPaint(window, &ps);
+        RECT client{};
+        GetClientRect(window, &client);
+        if (client.right > 0 && client.bottom > 0 && app.miniSurface.Ensure(client.right, client.bottom)) {
+            {
+                Canvas canvas(app.miniSurface);
+                PaintMini(canvas, client.right, client.bottom);
+            }
+            BitBlt(target, 0, 0, client.right, client.bottom, app.miniSurface.Dc(), 0, 0, SRCCOPY);
+        }
+        EndPaint(window, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (GetCapture() == window && app.miniPressed) {
+            POINT cursor{};
+            GetCursorPos(&cursor);
+            if (!app.miniDragging && (std::abs(cursor.x - app.miniCursor.x) > GetSystemMetrics(SM_CXDRAG) ||
+                                      std::abs(cursor.y - app.miniCursor.y) > GetSystemMetrics(SM_CYDRAG)))
+                app.miniDragging = true;
+            if (app.miniDragging)
+                SetWindowPos(window, nullptr, app.miniOrigin.x + cursor.x - app.miniCursor.x,
+                             app.miniOrigin.y + cursor.y - app.miniCursor.y, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            return 0;
+        }
+        if (!app.miniTracking) {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
+            TrackMouseEvent(&track);
+            app.miniTracking = true;
+        }
+        const int hit = MiniHitAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (hit != app.miniHot) {
+            app.miniHot = hit;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        app.miniTracking = false;
+        app.miniHot = 0;
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN: {
+        const int hit = MiniHitAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        app.miniPressed = hit ? hit : -1;          // -1: the body (tap = space, drag = move)
+        app.miniDragging = false;
+        GetCursorPos(&app.miniCursor);
+        RECT r{};
+        GetWindowRect(window, &r);
+        app.miniOrigin = POINT{r.left, r.top};
+        SetCapture(window);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: return 0;               // the second click of a double click does nothing
+    case WM_LBUTTONUP: {
+        const int pressed = app.miniPressed;
+        const bool dragged = app.miniDragging;
+        app.miniPressed = 0;
+        app.miniDragging = false;
+        if (GetCapture() == window) ReleaseCapture();
+        if (dragged) {
+            SaveMiniPosition();
+            return 0;
+        }
+        const int hit = MiniHitAt(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (pressed == Hid(HK_MINI_EXPAND) && hit == pressed) SetMiniMode(false);
+        else if (pressed == -1 && hit == 0) SpaceAction();
+        if (app.mini) InvalidateRect(app.mini, nullptr, FALSE);
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (reinterpret_cast<HWND>(lp) != window) {
+            if (app.miniDragging) SaveMiniPosition();
+            app.miniPressed = 0;
+            app.miniDragging = false;
+        }
+        return 0;
+    case WM_RBUTTONUP: {
+        POINT screen{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ClientToScreen(window, &screen);
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, 1, L"展开主窗口");
+        AppendMenuW(menu, MF_STRING | (app.pomodoroMode ? MF_CHECKED : 0), 2, L"番茄钟模式");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 3, L"退出时光账本");
+        SetForegroundWindow(window);
+        int command = 0;
+        {
+            ModalScope modal;
+            command = static_cast<int>(TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                                                        screen.x, screen.y, window, nullptr));
+        }
+        DestroyMenu(menu);
+        if (command == 1) SetMiniMode(false);
+        else if (command == 2) SetPomodoroMode(!app.pomodoroMode);
+        else if (command == 3) PostMessageW(app.hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    }
+    case WM_DPICHANGED: {
+        app.miniDpi = HIWORD(wp);
+        app.miniFonts.Create(app.miniDpi, app.numberFace);
+        const auto* r = reinterpret_cast<RECT*>(lp);
+        SetWindowPos(window, nullptr, r->left, r->top, MS(kMiniW), MS(kMiniH), SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    case WM_CLOSE:
+        SetMiniMode(false);
+        return 0;
+    case WM_NCDESTROY:
+        app.miniSurface.Release();
+        app.miniFonts.Release();
+        app.mini = nullptr;
+        break;
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+
 // ---------------------------------------------------------------- main window
 
 int HitAt(POINT pt) {
@@ -2484,7 +3346,7 @@ void Activate(int id) {
     const int kind = KindOf(id), index = IndexOf(id);
     const auto tagCount = static_cast<int>(app.model.tags.size());
     switch (kind) {
-    case HK_TAG: if (index < tagCount) ToggleTag(app.model.tags[static_cast<std::size_t>(index)].id); break;
+    case HK_TAG: if (index < tagCount) ClickTag(app.model.tags[static_cast<std::size_t>(index)].id); break;
     case HK_TAG_EDIT: if (index < tagCount) EditTag(app.model.tags[static_cast<std::size_t>(index)].id); break;
     case HK_RECORD: case HK_RECORD_EDIT: case HK_SEGMENT: EditRow(index); break;
     case HK_RECORD_DELETE: DeleteRow(index); break;
@@ -2507,8 +3369,20 @@ void Activate(int id) {
     case HK_WEEK_DAY:
         if (index < static_cast<int>(app.week.size())) GoToDay(app.week[static_cast<std::size_t>(index)].day);
         break;
-    case HK_TOAST_ACTION: UndoDelete(); break;
+    case HK_TOAST_ACTION:
+        if (app.toastKind == TOAST_UNDO) UndoDelete();
+        else if (app.toastKind == TOAST_START_FOCUS) PomodoroStart();
+        app.toast.clear();
+        break;
     case HK_RETRY: Persist(true); break;
+    case HK_MODE_FREE: SetPomodoroMode(false); break;
+    case HK_MODE_POMODORO: SetPomodoroMode(true); break;
+    case HK_POMO_START: PomodoroStart(); break;
+    case HK_POMO_PAUSE: case HK_POMO_RESUME: PomodoroPauseResume(); break;
+    case HK_POMO_SKIP: PomodoroSkip(); break;
+    case HK_POMO_ABANDON: PomodoroAbandon(); break;
+    case HK_POMO_SETTINGS: PostMessageW(app.hwnd, WM_COMMAND, CMD_POMODORO_SETTINGS, 0); break;
+    case HK_MINI: PostMessageW(app.hwnd, WM_COMMAND, CMD_MINI, 0); break;
     default: break;
     }
 }
@@ -2516,7 +3390,7 @@ void Activate(int id) {
 void Command(int id) {
     const auto tagCount = static_cast<int>(app.model.tags.size());
     if (id >= CMD_TAG_FIRST && id < CMD_TAG_FIRST + CMD_RANGE) {
-        if (id - CMD_TAG_FIRST < tagCount) ToggleTag(app.model.tags[static_cast<std::size_t>(id - CMD_TAG_FIRST)].id);
+        if (id - CMD_TAG_FIRST < tagCount) ClickTag(app.model.tags[static_cast<std::size_t>(id - CMD_TAG_FIRST)].id);
         return;
     }
     if (id >= CMD_EDIT_TAG_FIRST && id < CMD_EDIT_TAG_FIRST + CMD_RANGE) {
@@ -2536,15 +3410,30 @@ void Command(int id) {
     case CMD_EDIT_TAG: EditTag(app.selectedTagId ? app.selectedTagId : app.model.lastUsedTag()); break;
     case CMD_DELETE_TAG: DeleteTag(app.selectedTagId); break;
     case CMD_TOGGLE:
-        if (app.model.findTag(app.selectedTagId)) ToggleTag(app.selectedTagId);
-        else if (app.model.activeTagId) StopTimer();
-        else ResumeTimer();
+        if (app.model.findTag(app.selectedTagId)) ClickTag(app.selectedTagId);
+        else SpaceAction();
         break;
-    case CMD_SPACE:
-        if (app.model.activeTagId) StopTimer();
-        else ResumeTimer();
+    case CMD_SPACE: SpaceAction(); break;
+    case CMD_STOP:
+        if (PomodoroCard() && app.pomodoro.phase != tracker::PomodoroPhase::Ready) PomodoroAbandon();
+        else StopTimer();
         break;
-    case CMD_STOP: StopTimer(); break;
+    case CMD_POMODORO_TOGGLE: SetPomodoroMode(!app.pomodoroMode); break;
+    case CMD_POMODORO_ON: SetPomodoroMode(true); break;
+    case CMD_POMODORO_OFF: SetPomodoroMode(false); break;
+    case CMD_POMODORO_START: if (app.pomodoroMode) PomodoroStart(); break;
+    case CMD_POMODORO_PAUSE: if (app.pomodoroMode) PomodoroPauseResume(); break;
+    case CMD_POMODORO_SKIP: if (app.pomodoroMode) PomodoroSkip(); break;
+    case CMD_POMODORO_ABANDON: if (app.pomodoroMode) PomodoroAbandon(); break;
+    case CMD_POMODORO_SETTINGS: EditPomodoroSettings(); break;
+    case CMD_MINI: SetMiniMode(!app.miniMode); break;
+    case CMD_TOPMOST: SetTopmost(!app.topmost); break;
+    case CMD_AUTOSTART: ToggleAutoStart(); break;
+    case CMD_SOUND:
+        app.soundOn = !app.soundOn;
+        SaveSetting(L"pomodoro", L"sound", app.soundOn ? 1 : 0);
+        ShowToast(app.soundOn ? L"已开启提示音" : L"已关闭提示音");
+        break;
     case CMD_ADD_RECORD: AddRecord(); break;
     case CMD_UNDO: UndoDelete(); break;
     case CMD_THEME_TOGGLE: SetThemeMode(app.pal.dark ? 1 : 2); break;
@@ -2637,9 +3526,21 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         case Q_DARK: return app.pal.dark;
         case Q_SELECTED_TAG: return app.selectedTagId;
         case Q_LOADED: return app.loaded;
+        case Q_POMODORO_MODE: return app.pomodoroMode;
+        case Q_POMODORO_PHASE: return static_cast<LRESULT>(app.pomodoro.phase);
+        case Q_POMODORO_PAUSED: return app.pomodoro.paused;
+        case Q_POMODORO_REMAINING: return static_cast<LRESULT>(app.pomodoro.remainingAt(Now()));
+        case Q_POMODOROS_TODAY: return app.today.pomodoros;
+        case Q_MINI: return app.miniMode;
+        case Q_REST_TAG: return app.pomodoro.restTag;
+        case Q_TOPMOST: return app.topmost;
         default: return -1;
         }
     case WM_SIZE:
+        if (app.miniMode && wp != SIZE_MINIMIZED) {     // restored from the taskbar: back to the full window
+            app.miniMode = false;
+            if (app.mini) ShowWindow(app.mini, SW_HIDE);
+        }
         InvalidateRect(window, nullptr, FALSE);
         return 0;
     case WM_GETMINMAXINFO: {
@@ -2683,11 +3584,18 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             app.toast.clear();
             if (KindOf(app.hot) == HK_TOAST_ACTION) app.hot = 0;
         }
-        Refresh();
-        if (previousTick && now - previousTick > 300 && app.model.activeTagId && !app.modal && !app.readOnly) {
-            PromptAway(previousTick, now);
-            return 0;
+        if (app.pomodoroMode && app.pomodoro.running() && !app.readOnly) {
+            const auto events = app.pomodoro.tick(app.model, now, previousTick);
+            if (events.any() || !app.pomodoro.running()) AfterPomodoro(events);
+            else Refresh();
+        } else {
+            Refresh();
+            if (previousTick && now - previousTick > 300 && app.model.activeTagId && !app.modal && !app.readOnly) {
+                PromptAway(previousTick, now);
+                return 0;
+            }
         }
+        if (app.miniMode && app.mini) InvalidateRect(app.mini, nullptr, FALSE);
         if (!app.readOnly && app.model.activeTagId && (now - app.lastSave >= 15 || now < app.lastSave)) Persist(false);
         return 0;
     }
@@ -2823,6 +3731,7 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         KillTimer(window, TID_TICK);
         KillTimer(window, TID_TIP);
+        if (app.mini) DestroyWindow(app.mini);
         RemovePropW(window, L"DayLedgerKey");
         PostQuitMessage(0);
         return 0;
@@ -2889,6 +3798,8 @@ HACCEL CreateAccelerators() {
         {FVIRTKEY, VK_SPACE, CMD_SPACE}, {FVIRTKEY, VK_F1, CMD_SHORTCUTS},
         {FVIRTKEY | FCONTROL, 'N', CMD_NEW_TAG}, {FVIRTKEY | FCONTROL, 'B', CMD_ADD_RECORD},
         {FVIRTKEY | FCONTROL, 'Z', CMD_UNDO}, {FVIRTKEY | FCONTROL, 'S', CMD_RETRY_SAVE},
+        {FVIRTKEY, 'P', CMD_POMODORO_TOGGLE}, {FVIRTKEY, 'S', CMD_POMODORO_SKIP},
+        {FVIRTKEY, 'R', CMD_POMODORO_ABANDON}, {FVIRTKEY, 'M', CMD_MINI},
     };
     for (int i = 0; i < 9; ++i) {
         keys.push_back({FVIRTKEY, static_cast<WORD>('1' + i), static_cast<WORD>(CMD_TAG_FIRST + i)});
@@ -2945,7 +3856,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     if (!app.iconBig) app.iconBig = LoadIconW(nullptr, IDI_APPLICATION);
     if (!app.iconSmall) app.iconSmall = app.iconBig;
 
-    for (const wchar_t* name : {L"DayLedgerTagEditor", L"DayLedgerRecordEditor"}) {
+    for (const wchar_t* name : {L"DayLedgerTagEditor", L"DayLedgerRecordEditor", L"DayLedgerPomodoroSettings"}) {
         WNDCLASSEXW dialog{};
         dialog.cbSize = sizeof(dialog);
         dialog.style = CS_DBLCLKS;
@@ -2955,6 +3866,14 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
         dialog.lpszClassName = name;
         if (!RegisterClassExW(&dialog)) return 12;
     }
+    WNDCLASSEXW miniClass{};
+    miniClass.cbSize = sizeof(miniClass);
+    miniClass.style = CS_DBLCLKS;
+    miniClass.lpfnWndProc = MiniProc;
+    miniClass.hInstance = instance;
+    miniClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    miniClass.lpszClassName = L"DayLedgerMini";
+    if (!RegisterClassExW(&miniClass)) return 12;
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
     wc.style = CS_DBLCLKS;
@@ -2966,7 +3885,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     wc.lpszClassName = L"DayLedgerNativeWindow";
     if (!RegisterClassExW(&wc)) return 13;
 
-    app.themeMode = std::clamp(ReadSetting(L"ui", L"theme", 0), 0, 2);
+    wchar_t scale[16]{};
+    if (GetEnvironmentVariableW(L"DAYLEDGER_TEST_SECONDS_PER_MINUTE", scale, 16))
+        app.secondsPerMinute = std::clamp(_wtoi(scale), 1, 60);
+    LoadSettings();
     app.numberFace = FontInstalled(L"Segoe UI Variable Display") ? L"Segoe UI Variable Display" : L"Segoe UI";
     ApplyTheme();
 
@@ -2992,6 +3914,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     if (show == SW_SHOWNORMAL || show == SW_SHOWDEFAULT || show == SW_SHOW) show = maximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
     ShowWindow(window, show);
     UpdateWindow(window);
+    if (app.topmost) SetTopmost(true, false);
+    AutoStartEnabled(true);                  // repoint the Run value if the exe has moved
     app.accel = CreateAccelerators();
 
     MSG message{};

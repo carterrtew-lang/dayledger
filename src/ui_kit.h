@@ -378,7 +378,8 @@ private:
 
 enum class Icon {
     ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Plus, Play, Stop, Pencil, Trash, Moon, Sun,
-    Check, Alert, Lock, Close, Clock, More, Undo, Download, Folder, Keyboard, Monitor
+    Check, Alert, Lock, Close, Clock, More, Undo, Download, Folder, Keyboard, Monitor,
+    Pause, SkipForward, Expand, MiniWindow, Sliders
 };
 
 // Icons are authored on a 24-unit grid and scaled to `size` pixels around (cx, cy).
@@ -425,6 +426,44 @@ inline void PaintIcon(Canvas& c, Icon icon, float cx, float cy, float size, COLO
         g.DrawPolygon(&pen, points, 3);
         break;
     }
+    case Icon::Pause: {
+        for (float left : {6.0f, 14.0f}) {
+            Gdiplus::GraphicsPath path;
+            AddRound(path, X(left), Y(5), 4 * s, 14 * s, 1.5f * s, 1.5f * s, 1.5f * s, 1.5f * s);
+            g.FillPath(&brush, &path);
+        }
+        break;
+    }
+    case Icon::SkipForward: {
+        Gdiplus::PointF points[] = {{X(5), Y(5.5f)}, {X(15), Y(12)}, {X(5), Y(18.5f)}};
+        g.FillPolygon(&brush, points, 3);
+        g.DrawPolygon(&pen, points, 3);
+        Gdiplus::GraphicsPath bar;
+        AddRound(bar, X(16.5f), Y(5), 3 * s, 14 * s, 1.2f * s, 1.2f * s, 1.2f * s, 1.2f * s);
+        g.FillPath(&brush, &bar);
+        break;
+    }
+    case Icon::Expand:
+        poly({15, 3, 21, 3, 21, 9});
+        poly({9, 21, 3, 21, 3, 15});
+        line(21, 3, 14, 10);
+        line(3, 21, 10, 14);
+        break;
+    case Icon::MiniWindow: {
+        Gdiplus::GraphicsPath body;
+        AddRound(body, X(3), Y(5), 18 * s, 14 * s, 2 * s, 2 * s, 2 * s, 2 * s);
+        g.DrawPath(&pen, &body);
+        Gdiplus::GraphicsPath inset;
+        AddRound(inset, X(12), Y(11.5f), 6 * s, 4.5f * s, 1 * s, 1 * s, 1 * s, 1 * s);
+        g.FillPath(&brush, &inset);
+        break;
+    }
+    case Icon::Sliders:
+        line(4, 7, 20, 7);
+        line(4, 17, 20, 17);
+        dot(9, 7, 2.6f);
+        dot(15, 17, 2.6f);
+        break;
     case Icon::Stop: {
         Gdiplus::GraphicsPath path;
         AddRound(path, X(5), Y(5), 14 * s, 14 * s, 2.5f * s, 2.5f * s, 2.5f * s, 2.5f * s);
@@ -505,6 +544,21 @@ inline void PaintIcon(Canvas& c, Icon icon, float cx, float cy, float size, COLO
         break;
     }
     }
+}
+
+// A small tomato: the mark of a completed pomodoro.
+inline void PaintTomato(Canvas& c, float cx, float cy, float size) {
+    c.Circle(cx, cy + size * 0.07f, size * 0.42f, RGB(232, 76, 61));
+    c.Circle(cx - size * 0.13f, cy - size * 0.06f, size * 0.09f, RGB(255, 160, 140), 150);
+    std::vector<Gdiplus::PointF> leaf;
+    const float lx = cx, ly = cy - size * 0.31f;
+    for (int i = 0; i < 10; ++i) {
+        const float angle = -1.5707963f + i * 3.14159265f / 5;
+        const float r = (i % 2 ? 0.09f : 0.25f) * size;
+        leaf.emplace_back(lx + r * std::cos(angle), ly + r * 0.72f * std::sin(angle) + size * 0.03f);
+    }
+    Gdiplus::SolidBrush green(Gp(RGB(52, 160, 90)));
+    c.G().FillPolygon(&green, leaf.data(), static_cast<INT>(leaf.size()));
 }
 
 // ------------------------------------------------------------------ time & text

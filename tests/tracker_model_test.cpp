@@ -1,4 +1,5 @@
 #include "../src/tracker_model.h"
+#include "../src/pomodoro.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -41,6 +42,23 @@ std::uint64_t number(const std::vector<unsigned char>& bytes, std::size_t offset
 }
 void put(std::vector<unsigned char>& bytes, std::size_t offset, std::uint64_t value, unsigned size) {
     for (unsigned i = 0; i < size; ++i) bytes.at(offset + i) = (value >> (8 * i)) & 255;
+}
+// Rewrites a TRACKER3 file as TRACKER2 (no session flags) or TRACKER1 (also no checkpoint).
+std::vector<unsigned char> downgrade(const std::vector<unsigned char>& bytes, char version) {
+    std::vector<unsigned char> out(bytes.begin(), bytes.begin() + 12);
+    out[7] = static_cast<unsigned char>(version);
+    std::size_t cursor = 12;
+    for (std::uint64_t i = 0; i < number(bytes, 8, 4); ++i)
+        cursor += 16 + static_cast<std::size_t>(number(bytes, cursor + 12, 4));
+    out.insert(out.end(), bytes.begin() + 12, bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 4));
+    const auto sessions = number(bytes, cursor, 4);
+    cursor += 4;
+    for (std::uint64_t i = 0; i < sessions; ++i, cursor += 24)
+        out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
+                   bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 20));
+    out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
+               bytes.begin() + static_cast<std::ptrdiff_t>(cursor + (version == '1' ? 12 : 20)));
+    return out;
 }
 
 void timingTests() {
@@ -181,6 +199,137 @@ void editingTests() {
     check(model.moveTag(3, 1) && model.tags[2].id == 3, "move tag down");
 }
 
+void flagTests(const std::filesystem::path& directory) {
+    const unsigned pomodoro = tracker::SessionPomodoro;
+    tracker::Model model;
+    model.start(1, 100);
+    model.stop(200, pomodoro);
+    model.start(2, 200);
+    model.stop(260);
+    model.start(1, 300);
+    model.stop(400, pomodoro | 8u);   // unknown bits are dropped
+    check(model.sessions[0].flags == pomodoro && model.sessions[1].flags == 0 &&
+          model.sessions[2].flags == pomodoro, "stop records flags");
+    auto stats = model.stats(0, 1000, 1000);
+    check(stats.pomodoros == 2 && stats.pomodorosByTag[1] == 2, "pomodoro counts");
+    check(model.stats(0, 300, 1000).pomodoros == 1, "pomodoro counted on the day it ends");
+    check(model.stats(200, 1000, 1000).pomodoros == 1, "pomodoro ending at midnight belongs to the day before");
+    check(model.stats(0, 1000, 350).pomodoros == 1, "not counted before it ends");
+    check(static_cast<bool>(model.updateSession(0, 2, 100, 190, 1000)) && model.sessions[0].flags == pomodoro,
+          "edit keeps the pomodoro flag");
+    const auto removed = model.sessions[2];
+    check(model.removeSession(2) && model.stats(0, 1000, 1000).pomodoros == 1, "deleted record is uncounted");
+    check(static_cast<bool>(model.addSession(removed.tagId, removed.start, removed.end, 1000, removed.flags)) &&
+          model.stats(0, 1000, 1000).pomodoros == 2, "undo restores the flag");
+    const auto path = directory / L"flags.dat";
+    check(model.save(path.wstring()), "save flags");
+    tracker::Model loaded;
+    check(loaded.load(path.wstring()) && loaded.sessions.size() == 3 && loaded.sessions[0].flags == pomodoro &&
+          loaded.sessions[1].flags == 0 && loaded.sessions[2].flags == pomodoro, "flags roundtrip");
+    auto invalid = model;
+    invalid.sessions[1].flags = 4;
+    check(!invalid.save(path.wstring()), "unknown flag bits rejected on save");
+}
+
+void pomodoroTests() {
+    using tracker::PomodoroPhase;
+    const unsigned flag = tracker::SessionPomodoro;
+    tracker::Model m;
+    tracker::Pomodoro p;
+    p.config = {100, 20, 50, 2, false};
+    auto e = p.focus(m, 1, 1000);
+    check(e.focusStarted && p.phase == PomodoroPhase::Focus && m.activeTagId == 1 && m.activeSince == 1000 &&
+          p.phaseEnd == 1100, "focus starts recording");
+    check(!p.tick(m, 1050, 1049).any() && p.remainingAt(1050) == 50, "countdown runs");
+    e = p.tick(m, 1101, 1100);
+    check(e.focusCompleted && e.breakStarted && !e.longBreak && e.restTagCreated, "focus completes into a break");
+    const int rest = p.restTag;
+    check(rest == 4 && m.findTag(rest)->name == L"\u4f11\u606f" &&
+          m.findTag(rest)->category == tracker::Category::Other, "rest tag created");
+    check(m.sessions.size() == 1 && m.sessions[0].start == 1000 && m.sessions[0].end == 1100 &&
+          m.sessions[0].flags == flag, "completed focus flagged at the exact end");
+    check(m.activeTagId == rest && m.activeSince == 1100 && p.phaseEnd == 1120, "break records to the rest tag");
+    e = p.tick(m, 1121, 1120);
+    check(e.breakEnded && !e.focusStarted && p.phase == PomodoroPhase::Ready && !m.activeTagId &&
+          m.sessions.back().tagId == rest && m.sessions.back().end == 1120 && m.sessions.back().flags == 0,
+          "break ends and waits for the user");
+    check(m.stats(0, 9000, 9000).pomodoros == 1, "one pomodoro counted");
+
+    p.skip(m, 1200);
+    check(p.phase == PomodoroPhase::Focus && m.activeTagId == 1 && p.phaseEnd == 1300, "skip from ready focuses");
+    e = p.tick(m, 1300, 1299);
+    check(e.focusCompleted && e.longBreak && p.cycle == 0 && p.phaseEnd == 1350, "every second focus: long break");
+    e = p.skip(m, 1310);
+    check(e.breakEnded && e.focusStarted && p.phase == PomodoroPhase::Focus && m.activeTagId == 1 &&
+          m.activeSince == 1310 && m.sessions.back().tagId == rest && m.sessions.back().end == 1310,
+          "skipping a break starts the next focus");
+
+    p.pause(m, 1330);
+    check(p.paused && !m.activeTagId && p.remainingAt(5000) == 80 && m.sessions.back().end == 1330 &&
+          m.sessions.back().flags == 0, "pause records the partial focus");
+    check(!p.tick(m, 1400, 1399).any() && p.paused, "paused countdown holds");
+    p.resume(m, 1500);
+    check(!p.paused && m.activeTagId == 1 && m.activeSince == 1500 && p.phaseEnd == 1580, "resume continues");
+
+    p.focus(m, 2, 1540);
+    check(m.activeTagId == 2 && p.focusTag == 2 && p.phaseEnd == 1580 && m.sessions.back().end == 1540,
+          "switching tags keeps the countdown");
+    e = p.tick(m, 1580, 1579);
+    check(e.focusCompleted && m.sessions.back().tagId == 2 && m.sessions.back().start == 1540 &&
+          m.sessions.back().flags == flag, "the final segment is the pomodoro");
+    e = p.focus(m, 1, 1590);
+    check(e.focusStarted && p.phase == PomodoroPhase::Focus && m.sessions.back().tagId == rest &&
+          m.sessions.back().end == 1590 && m.activeTagId == 1, "a tag click during a break starts focusing");
+
+    const int counted = m.stats(0, 9000, 9000).pomodoros;
+    p.abandon(m, 1620);
+    check(p.phase == PomodoroPhase::Ready && !m.activeTagId && m.sessions.back().end == 1620 &&
+          m.stats(0, 9000, 9000).pomodoros == counted, "abandon keeps the time, counts nothing");
+
+    p.focus(m, 1, 2000);
+    e = p.tick(m, 2600, 2040);
+    check(e.interrupted && p.phase == PomodoroPhase::Ready && !m.activeTagId && m.sessions.back().end == 2040 &&
+          m.sessions.back().flags == 0, "sleep interrupts the focus at the last tick");
+
+    p.focus(m, 1, 3000);
+    e = p.tick(m, 3200, 3090);
+    const auto& focusRecord = m.sessions[m.sessions.size() - 2];
+    check(e.focusCompleted && e.breakEnded && p.phase == PomodoroPhase::Ready && !m.activeTagId &&
+          focusRecord.end == 3100 && focusRecord.flags == flag && m.sessions.back().start == 3100 &&
+          m.sessions.back().end == 3150, "a late tick catches up with focus and break");
+
+    p.config.autoNext = true;
+    p.focus(m, 1, 4000);
+    p.tick(m, 4100, 4099);
+    e = p.tick(m, 4120, 4119);
+    check(e.breakEnded && e.focusStarted && p.phase == PomodoroPhase::Focus && m.activeTagId == 1 &&
+          m.activeSince == 4120 && p.phaseEnd == 4220, "auto-start after a break");
+    p.config.autoNext = false;
+
+    m.stop(4150);
+    p.tick(m, 4160, 4159);
+    check(p.paused && p.remainingAt(9999) == 60, "a record stopped elsewhere pauses the countdown");
+    p.abandon(m, 4170);
+    check(p.phase == PomodoroPhase::Ready && !m.activeTagId, "abandon while paused");
+
+    m.start(3, 5000);           // a free-running record when focus begins is split
+    p.focus(m, 3, 5100);
+    check(m.sessions.back().tagId == 3 && m.sessions.back().start == 5000 && m.sessions.back().end == 5100 &&
+          m.activeSince == 5100, "free record split at focus start");
+    p.leave();
+    check(p.phase == PomodoroPhase::Ready && m.activeTagId == 3, "leaving pomodoro mode keeps recording");
+
+    tracker::Model fresh;
+    fresh.addTag(L"\u4f11\u606f", 0x123456u, tracker::Category::Play);
+    tracker::Pomodoro q;
+    q.config = {10, 5, 5, 4, false};
+    q.focus(fresh, 1, 100);
+    e = q.tick(fresh, 110, 109);
+    check(q.restTag == 4 && fresh.activeTagId == 4 && fresh.tags.size() == 4 && !e.restTagCreated,
+          "an existing rest tag is reused");
+    check(fresh.findTag(1) && !q.focus(fresh, 99, 120).any(), "unknown tag ignored");
+}
+
 void persistenceTests(const std::filesystem::path& directory) {
     const auto path = directory / L"\u65f6\u95f4-\u8bb0\u5f55.bin";
     const auto corruptPath = directory / L"corrupt.bin";
@@ -206,7 +355,7 @@ void persistenceTests(const std::filesystem::path& directory) {
           "stopped state roundtrip");
     check(original.save(path.wstring()), "restore fixture");
     const auto valid = readBytes(path);
-    check(valid.size() > 8 && valid[0] == 'T' && valid[7] == '2', "versioned persistence");
+    check(valid.size() > 8 && valid[0] == 'T' && valid[7] == '3', "versioned persistence");
     std::vector<std::size_t> tagOffsets;
     std::size_t cursor = 12;
     for (std::uint64_t i = 0; i < number(valid, 8, 4); ++i) {
@@ -215,14 +364,14 @@ void persistenceTests(const std::filesystem::path& directory) {
     }
     const auto countOffset = cursor;
     const auto sessionOffset = cursor + 4;
-    const auto activeOffset = sessionOffset + 20 * number(valid, countOffset, 4);
+    const auto activeOffset = sessionOffset + 24 * number(valid, countOffset, 4);
     const auto rejects = [&](std::vector<unsigned char> bytes) {
         writeBytes(corruptPath, bytes);
         check(!loaded.load(corruptPath.wstring()), "corrupt load rejected");
         check(loaded.activeTagId == 0 && loaded.sessions.size() == 3 && loaded.findTag(id)->name == unicode,
               "failed load leaves model unchanged");
     };
-    auto bad = valid; bad[7] = '3'; rejects(bad);
+    auto bad = valid; bad[7] = '4'; rejects(bad);
     bad = valid; put(bad, activeOffset + 12, ~std::uint64_t(0), 8); rejects(bad);
     bad = valid; put(bad, activeOffset + 12, 253402300800ULL, 8); rejects(bad);
     bad = valid; bad.push_back(0); rejects(bad);
@@ -245,12 +394,21 @@ void persistenceTests(const std::filesystem::path& directory) {
     bad = valid; put(bad, sessionOffset, 999, 4); rejects(bad);
     bad = valid; put(bad, sessionOffset + 12, 100, 8); rejects(bad);
     bad = valid; put(bad, sessionOffset + 4, ~std::uint64_t(0), 8); rejects(bad);
-    bad = valid; put(bad, sessionOffset + 24, 150, 8); rejects(bad);
+    bad = valid; put(bad, sessionOffset + 28, 150, 8); rejects(bad);
+    bad = valid; put(bad, sessionOffset + 20, 2, 4); rejects(bad);
     bad = valid; put(bad, activeOffset, 999, 4); rejects(bad);
     bad = valid; put(bad, activeOffset + 4, 250, 8); rejects(bad);
     bad = valid; put(bad, activeOffset, 0, 4); rejects(bad);
     bad = valid; put(bad, activeOffset + 4, ~std::uint64_t(0), 8); rejects(bad);
 
+    for (const char version : {'2', '1'}) {
+        writeBytes(corruptPath, downgrade(valid, version));
+        tracker::Model old;
+        check(old.load(corruptPath.wstring()) && old.sessions.size() == 2 && old.activeTagId == 2 &&
+              old.sessions[1].tagId == id && old.sessions[1].flags == 0, "older formats with records load");
+        check(old.lastSaved == (version == '2' ? static_cast<long long>(number(valid, activeOffset + 12, 8)) : 0),
+              "older format checkpoint");
+    }
     check(!loaded.load((directory / L"missing.bin").wstring()), "missing load fails");
     check(!original.save((directory / L"missing" / L"file.bin").wstring()), "missing parent save fails");
     check(!original.save(directory.wstring()), "directory replacement fails safely");
@@ -280,7 +438,9 @@ int main() {
         timingTests();
         tagTests();
         editingTests();
+        pomodoroTests();
         persistenceTests(files.directory);
+        flagTests(files.directory);
         tracker::Model recovery;
         recovery.start(1, 100);
         const auto recoveryPath = files.directory / L"recovery.dat";
