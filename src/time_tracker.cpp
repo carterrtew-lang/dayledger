@@ -1,8 +1,9 @@
 // DayLedger (时光账本) - a native Win32 day ledger: one-click tag timers with an optional pomodoro
-// rhythm, a daily work / play / other breakdown, a 24-hour timeline, an editable record list, a
-// weekly chart and a floating mini window.
-// Everything in the main window is custom drawn (GDI+ shapes, GDI ClearType text); only the
-// text fields in the dialogs are native EDIT controls.
+// rhythm; tags grouped in editable categories (each tag a shade of its category's colour); a daily
+// breakdown by category and tag, a 24-hour timeline, an editable record list, a weekly chart and a
+// floating mini window.
+// Everything in the main window is custom drawn (GDI+ shapes, GDI ClearType text), the title bar
+// included; only the text fields in the dialogs are native EDIT controls.
 // Link: user32 gdi32 gdiplus comdlg32 comctl32 shell32 ole32 uuid advapi32.
 #ifndef UNICODE
 #define UNICODE
@@ -54,10 +55,16 @@ enum : int {
     CMD_AUTOSTART = 133, CMD_POMODORO_START = 134, CMD_SOUND = 135, CMD_POMODORO_ON = 136,
     CMD_POMODORO_OFF = 137, CMD_EXIT = 138, CMD_SHOW = 139, CMD_CLOSE_TO_TRAY = 140, CMD_CALENDAR = 141,
     CMD_CLOSE = 142,                  // same as the close button
-    CMD_TAG_FIRST = 0x1000,           // + tag index: start, switch to, or stop that tag
-    CMD_EDIT_TAG_FIRST = 0x2000,      // + tag index: edit that tag
+    CMD_NEW_CATEGORY = 143, CMD_SYSTEM_TITLEBAR = 144,
+    CMD_VIEW_DAY = 145, CMD_VIEW_STATS = 146, CMD_VIEW_TOGGLE = 147,     // the day / the statistics page
+    CMD_RANGE_WEEK = 148, CMD_RANGE_MONTH = 149, CMD_RANGE_YEAR = 150,   // statistics by week / month / year
+    // A tag position counts down the tag list as the sidebar shows it: category by category.
+    CMD_TAG_FIRST = 0x1000,           // + tag position: start, switch to, or stop that tag
+    CMD_EDIT_TAG_FIRST = 0x2000,      // + tag position: edit that tag
     CMD_EDIT_RECORD_FIRST = 0x3000,   // + row of the record list (newest first)
     CMD_DELETE_RECORD_FIRST = 0x4000, // + row of the record list; undoable
+    CMD_EDIT_CATEGORY_FIRST = 0x5000, // + category index: edit that category
+    CMD_NEW_TAG_IN_FIRST = 0x6000,    // + category index: new tag in that category
     CMD_RANGE = 0x1000,
 };
 // SendMessage(main, WM_DL_QUERY, what, 0) reads window state (automation interface).
@@ -66,14 +73,22 @@ enum : int { Q_TAGS = 0, Q_RECORDS = 1, Q_ACTIVE = 2, Q_READONLY = 3, Q_IS_TODAY
              Q_SAVE_FAILED = 5, Q_DARK = 6, Q_SELECTED_TAG = 7, Q_LOADED = 8, Q_POMODORO_MODE = 9,
              Q_POMODORO_PHASE = 10, Q_POMODORO_PAUSED = 11, Q_POMODORO_REMAINING = 12,
              Q_POMODOROS_TODAY = 13, Q_MINI = 14, Q_REST_TAG = 15, Q_TOPMOST = 16, Q_TRAY = 17,
-             Q_CALENDAR = 18 };
+             Q_CALENDAR = 18, Q_CATEGORIES = 19,
+             Q_VIEW = 20,           // 0 the day, 1 statistics
+             Q_RANGE = 21,          // 0 week, 1 month, 2 year
+             Q_PERIOD_TOTAL = 22,   // seconds recorded in the shown period (statistics page), else -1
+             Q_PERIOD_START = 23 }; // first moment of the shown period (statistics page), else -1
 constexpr UINT WM_DL_LOAD = WM_APP + 1;
 constexpr UINT WM_DL_ACTIVATE = WM_APP + 2;
 constexpr UINT WM_DL_TRAY = WM_APP + 3;       // notification-area icon callback
 
 // Tag dialog (class DayLedgerTagEditor). Post WM_COMMAND with these ids to drive it.
+// TD_CATEGORY_FIRST + category index picks the category; TD_COLOR_FIRST + n picks shade n
+// (0 darkest .. 7 lightest) of the category's colour family.
 enum : int { TD_NAME = 201, TD_CUSTOM_COLOR = 203, TD_DELETE = 204, TD_CATEGORY_FIRST = 211,
-             TD_COLOR_FIRST = 220 };
+             TD_COLOR_FIRST = 280 };
+// Category dialog (class DayLedgerCategoryEditor). CD_COLOR_FIRST + n picks preset colour n.
+enum : int { CD_NAME = 501, CD_CUSTOM_COLOR = 503, CD_DELETE = 504, CD_RECOLOR = 505, CD_COLOR_FIRST = 520 };
 // Record dialog (class DayLedgerRecordEditor).
 enum : int { RD_START = 302, RD_END = 303, RD_DELETE = 304, RD_TAG_FIRST = 0x1000 };
 // Pomodoro settings dialog (class DayLedgerPomodoroSettings).
@@ -88,7 +103,9 @@ enum HitKind : int {
     HK_NEW_TAG, HK_ADD_RECORD, HK_WEEK_DAY, HK_SEGMENT, HK_TOAST_ACTION, HK_RETRY, HK_NOW,
     HK_STATUS, HK_MODE_FREE, HK_MODE_POMODORO, HK_POMO_START, HK_POMO_PAUSE, HK_POMO_RESUME,
     HK_POMO_SKIP, HK_POMO_ABANDON, HK_POMO_SETTINGS, HK_MINI, HK_MINI_EXPAND, HK_DATE, HK_CAL_PREV,
-    HK_CAL_NEXT, HK_CAL_DAY, HK_CAL_TODAY, HK_DIALOG,
+    HK_CAL_NEXT, HK_CAL_DAY, HK_CAL_TODAY, HK_DIALOG, HK_CAT_HEADER, HK_CAT_ADD, HK_CAT_EDIT, HK_CAT_EMPTY,
+    HK_NEW_CATEGORY, HK_VIEW_DAY, HK_VIEW_STATS, HK_RANGE, HK_PERIOD_PREV, HK_PERIOD_NEXT, HK_PERIOD_NOW,
+    HK_TREND_BAR, HK_HOUR, HK_BREAKDOWN, HK_BREAKDOWN_SCROLL, HK_KPI,
 };
 
 enum ToastKind : int { TOAST_PLAIN, TOAST_UNDO, TOAST_START_FOCUS };
@@ -118,7 +135,19 @@ struct RecordRow {
 
 struct WeekDay { long long day; tracker::DayStats stats; };
 
-struct Layout { RECT tagsList{}, recordsList{}, main{}, date{}; };
+struct Layout { RECT tagsList{}, recordsList{}, breakdownList{}, main{}, date{}; };
+
+// What the statistics page shows for one week, month or year.
+struct PeriodStats {
+    long long start = 0, end = 0;                   // [start, end)
+    std::vector<long long> buckets;                 // bounds of the trend bars: days, or months of a year
+    std::vector<tracker::DayStats> trend;           // one per bar
+    tracker::DayStats total, previous;              // this period; the previous one (to the same point)
+    bool samePoint = false;                         // `previous` stops where this period stands today
+    std::map<int, std::array<long long, 24>> hours; // seconds per hour of the day, by category
+    int elapsedDays = 0, activeDays = 0, elapsedBuckets = 0;
+    long long focusSeconds = 0;                     // completed pomodoros that ended in the period
+};
 
 struct Undo {
     bool valid = false, active = false;
@@ -132,12 +161,19 @@ struct App {
     tracker::Model model;
     std::wstring dataDir, dataPath, settingsPath, numberFace = L"Segoe UI";
     bool readOnly = false, saveFailed = false, closing = false, loaded = false;
+    bool upgraded = false;              // the ledger was written by a version without categories
     long long chosenDay = 0, lastSave = 0, lastDaySeen = 0, lastTick = 0;
     int selectedTagId = 0;
     // derived from the model on every refresh
     tracker::DayStats day, prevDay, today;
     std::vector<RecordRow> rows;
     std::vector<WeekDay> week;
+    // statistics page
+    int view = 0;                       // 0 the day, 1 statistics
+    int range = 1;                      // 0 week, 1 month, 2 year
+    long long periodStart = 0;          // first day of the shown period (0: not chosen yet)
+    PeriodStats period;
+    int breakdownScroll = 0, breakdownContent = 0;
     // theme
     int themeMode = 0;              // 0 follows Windows, 1 light, 2 dark
     Palette pal = LightPalette();
@@ -182,6 +218,10 @@ struct App {
     DWORD calendarClosedAt = 0;
     Surface calendarSurface;
     // window
+    bool customFrame = true;            // our own title bar (off: the system one, [window] systemTitleBar=1)
+    bool active = true;                 // the app is in the foreground (the title bar dims otherwise)
+    int captionHot = 0, captionPressed = 0;   // HTMINBUTTON / HTMAXBUTTON / HTCLOSE under the pointer
+    bool ncTracking = false;
     Surface surface;
     HACCEL accel = nullptr;
     HICON iconBig = nullptr, iconSmall = nullptr;
@@ -213,12 +253,96 @@ HMODULE SystemLibrary(const wchar_t* name) {
     return LoadLibraryExW(name, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
 }
 
-const wchar_t* CategoryName(tracker::Category category) {
-    switch (category) {
-    case tracker::Category::Work: return L"工作";
-    case tracker::Category::Play: return L"娱乐";
-    default: return L"其他";
+// ---- the title bar: our own row of content in place of the system caption
+
+constexpr int kTitleHeight = 48;            // DIP; the height of a Windows 11 "tall" title bar
+constexpr int kCaptionButtonWidth = 46;     // DIP, as the system's caption buttons
+
+int TitleHeight() { return S(kTitleHeight); }
+int SystemMetric(int index) {
+    using MetricsForDpi = int(WINAPI*)(int, UINT);
+    static MetricsForDpi metrics = LoadProc<MetricsForDpi>(GetModuleHandleW(L"user32.dll"), "GetSystemMetricsForDpi");
+    return metrics ? metrics(index, app.dpi) : GetSystemMetrics(index);
+}
+// The resize band along the top edge (inside the client area, since the frame has no top part).
+int ResizeBorder() { return SystemMetric(SM_CYSIZEFRAME) + SystemMetric(SM_CXPADDEDBORDER); }
+// Caption button `index` (0 minimise, 1 maximise / restore, 2 close) in client coordinates.
+RECT CaptionButtonRect(int index, int clientWidth) {
+    const int w = S(kCaptionButtonWidth);
+    return RECT{clientWidth - (3 - index) * w, 0, clientWidth - (2 - index) * w, TitleHeight()};
+}
+int CaptionButtonAt(POINT pt, int clientWidth) {
+    static const int codes[] = {HTMINBUTTON, HTMAXBUTTON, HTCLOSE};
+    for (int i = 0; i < 3; ++i) {
+        const RECT r = CaptionButtonRect(i, clientWidth);
+        if (PtInRect(&r, pt)) return codes[i];
     }
+    return 0;
+}
+
+std::wstring CategoryName(int id) {
+    const auto* category = app.model.findCategory(id);
+    return category ? category->name : std::wstring(L"?");
+}
+COLORREF CategoryColor(int id) {
+    const auto* category = app.model.findCategory(id);
+    return category ? category->color : app.pal.text3;
+}
+
+// Tags of a category that have time in `stats`, busiest first.
+std::vector<const tracker::Tag*> BusyTags(const tracker::DayStats& stats, int category) {
+    std::vector<const tracker::Tag*> busy;
+    for (const auto& tag : app.model.tags)
+        if (tag.category == category && stats.ofTag(tag.id) > 0) busy.push_back(&tag);
+    std::stable_sort(busy.begin(), busy.end(), [&](const tracker::Tag* a, const tracker::Tag* b) {
+        return stats.ofTag(a->id) > stats.ofTag(b->id);
+    });
+    return busy;
+}
+
+// Tags in the order the sidebar shows them: category by category, in model order within each.
+std::vector<int> DisplayTags() {
+    std::vector<int> order;
+    const auto& model = app.model;
+    for (const auto& category : model.categories)
+        for (std::size_t i = 0; i < model.tags.size(); ++i)
+            if (model.tags[i].category == category.id) order.push_back(static_cast<int>(i));
+    return order;
+}
+// The model index of the tag at a display position (what the number keys use), or -1.
+int DisplayTagAt(int position) {
+    const auto order = DisplayTags();
+    return position >= 0 && position < static_cast<int>(order.size()) ? order[static_cast<std::size_t>(position)] : -1;
+}
+
+// The rows of the tag list: per category a header and its tags (or a hint when it has none),
+// then a "new category" row. Offsets in pixels from the top of the list content.
+enum SideKind { SIDE_HEADER, SIDE_TAG, SIDE_EMPTY, SIDE_NEW_CATEGORY };
+struct SideItem { SideKind kind; int index; int top, height; };     // index: category or tag index
+constexpr int kTagRowHeight = 52;
+
+std::vector<SideItem> SidebarItems() {
+    std::vector<SideItem> items;
+    const auto& model = app.model;
+    int y = 0;
+    for (std::size_t c = 0; c < model.categories.size(); ++c) {
+        const int headerH = S(c ? 42 : 32);
+        items.push_back({SIDE_HEADER, static_cast<int>(c), y, headerH});
+        y += headerH;
+        bool any = false;
+        for (std::size_t t = 0; t < model.tags.size(); ++t) {
+            if (model.tags[t].category != model.categories[c].id) continue;
+            items.push_back({SIDE_TAG, static_cast<int>(t), y, S(kTagRowHeight)});
+            y += S(kTagRowHeight);
+            any = true;
+        }
+        if (!any) {
+            items.push_back({SIDE_EMPTY, static_cast<int>(c), y, S(40)});
+            y += S(40);
+        }
+    }
+    items.push_back({SIDE_NEW_CATEGORY, 0, y + S(10), S(36)});
+    return items;
 }
 
 std::wstring WinError(DWORD error) {
@@ -292,6 +416,23 @@ bool ParseMinutes(std::wstring text, int& minutes, bool allowEndOfDay) {
 }
 
 // Local wall-clock time `minutes` after the start of `day` (24:00 rolls to the next day).
+long long MonthStart(long long time) {
+    auto t = LocalTm(time);
+    t.tm_mday = 1;
+    t.tm_hour = t.tm_min = t.tm_sec = 0;
+    t.tm_isdst = -1;
+    return static_cast<long long>(std::mktime(&t));
+}
+
+long long ShiftMonth(long long month, int delta) {
+    auto t = LocalTm(month);
+    t.tm_mon += delta;
+    t.tm_mday = 1;
+    t.tm_hour = t.tm_min = t.tm_sec = 0;
+    t.tm_isdst = -1;
+    return static_cast<long long>(std::mktime(&t));
+}
+
 long long DayPlusMinutes(long long day, int minutes) {
     auto t = LocalTm(day);
     t.tm_hour = minutes / 60;
@@ -449,6 +590,9 @@ void LoadSettings() {
     app.soundOn = ReadSetting(L"pomodoro", L"sound", 1) != 0;
     app.topmost = ReadSetting(L"window", L"topmost", 0) != 0;
     app.closeToTray = ReadSetting(L"window", L"closeToTray", 1) != 0;
+    app.customFrame = ReadSetting(L"window", L"systemTitleBar", 0) == 0;
+    app.view = std::clamp(ReadSetting(L"ui", L"view", 0), 0, 1);
+    app.range = std::clamp(ReadSetting(L"ui", L"range", 1), 0, 2);
     app.trayHintShown = ReadSetting(L"window", L"trayHint", 0) != 0;
     auto& config = app.pomodoro.config;
     config.focus = std::clamp(ReadSetting(L"pomodoro", L"focus", 25), 1, 180) * app.secondsPerMinute;
@@ -549,8 +693,14 @@ void LoadData() {
         MessageBoxW(app.hwnd, message.c_str(), L"读取失败 · 只读保护", MB_OK | MB_ICONERROR);
         return;
     }
+    char magic[8]{};
+    {
+        std::ifstream probe(std::filesystem::path(app.dataPath), std::ios::binary);
+        probe.read(magic, sizeof(magic));
+    }
     bool loaded = false;
     try { loaded = app.model.load(app.dataPath); } catch (...) { loaded = false; }
+    app.upgraded = loaded && std::string(magic, 7) == "TRACKER" && magic[7] >= '1' && magic[7] <= '3';
     if (!loaded) {
         app.readOnly = true;
         const std::wstring message = L"记录文件无法读取或已损坏：\n" + app.dataPath +
@@ -619,6 +769,57 @@ void UpdateTitle() {
     }
 }
 
+// ---- periods of the statistics page
+
+long long PeriodStart(int range, long long day) {
+    day = DayStart(day);
+    if (range == 0) return ShiftDay(day, -((LocalTm(day).tm_wday + 6) % 7));     // weeks start on Monday
+    const long long month = MonthStart(day);
+    return range == 1 ? month : ShiftMonth(month, -LocalTm(month).tm_mon);
+}
+long long ShiftPeriod(int range, long long start, int delta) {
+    return range == 0 ? ShiftDay(start, 7 * delta) : ShiftMonth(start, (range == 1 ? 1 : 12) * delta);
+}
+
+void ComputePeriod(long long now) {
+    const auto& model = app.model;
+    auto& p = app.period;
+    const long long today = DayStart(now);
+    if (!app.periodStart) app.periodStart = PeriodStart(app.range, app.chosenDay ? app.chosenDay : today);
+    p.start = app.periodStart;
+    p.end = ShiftPeriod(app.range, p.start, 1);
+    std::vector<long long> days;
+    for (long long d = p.start; d < p.end && days.size() < 400; d = ShiftDay(d, 1)) days.push_back(d);
+    days.push_back(p.end);
+    const auto daily = model.statsBetween(days, now);
+    p.elapsedDays = p.activeDays = 0;
+    for (std::size_t i = 0; i < daily.size(); ++i) {
+        if (days[i] <= today) ++p.elapsedDays;
+        if (daily[i].total > 0) ++p.activeDays;
+    }
+    if (app.range == 2) {
+        p.buckets.clear();
+        for (int m = 0; m <= 12; ++m) p.buckets.push_back(ShiftMonth(p.start, m));
+        p.trend = model.statsBetween(p.buckets, now);
+    } else {
+        p.buckets = days;
+        p.trend = daily;
+    }
+    p.elapsedBuckets = 0;
+    for (std::size_t i = 0; i + 1 < p.buckets.size(); ++i) if (p.buckets[i] <= today) ++p.elapsedBuckets;
+    p.total = model.stats(p.start, p.end, now);
+    // Compared with the previous period up to the same point (the same number of days), or whole.
+    const long long previousStart = ShiftPeriod(app.range, p.start, -1);
+    p.samePoint = today >= p.start && today < p.end;
+    p.previous = model.stats(previousStart, p.samePoint ? std::min(ShiftDay(previousStart, p.elapsedDays), p.start)
+                                                        : p.start, now);
+    p.hours = model.hoursByCategory(days, now);
+    p.focusSeconds = 0;
+    for (const auto& session : model.sessions)
+        if ((session.flags & tracker::SessionPomodoro) && session.end > p.start && session.end <= p.end)
+            p.focusSeconds += session.end - session.start;
+}
+
 void Refresh() {
     const long long now = Now(), today = DayStart(now);
     const long long dayEnd = ShiftDay(app.chosenDay, 1);
@@ -644,6 +845,7 @@ void Refresh() {
         app.week.push_back({day, day > today ? tracker::DayStats{} : model.stats(day, ShiftDay(day, 1), now)});
     }
     if (app.selectedTagId && !model.findTag(app.selectedTagId)) app.selectedTagId = 0;
+    if (app.view == 1) ComputePeriod(now);
     UpdateTitle();
     TrayUpdate();
     InvalidateRect(app.hwnd, nullptr, FALSE);
@@ -822,21 +1024,59 @@ std::wstring EndText(long long time, long long dayStart, long long dayEnd) {
 
 // ---------------------------------------------------------------- painting: left column
 
+// The left part of the title bar: logo, name, and the mini window / theme / more buttons.
 void PaintBrand(Ctx& x, const RECT& r) {
-    const int size = S(36);
-    const RECT logo{r.left, r.top + (Ht(r) - size) / 2, r.left + size, r.top + (Ht(r) - size) / 2 + size};
-    PaintLogo(x.c, logo);
-    const int tx = logo.right + S(12);
-    x.c.Text(L"时光账本", RECT{tx, logo.top - S(2), r.right - S(118), logo.top + S(21)}, x.f.brand, x.p.text);
-    x.c.Text(L"DayLedger · 每一分钟都算数", RECT{tx, logo.top + S(19), r.right - S(118), logo.bottom + S(3)},
-             x.f.caption, x.p.text3);
-    const RECT menu{r.right - S(34), logo.top + S(1), r.right, logo.bottom + S(-1)};
-    const RECT theme{menu.left - S(38), menu.top, menu.left - S(4), menu.bottom};
-    const RECT miniButton{theme.left - S(38), menu.top, theme.left - S(4), menu.bottom};
-    IconButton(x, miniButton, Icon::MiniWindow, Hid(HK_MINI), L"迷你悬浮窗（M）");
+    const int size = S(26), cy = (r.top + r.bottom) / 2;
+    PaintLogo(x.c, RECT{r.left, cy - size / 2, r.left + size, cy - size / 2 + size});
+    const int bw = S(34), bh = S(34), gap = S(2);
+    const RECT menu{r.right - bw, cy - bh / 2, r.right, cy - bh / 2 + bh};
+    const RECT theme{menu.left - gap - bw, menu.top, menu.left - gap, menu.bottom};
+    const RECT miniButton{theme.left - gap - bw, menu.top, theme.left - gap, menu.bottom};
+    x.c.Text(L"时光账本", RECT{r.left + size + S(10), r.top, miniButton.left - S(8), r.bottom}, x.f.brand,
+             app.active ? x.p.text : x.p.text2);
+    IconButton(x, miniButton, Icon::MiniWindow, Hid(HK_MINI), L"迷你悬浮窗（M）", true, 17);
     IconButton(x, theme, x.p.dark ? Icon::Sun : Icon::Moon, Hid(HK_THEME),
-               x.p.dark ? L"切换到浅色主题" : L"切换到深色主题");
-    IconButton(x, menu, Icon::More, Hid(HK_MENU), L"更多：导出、主题、快捷键");
+               x.p.dark ? L"切换到浅色主题" : L"切换到深色主题", true, 17);
+    IconButton(x, menu, Icon::More, Hid(HK_MENU), L"更多：新建、导出、主题、快捷键", true, 17);
+}
+
+// Minimise, maximise / restore and close, drawn like the system's (the pointer reaches them as
+// non-client hits, so Windows 11 still offers snap layouts on the maximise button).
+void PaintCaptionButtons(Ctx& x, int width) {
+    auto& c = x.c;
+    const bool zoomed = IsZoomed(app.hwnd) != FALSE;
+    static const int codes[] = {HTMINBUTTON, HTMAXBUTTON, HTCLOSE};
+    for (int i = 0; i < 3; ++i) {
+        const RECT r = CaptionButtonRect(i, width);
+        const bool hot = app.captionHot == codes[i], down = hot && app.captionPressed == codes[i];
+        COLORREF ink = app.active ? x.p.text : x.p.text3;
+        if (codes[i] == HTCLOSE && hot) {
+            c.Fill(r, down ? RGB(0xA3, 0x26, 0x19) : RGB(0xC4, 0x2B, 0x1C));
+            ink = RGB(255, 255, 255);
+        } else if (hot) {
+            c.Fill(r, Mix(x.p.bg, x.p.text, down ? 0.13 : 0.07));
+        }
+        const float line = std::max(1.0f, std::floor(Sf(1) + 0.25f));
+        const float g = std::round(Sf(10));
+        const float left = std::floor((r.left + r.right - g) / 2.0f), top = std::floor((r.top + r.bottom - g) / 2.0f);
+        auto square = [&](float sx, float sy, float side) {
+            c.Fill(sx, sy, side, line, ink);
+            c.Fill(sx, sy + side - line, side, line, ink);
+            c.Fill(sx, sy, line, side, ink);
+            c.Fill(sx + side - line, sy, line, side, ink);
+        };
+        if (i == 0) c.Fill(left, std::floor(top + g / 2), g, line, ink);
+        else if (i == 1 && !zoomed) square(left, top, g);
+        else if (i == 1) {                    // restore: a square with another one behind it
+            const float off = std::round(Sf(2));
+            square(left, top + off, g - off);
+            c.Fill(left + off, top, g - off, line, ink);
+            c.Fill(left + g - line, top, line, g - off, ink);
+        } else {
+            c.Line(left, top, left + g, top + g, ink, line * 1.1f);
+            c.Line(left + g, top, left, top + g, ink, line * 1.1f);
+        }
+    }
 }
 
 // "18:42" for a countdown; hours appear only for very long phases.
@@ -1030,7 +1270,7 @@ void PaintTimer(Ctx& x, const RECT& r) {
     else PaintFreeTimer(x, r, top, statusRight);
 }
 
-void PaintTagRow(Ctx& x, const RECT& row, int index, long long maxSeconds) {
+void PaintTagRow(Ctx& x, const RECT& row, int index, int position, long long maxSeconds) {
     auto& c = x.c;
     const auto& tag = app.model.tags[static_cast<std::size_t>(index)];
     const bool active = tag.id == app.model.activeTagId;
@@ -1041,7 +1281,7 @@ void PaintTagRow(Ctx& x, const RECT& row, int index, long long maxSeconds) {
     if (active) c.Round(inner, Sf(10), Mix(x.p.surface, tag.color, x.p.dark ? 0.2 : 0.11));
     if (down) c.Round(inner, Sf(10), active ? Mix(x.p.pressed, tag.color, 0.18) : x.p.pressed);
     else if (hot && !active) c.Round(inner, Sf(10), x.p.hover);
-    const float cx = inner.left + Sf(24), cy = (inner.top + inner.bottom) / 2.0f;
+    const float cx = inner.left + Sf(27), cy = (inner.top + inner.bottom) / 2.0f;
     const bool pomodoro = app.pomodoroMode;
     if (active || hot) {
         c.Circle(cx, cy, Sf(13), tag.color);
@@ -1051,25 +1291,30 @@ void PaintTagRow(Ctx& x, const RECT& row, int index, long long maxSeconds) {
     } else {
         c.Circle(cx, cy, Sf(6), tag.color);
     }
+    const bool numbered = position >= 0 && position < 9;
     const std::wstring verb = pomodoro ? L"单击开始专注" : L"单击开始计时";
     Hot(x, inner, rowId, active ? (pomodoro ? L"单击暂停" : L"单击停止计时") :
-        (index < 9 ? verb + Format(L" · 快捷键 %d", index + 1) : verb));
+        (numbered ? verb + Format(L" · 快捷键 %d", position + 1) : verb));
     const int editW = hot && !app.readOnly ? S(34) : 0;
     const int durationRight = inner.right - S(12) - editW;
-    const int textLeft = inner.left + S(48), textRight = durationRight - S(78);
-    c.Text(tag.name, RECT{textLeft, inner.top + S(4), textRight, inner.top + S(25)},
-           active ? x.f.bodyBold : x.f.body, x.p.text);
-    std::wstring sub = CategoryName(tag.category);
-    if (index < 9) sub += Format(L"  ·  按 %d", index + 1);
+    const int textLeft = inner.left + S(50), textRight = durationRight - S(78);
+    std::wstring sub = numbered ? Format(L"按 %d", position + 1) : std::wstring();
     const auto tomatoes = app.today.pomodorosByTag.find(tag.id);
-    if (tomatoes != app.today.pomodorosByTag.end()) sub += Format(L"  ·  %d 个番茄", tomatoes->second);
-    c.Text(sub, RECT{textLeft, inner.top + S(24), textRight, inner.top + S(41)}, x.f.caption, x.p.text3);
-    const auto found = app.today.byTag.find(tag.id);
-    const long long seconds = found == app.today.byTag.end() ? 0 : found->second;
+    if (tomatoes != app.today.pomodorosByTag.end())
+        sub += (sub.empty() ? L"" : L"  ·  ") + Format(L"%d 个番茄", tomatoes->second);
+    if (sub.empty()) {
+        c.Text(tag.name, RECT{textLeft, inner.top, textRight, inner.bottom - S(2)}, active ? x.f.bodyBold : x.f.body,
+               x.p.text);
+    } else {
+        c.Text(tag.name, RECT{textLeft, inner.top + S(4), textRight, inner.top + S(25)},
+               active ? x.f.bodyBold : x.f.body, x.p.text);
+        c.Text(sub, RECT{textLeft, inner.top + S(24), textRight, inner.top + S(41)}, x.f.caption, x.p.text3);
+    }
+    const long long seconds = app.today.ofTag(tag.id);
     if (seconds > 0 && maxSeconds > 0) {        // today's share, relative to the busiest tag
         const float barLeft = float(textLeft), full = float(inner.right - S(12) - textLeft);
         const float barW = std::max(Sf(4), full * static_cast<float>(seconds) / static_cast<float>(maxSeconds));
-        c.Round(barLeft, float(inner.bottom - S(7)), barW, Sf(3), Sf(1.5f), tag.color, 220);
+        c.Round(barLeft, float(inner.bottom - S(6)), barW, Sf(3), Sf(1.5f), tag.color, 220);
     }
     c.Text(seconds > 0 ? DurationText(seconds) : L"—", RECT{textRight, inner.top, durationRight, inner.bottom},
            active ? x.f.bodyBold : x.f.label, active ? x.p.text : seconds > 0 ? x.p.text2 : x.p.text3,
@@ -1081,6 +1326,49 @@ void PaintTagRow(Ctx& x, const RECT& row, int index, long long maxSeconds) {
     }
 }
 
+// A category header: its colour, its name and today's total; on hover, "add a tag" and "edit".
+void PaintCategoryHeader(Ctx& x, const RECT& row, int index) {
+    auto& c = x.c;
+    const auto& category = app.model.categories[static_cast<std::size_t>(index)];
+    const int headerId = Hid(HK_CAT_HEADER, index), addId = Hid(HK_CAT_ADD, index), editId = Hid(HK_CAT_EDIT, index);
+    const bool hot = app.hot == headerId || app.hot == addId || app.hot == editId;
+    const RECT line{row.left, row.bottom - S(30), row.right, row.bottom - S(2)};
+    Hot(x, line, headerId);
+    const float cy = (line.top + line.bottom) / 2.0f;
+    c.Round(float(line.left + S(12)), cy - Sf(5), Sf(10), Sf(10), Sf(3), category.color);
+    const bool buttons = hot && !app.readOnly;
+    const int right = line.right - S(12) - (buttons ? S(58) : 0);
+    const long long seconds = app.today.ofCategory(category.id);
+    const std::wstring total = seconds > 0 ? DurationText(seconds) : L"—";
+    const int totalW = c.Measure(total, x.f.labelBold).cx;
+    c.Text(category.name, RECT{line.left + S(30), line.top, right - totalW - S(10), line.bottom}, x.f.labelBold,
+           x.p.text2);
+    c.Text(total, RECT{right - totalW - S(2), line.top, right, line.bottom}, x.f.labelBold,
+           seconds > 0 ? x.p.text2 : x.p.text3, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    if (buttons) {
+        const RECT edit{line.right - S(6) - S(28), static_cast<int>(cy) - S(14), line.right - S(6),
+                        static_cast<int>(cy) + S(14)};
+        const RECT add{edit.left - S(2) - S(28), edit.top, edit.left - S(2), edit.bottom};
+        IconButton(x, add, Icon::Plus, addId, L"在「" + category.name + L"」新建标签", true, 15);
+        IconButton(x, edit, Icon::Pencil, editId, L"编辑大类「" + category.name + L"」", true, 15);
+    }
+}
+
+void PaintEmptyCategory(Ctx& x, const RECT& row, int index) {
+    auto& c = x.c;
+    const auto& category = app.model.categories[static_cast<std::size_t>(index)];
+    const int id = Hid(HK_CAT_EMPTY, index);
+    const RECT inner{row.left, row.top + S(2), row.right, row.bottom - S(2)};
+    const bool hot = app.hot == id && !app.readOnly;
+    if (hot) c.Round(inner, Sf(10), app.pressed == id ? x.p.pressed : x.p.hover);
+    const float cy = (inner.top + inner.bottom) / 2.0f;
+    c.Ring(inner.left + Sf(27), cy, Sf(9), hot ? x.p.text2 : x.p.borderStrong, Sf(1.2f));
+    PaintIcon(c, Icon::Plus, inner.left + Sf(27), cy, Sf(12), hot ? x.p.text2 : x.p.text3);
+    c.Text(L"还没有标签 · 单击添加", RECT{inner.left + S(50), inner.top, inner.right - S(12), inner.bottom}, x.f.label,
+           hot ? x.p.text2 : x.p.text3);
+    if (!app.readOnly) Hot(x, inner, id, L"在「" + category.name + L"」新建标签");
+}
+
 void PaintTags(Ctx& x, const RECT& r) {
     auto& c = x.c;
     Card(x, r);
@@ -1088,133 +1376,280 @@ void PaintTags(Ctx& x, const RECT& r) {
     const RECT add{r.right - S(14) - S(78), r.top + S(12), r.right - S(14), r.top + S(12) + S(32)};
     Button(x, add, L"新建", static_cast<int>(Icon::Plus), Btn::Ghost, Hid(HK_NEW_TAG), !app.readOnly,
            L"新建标签（Ctrl+N）");
-    const RECT list{r.left + S(8), r.top + S(54), r.right - S(8), r.bottom - S(8)};
+    const RECT list{r.left + S(8), r.top + S(50), r.right - S(8), r.bottom - S(8)};
     app.layout.tagsList = list;
-    const int rowH = S(54);
-    const int count = static_cast<int>(app.model.tags.size());
-    app.tagContent = count * rowH;
+    const auto items = SidebarItems();
+    app.tagContent = items.empty() ? 0 : items.back().top + items.back().height + S(4);
     app.tagScroll = std::clamp(app.tagScroll, 0, std::max(0, app.tagContent - Ht(list)));
-    if (!count) {
-        c.Text(L"还没有标签", RECT{list.left, list.top + S(20), list.right, list.top + S(44)}, x.f.body, x.p.text2,
-               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        c.Text(L"点击右上角“新建”添加一个，比如“工作”“阅读”", RECT{list.left, list.top + S(44), list.right,
-               list.top + S(64)}, x.f.label, x.p.text3, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        return;
-    }
     long long busiest = 0;
     for (const auto& entry : app.today.byTag) busiest = std::max(busiest, entry.second);
+    int position = 0;
     c.PushClip(list);
-    for (int i = 0; i < count; ++i) {
-        const RECT row{list.left, list.top + i * rowH - app.tagScroll, list.right,
-                       list.top + (i + 1) * rowH - app.tagScroll};
+    for (const auto& item : items) {
+        const RECT row{list.left, list.top + item.top - app.tagScroll, list.right,
+                       list.top + item.top + item.height - app.tagScroll};
+        const int shown = item.kind == SIDE_TAG ? position++ : -1;
         if (row.bottom < list.top || row.top > list.bottom) continue;
-        PaintTagRow(x, row, i, busiest);
+        switch (item.kind) {
+        case SIDE_HEADER: PaintCategoryHeader(x, row, item.index); break;
+        case SIDE_TAG: PaintTagRow(x, row, item.index, shown, busiest); break;
+        case SIDE_EMPTY: PaintEmptyCategory(x, row, item.index); break;
+        case SIDE_NEW_CATEGORY:
+            Button(x, RECT{row.left + S(4), row.top, row.right - S(4), row.bottom}, L"新建大类",
+                   static_cast<int>(Icon::Plus), Btn::Ghost, Hid(HK_NEW_CATEGORY), !app.readOnly,
+                   L"新建一个大类，例如“学习”“运动”");
+            break;
+        }
     }
     c.PopClip();
     PaintScrollbar(x, list, app.tagContent, app.tagScroll, HK_TAG_SCROLL);
 }
 
-void PaintStatus(Ctx& x, const RECT& r) {
+// Where the ledger stands (saved, saving failed, read-only), right-aligned at `right` in the title
+// bar; returns its left edge. Without `withText` only the icon shows (the words are in the tooltip),
+// except for a failed save, which always says so.
+int PaintStatus(Ctx& x, int right, int cy, bool withText) {
     Icon icon = Icon::Check;
-    COLORREF iconColor = x.p.category[2], textColor = x.p.text3;
-    std::wstring text;
+    COLORREF iconColor = x.p.dark ? RGB(0x3c, 0xc4, 0x8f) : RGB(0x1b, 0x9e, 0x6c), textColor = x.p.text3;
+    std::wstring text, tip;
     int id = Hid(HK_STATUS);
-    std::wstring tip = app.dataPath.empty() ? L"" : L"数据文件：" + app.dataPath;
+    const std::wstring file = app.dataPath.empty() ? std::wstring() : L"\n数据文件：" + app.dataPath;
     if (app.readOnly) {
         icon = Icon::Lock;
         iconColor = x.p.text3;
-        text = L"只读保护 · 数据文件不会被修改";
+        text = L"只读保护";
+        tip = L"只读保护：数据文件不会被修改" + file;
     } else if (app.saveFailed) {
         icon = Icon::Alert;
         iconColor = textColor = x.p.danger;
         text = L"保存失败 · 点击重试";
         id = Hid(HK_RETRY);
-        tip = L"重新尝试保存到本机";
+        tip = L"重新尝试保存到本机（Ctrl+S）";
+        withText = true;
     } else if (app.lastSave) {
-        text = L"已自动保存到本机 · " + HM(app.lastSave);
+        text = L"已保存 " + HM(app.lastSave);
+        tip = L"已自动保存到本机 · " + HM(app.lastSave) + file;
     } else {
         icon = Icon::Clock;
         iconColor = x.p.text3;
-        text = L"本地账本已就绪 · 记录会自动保存";
+        text = L"自动保存";
+        tip = L"本地账本已就绪，记录会自动保存" + file;
     }
+    const int textW = withText ? x.c.Measure(text, x.f.label).cx : 0;
+    const int w = S(30) + (withText ? textW + S(10) : 0);
+    const RECT r{right - w, cy - S(15), right, cy + S(15)};
     const bool hot = app.hot == id;
-    if (hot && KindOf(id) == HK_RETRY) x.c.Round(r, Sf(8), x.p.dangerSoft);
-    PaintIcon(x.c, icon, r.left + Sf(14), (r.top + r.bottom) / 2.0f, Sf(14), iconColor);
-    x.c.Text(text, RECT{r.left + S(28), r.top, r.right - S(4), r.bottom}, x.f.label, textColor);
-    if (!tip.empty()) Hot(x, r, id, tip);
+    if (KindOf(id) == HK_RETRY) x.c.Round(r, Sf(15), hot ? Mix(x.p.dangerSoft, x.p.danger, 0.12) : x.p.dangerSoft);
+    else if (hot) x.c.Round(r, Sf(15), x.p.hover);
+    PaintIcon(x.c, icon, r.left + Sf(15), static_cast<float>(cy), Sf(14), iconColor);
+    if (withText)
+        x.c.Text(text, RECT{r.left + S(27), r.top, r.right - S(8), r.bottom}, x.f.label, textColor,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    Hot(x, r, id, tip);
+    return r.left;
 }
 
 // ---------------------------------------------------------------- painting: right column
 
-void PaintHeader(Ctx& x, const RECT& r) {
+// A segmented control in the title bar (on the page background, not on a card).
+void TitleSegments(Ctx& x, const RECT& box, const wchar_t* const* names, int count, int selected, int kind,
+                   const wchar_t* const* tips) {
+    auto& c = x.c;
+    c.Round(box, Sf(9), x.p.dark ? x.p.surface : x.p.pressed);
+    const int partW = (Wd(box) - S(4)) / count;
+    for (int i = 0; i < count; ++i) {
+        const int id = Hid(kind, i);
+        const RECT part{box.left + S(2) + i * partW, box.top + S(2), box.left + S(2) + (i + 1) * partW, box.bottom - S(2)};
+        if (i == selected) {
+            if (x.p.shadow) c.Shadow(part, Sf(7), 12);
+            c.Round(part, Sf(7), x.p.dark ? x.p.pressed : x.p.surface);
+        } else if (app.hot == id) c.Round(part, Sf(7), x.p.dark ? x.p.hover : Mix(x.p.pressed, x.p.surface, 0.55));
+        c.Text(names[i], part, i == selected ? x.f.labelBold : x.f.label, i == selected ? x.p.text : x.p.text2,
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (i != selected) Hot(x, part, id, tips[i]);
+    }
+}
+
+// The day: the date (opens the date picker), previous / next day, "back to today", and the save
+// status at the right end. Less important pieces shrink first when the window is narrow.
+void PaintDayHeader(Ctx& x, const RECT& r) {
     auto& c = x.c;
     const bool isToday = app.chosenDay == x.today;
-    const std::wstring title = DateTitle(app.chosenDay);
-    const int titleW = c.Measure(title, x.f.heading).cx;
+    const int cy = (r.top + r.bottom) / 2;
     const std::wstring relative = RelativeDay(app.chosenDay, x.today);
     const int pillW = c.Measure(relative, x.f.labelBold).cx + S(18);
+    bool pill = true, weekday = true, backText = true, statusText = true, status = true;
+    std::wstring title;
+    int titleW = 0;
+    auto measure = [&] {
+        title = weekday ? DateTitle(app.chosenDay) : MonthDay(app.chosenDay);
+        titleW = c.Measure(title, x.f.heading).cx;
+    };
+    measure();
+    auto need = [&] {
+        return titleW + S(12) + (pill ? pillW + S(4) : 0) + S(32) + S(8) + S(70) +
+               (isToday ? 0 : (backText ? S(112) : S(42))) + S(16) + (status ? (statusText ? S(130) : S(30)) : 0);
+    };
+    const int avail = Wd(r);
+    if (need() > avail) statusText = false;
+    if (need() > avail) backText = false;
+    if (need() > avail) pill = false;
+    if (need() > avail) { weekday = false; measure(); }
+    if (need() > avail && !app.saveFailed) status = false;
     // The date opens the date picker; it highlights like a button.
-    const RECT date{r.left - S(10), r.top + S(1), r.left + titleW + S(12) + pillW + S(32), r.bottom - S(1)};
+    const RECT date{r.left - S(10), cy - S(19), r.left + titleW + S(12) + (pill ? pillW + S(4) : 0) + S(28), cy + S(19)};
     const int dateId = Hid(HK_DATE);
     if (app.calendar) c.Round(date, Sf(10), x.p.pressed);
     else if (app.hot == dateId) c.Round(date, Sf(10), app.pressed == dateId ? x.p.pressed : x.p.hover);
     Hot(x, date, dateId, L"选择日期");
     app.layout.date = date;
     c.Text(title, RECT{r.left, r.top, r.left + titleW + 4, r.bottom}, x.f.heading, x.p.text);
-    PaintIcon(c, app.calendar ? Icon::ChevronUp : Icon::ChevronDown, float(date.right - S(16)),
-              (r.top + r.bottom) / 2.0f, Sf(15), app.hot == dateId || app.calendar ? x.p.text : x.p.text2);
-    const RECT pill{r.left + titleW + S(12), (r.top + r.bottom) / 2 - S(12), r.left + titleW + S(12) + pillW,
-                    (r.top + r.bottom) / 2 + S(12)};
-    c.Round(pill, Sf(12), isToday ? x.p.accentSoft : x.p.track);
-    c.Text(relative, pill, x.f.labelBold, isToday ? x.p.accentText : x.p.text2,
-           DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    const RECT next{r.right - S(38), (r.top + r.bottom) / 2 - S(19), r.right, (r.top + r.bottom) / 2 + S(19)};
-    const RECT prev{next.left - S(42), next.top, next.left - S(4), next.bottom};
+    if (pill) {
+        const RECT box{r.left + titleW + S(12), cy - S(12), r.left + titleW + S(12) + pillW, cy + S(12)};
+        c.Round(box, Sf(12), isToday ? x.p.accentSoft : x.p.track);
+        c.Text(relative, box, x.f.labelBold, isToday ? x.p.accentText : x.p.text2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    PaintIcon(c, app.calendar ? Icon::ChevronUp : Icon::ChevronDown, float(date.right - S(16)), float(cy), Sf(15),
+              app.hot == dateId || app.calendar ? x.p.text : x.p.text2);
+    const RECT prev{date.right + S(8), cy - S(17), date.right + S(8) + S(34), cy + S(17)};
+    const RECT next{prev.right + S(2), prev.top, prev.right + S(2) + S(34), prev.bottom};
     IconButton(x, prev, Icon::ChevronLeft, Hid(HK_PREV), L"前一天（←）");
     IconButton(x, next, Icon::ChevronRight, Hid(HK_NEXT), L"后一天（→）", !isToday);
     if (!isToday) {
-        const RECT back{prev.left - S(12) - S(104), next.top + S(1), prev.left - S(12), next.bottom - S(1)};
-        Button(x, back, L"回到今天", static_cast<int>(Icon::Undo), Btn::Secondary, Hid(HK_TODAY), true,
-               L"回到今天（Home）");
+        const RECT back{next.right + S(8), cy - S(16), next.right + S(8) + (backText ? S(104) : S(34)), cy + S(16)};
+        if (backText) Button(x, back, L"回到今天", static_cast<int>(Icon::Undo), Btn::Secondary, Hid(HK_TODAY), true,
+                             L"回到今天（Home）");
+        else IconButton(x, back, Icon::Undo, Hid(HK_TODAY), L"回到今天（Home）", true, 16);
     }
+    if (status) PaintStatus(x, r.right, cy, statusText);
 }
 
-void PaintDonut(Ctx& x, float cx, float cy, float outer) {
+// "11月16日 – 22日", "2026年11月", "2026年": the shown period of the statistics page; the short
+// form ("11/16–22", "11月") for a narrow window.
+std::wstring PeriodLabel(long long today, bool brief) {
+    const auto& p = app.period;
+    const auto a = LocalTm(p.start), b = LocalTm(ShiftDay(p.end, -1)), now = LocalTm(today);
+    const bool thisYear = a.tm_year == now.tm_year;
+    if (app.range == 2) return Format(L"%d年", a.tm_year + 1900);
+    if (app.range == 1) return brief && thisYear ? Format(L"%d月", a.tm_mon + 1) : Format(L"%d年%d月", a.tm_year + 1900, a.tm_mon + 1);
+    if (brief) return a.tm_mon == b.tm_mon ? Format(L"%d/%d–%d", a.tm_mon + 1, a.tm_mday, b.tm_mday)
+                                           : Format(L"%d/%d–%d/%d", a.tm_mon + 1, a.tm_mday, b.tm_mon + 1, b.tm_mday);
+    const std::wstring year = thisYear ? std::wstring() : Format(L"%d年", a.tm_year + 1900);
+    if (a.tm_mon == b.tm_mon) return year + Format(L"%d月%d日 – %d日", a.tm_mon + 1, a.tm_mday, b.tm_mday);
+    return year + Format(L"%d月%d日 – %d月%d日", a.tm_mon + 1, a.tm_mday, b.tm_mon + 1, b.tm_mday);
+}
+
+// The statistics page: week / month / year, the period, previous / next, back to the current one.
+// Narrow windows lose the status words, the status, the button text, then use shorter labels;
+// the "back" button goes last (Home does the same).
+void PaintPeriodHeader(Ctx& x, const RECT& r, bool compact) {
     auto& c = x.c;
-    const float thickness = std::max(Sf(10), outer * 0.2f), inner = outer - thickness;
-    const long long parts[3] = {app.day.work, app.day.play, app.day.other};
-    const long long total = app.day.total;
+    const auto& p = app.period;
+    const int cy = (r.top + r.bottom) / 2;
+    const bool current = x.today >= p.start && x.today < p.end;
+    static const wchar_t* names[] = {L"周", L"月", L"年"};
+    static const wchar_t* tips[] = {L"按周统计", L"按月统计", L"按年统计"};
+    const RECT box{r.left, cy - S(15), r.left + 3 * S(compact ? 30 : 38) + S(4), cy + S(15)};
+    TitleSegments(x, box, names, 3, app.range, HK_RANGE, tips);
+    const int left = box.right + S(compact ? 12 : 16), arrow = S(compact ? 30 : 34);
+    std::wstring label = PeriodLabel(x.today, false);
+    HFONT font = x.f.name;
+    int labelW = c.Measure(label, font).cx;
+    bool backText = true, statusText = true, status = true, back = !current;
+    auto need = [&] {
+        return (left - r.left) + labelW + S(10) + 2 * arrow + S(2) + (back ? (backText ? S(86) : S(42)) : 0) + S(16) +
+               (status ? (statusText ? S(130) : S(30)) : 0);
+    };
+    const int avail = Wd(r);
+    if (need() > avail) statusText = false;
+    if (need() > avail && !app.saveFailed) status = false;
+    if (need() > avail) backText = false;
+    if (need() > avail) { font = x.f.title; labelW = c.Measure(label, font).cx; }
+    if (need() > avail) { label = PeriodLabel(x.today, true); labelW = c.Measure(label, font).cx; }
+    if (need() > avail) back = false;
+    c.Text(label, RECT{left, r.top, left + labelW + 2, r.bottom}, font, x.p.text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    static const wchar_t* prevTips[] = {L"上一周（←）", L"上个月（←）", L"上一年（←）"};
+    static const wchar_t* nextTips[] = {L"下一周（→）", L"下个月（→）", L"下一年（→）"};
+    static const wchar_t* backNames[] = {L"本周", L"本月", L"今年"};
+    const RECT prev{left + labelW + S(10), cy - S(17), left + labelW + S(10) + arrow, cy + S(17)};
+    const RECT next{prev.right + S(2), prev.top, prev.right + S(2) + arrow, prev.bottom};
+    IconButton(x, prev, Icon::ChevronLeft, Hid(HK_PERIOD_PREV), prevTips[app.range]);
+    IconButton(x, next, Icon::ChevronRight, Hid(HK_PERIOD_NEXT), nextTips[app.range], !current);
+    if (back) {
+        const std::wstring tip = std::wstring(L"回到") + backNames[app.range] + L"（Home）";
+        const RECT back{next.right + S(8), cy - S(16), next.right + S(8) + (backText ? S(78) : S(34)), cy + S(16)};
+        if (backText) Button(x, back, backNames[app.range], static_cast<int>(Icon::Undo), Btn::Secondary,
+                             Hid(HK_PERIOD_NOW), true, tip);
+        else IconButton(x, back, Icon::Undo, Hid(HK_PERIOD_NOW), tip, true, 16);
+    }
+    if (status) PaintStatus(x, r.right, cy, statusText);
+}
+
+// The title bar right of the brand: today / statistics, then the page's own navigation.
+void PaintHeader(Ctx& x, const RECT& r) {
+    static const wchar_t* names[] = {L"今日", L"统计"};
+    static const wchar_t* tips[] = {L"今日：当天的记录与时间轴（V）", L"统计：按周、月、年看时间去向（V）"};
+    const bool compact = Wd(r) < S(540);
+    const int cy = (r.top + r.bottom) / 2;
+    const RECT box{r.left, cy - S(15), r.left + 2 * S(compact ? 44 : 52) + S(4), cy + S(15)};
+    TitleSegments(x, box, names, 2, app.view, HK_VIEW_DAY, tips);
+    const RECT rest{box.right + S(compact ? 14 : 20), r.top, r.right, r.bottom};
+    if (app.view == 1) PaintPeriodHeader(x, rest, compact);
+    else PaintDayHeader(x, rest);
+}
+
+// Two rings: categories inside, their tags outside (in the categories' colour families).
+void PaintSunburst(Ctx& x, float cx, float cy, float outer) {
+    auto& c = x.c;
+    const float tagWidth = std::max(Sf(7), outer * 0.12f), gap = Sf(2), categoryWidth = std::max(Sf(9), outer * 0.18f);
+    const float tagInner = outer - tagWidth, categoryOuter = tagInner - gap;
+    const float categoryInner = categoryOuter - categoryWidth;
+    const auto& day = app.day;
+    const long long total = day.total;
     if (total <= 0) {
-        c.Sector(cx, cy, outer, inner, 0.0f, 360.0f, x.p.track);
+        c.Sector(cx, cy, outer, tagInner, 0.0f, 360.0f, x.p.track);
+        c.Sector(cx, cy, categoryOuter, categoryInner, 0.0f, 360.0f, x.p.track);
     } else {
+        std::vector<float> categoryCuts, tagCuts;
         float angle = -90.0f;
-        std::vector<float> boundaries;
-        int nonZero = 0;
-        for (int i = 0; i < 3; ++i) {
-            if (parts[i] <= 0) continue;
-            ++nonZero;
-            const float sweep = 360.0f * static_cast<float>(parts[i]) / static_cast<float>(total);
-            c.Sector(cx, cy, outer, inner, angle, std::min(360.0f, sweep + 0.3f), x.p.category[i]);
-            boundaries.push_back(angle);
+        for (const auto& category : app.model.categories) {
+            const long long seconds = day.ofCategory(category.id);
+            if (seconds <= 0) continue;
+            const float sweep = 360.0f * static_cast<float>(seconds) / static_cast<float>(total);
+            c.Sector(cx, cy, categoryOuter, categoryInner, angle, std::min(360.0f, sweep + 0.3f), category.color);
+            float tagAngle = angle;
+            for (const auto* tag : BusyTags(day, category.id)) {
+                const float tagSweep = 360.0f * static_cast<float>(day.ofTag(tag->id)) / static_cast<float>(total);
+                c.Sector(cx, cy, outer, tagInner, tagAngle, std::min(360.0f, tagSweep + 0.3f), tag->color);
+                if (tagAngle != angle) tagCuts.push_back(tagAngle);
+                tagAngle += tagSweep;
+            }
+            categoryCuts.push_back(angle);
             angle += sweep;
         }
-        if (nonZero > 1) {          // surface gaps between the parts
-            for (float a : boundaries) {
-                const float rad = a * 3.14159265f / 180.0f;
-                c.Line(cx + (inner - 1) * std::cos(rad), cy + (inner - 1) * std::sin(rad),
-                       cx + (outer + 1) * std::cos(rad), cy + (outer + 1) * std::sin(rad), x.p.surface,
-                       Sf(2.5f), 255, false);
-            }
-        }
+        auto cut = [&](float a, float from, float to) {
+            const float rad = a * 3.14159265f / 180.0f;
+            c.Line(cx + from * std::cos(rad), cy + from * std::sin(rad), cx + to * std::cos(rad),
+                   cy + to * std::sin(rad), x.p.surface, Sf(2.2f), 255, false);
+        };
+        if (categoryCuts.size() > 1) for (float a : categoryCuts) cut(a, categoryInner - 1, outer + 1);
+        else if (categoryCuts.size() == 1 && day.ofCategory(app.model.categories.front().id) != total) {}
+        for (float a : tagCuts) cut(a, tagInner - 1, outer + 1);
     }
-    const int width = RichDuration(c, total, 0, 0, x.f.numM, x.f.label, x.p.text, x.p.text2, S(2), true);
+    HFONT number = x.f.numM;
+    int width = RichDuration(c, total, 0, 0, number, x.f.label, x.p.text, x.p.text2, S(2), true);
+    if (width > 2 * categoryInner - S(10)) {
+        number = x.f.bodyBold;
+        width = RichDuration(c, total, 0, 0, number, x.f.caption, x.p.text, x.p.text2, S(1), true);
+    }
     const int baseline = static_cast<int>(cy) + S(4);
-    if (total > 0) RichDuration(c, total, static_cast<int>(cx) - width / 2, baseline, x.f.numM, x.f.label,
-                                x.p.text, x.p.text2, S(2));
-    else c.Text(L"暂无", RECT{int(cx - inner), baseline - S(22), int(cx + inner), baseline + S(2)}, x.f.title,
-                x.p.text3, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    c.Text(L"总计", RECT{int(cx - inner), baseline + S(4), int(cx + inner), baseline + S(22)}, x.f.label,
-           x.p.text3, DT_CENTER | DT_TOP | DT_SINGLELINE);
+    if (total > 0) RichDuration(c, total, static_cast<int>(cx) - width / 2, baseline, number,
+                                number == x.f.numM ? x.f.label : x.f.caption, x.p.text, x.p.text2,
+                                number == x.f.numM ? S(2) : S(1));
+    else c.Text(L"暂无", RECT{int(cx - categoryInner), baseline - S(22), int(cx + categoryInner), baseline + S(2)},
+                x.f.title, x.p.text3, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    c.Text(L"总计", RECT{int(cx - categoryInner), baseline + S(4), int(cx + categoryInner), baseline + S(22)},
+           x.f.label, x.p.text3, DT_CENTER | DT_TOP | DT_SINGLELINE);
 }
 
 std::wstring Delta(long long now, long long before) {
@@ -1223,53 +1658,135 @@ std::wstring Delta(long long now, long long before) {
     return std::wstring(diff > 0 ? L"+" : L"−") + DurationText(std::llabs(diff));
 }
 
+// The categories the overview shows: the ones with time today, topped up to three.
+std::vector<int> ShownCategories() {
+    std::vector<int> shown;
+    for (const auto& category : app.model.categories)
+        if (app.day.ofCategory(category.id) > 0) shown.push_back(category.id);
+    for (const auto& category : app.model.categories) {
+        if (shown.size() >= 3) break;
+        if (std::find(shown.begin(), shown.end(), category.id) == shown.end()) shown.push_back(category.id);
+    }
+    std::stable_sort(shown.begin(), shown.end(), [](int a, int b) {
+        return app.model.categoryIndex(a) < app.model.categoryIndex(b);
+    });
+    return shown;
+}
+
 void PaintSummary(Ctx& x, const RECT& r) {
     auto& c = x.c;
     Card(x, r);
+    const auto& day = app.day;
     const bool isToday = app.chosenDay == x.today;
     CardTitle(x, r, isToday ? L"今日概览" : L"当日概览",
-              app.day.pomodoros ? Format(L"完成 %d 个番茄", app.day.pomodoros) : std::wstring());
-    if (app.day.total > 0 || app.prevDay.total > 0) {
-        const std::wstring delta = L"较前一天  工作 " + Delta(app.day.work, app.prevDay.work) + L"  ·  娱乐 " +
-                                   Delta(app.day.play, app.prevDay.play);
-        c.Text(delta, RECT{r.left + S(140), r.top + S(17), r.right - S(20), r.top + S(40)}, x.f.label, x.p.text3,
+              day.pomodoros ? Format(L"完成 %d 个番茄", day.pomodoros) : std::wstring());
+    if (day.total > 0 || app.prevDay.total > 0) {
+        std::vector<int> busiest;
+        for (const auto& category : app.model.categories) busiest.push_back(category.id);
+        std::stable_sort(busiest.begin(), busiest.end(), [&](int a, int b) {
+            return std::max(day.ofCategory(a), app.prevDay.ofCategory(a)) > std::max(day.ofCategory(b), app.prevDay.ofCategory(b));
+        });
+        std::wstring delta = L"较前一天";
+        for (std::size_t i = 0; i < std::min<std::size_t>(2, busiest.size()); ++i)
+            delta += (i ? L"  ·  " : L"  ") + CategoryName(busiest[i]) + L" " +
+                     Delta(day.ofCategory(busiest[i]), app.prevDay.ofCategory(busiest[i]));
+        c.Text(delta, RECT{r.left + S(170), r.top + S(17), r.right - S(20), r.top + S(40)}, x.f.label, x.p.text3,
                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
-    const int top = r.top + S(50), bottom = r.bottom - S(16);
-    const float outer = std::min(static_cast<float>(bottom - top) / 2.0f, Sf(62));
-    const float cx = r.left + S(24) + outer, cy = (top + bottom) / 2.0f;
-    PaintDonut(x, cx, cy, outer);
-    const int x0 = static_cast<int>(cx + outer) + S(30), x1 = r.right - S(16);
-    const long long values[3] = {app.day.work, app.day.play, app.day.other};
-    const long long total = app.day.total;
-    if (x1 - x0 >= S(390)) {
-        const int tileW = (x1 - x0) / 3;
-        for (int i = 0; i < 3; ++i) {
-            const int left = x0 + i * tileW;
-            if (i) c.Fill(float(left), cy - Sf(38), Sf(1), Sf(76), x.p.grid);
-            const int tx = left + (i ? S(22) : S(2));
-            const int ty = static_cast<int>(cy) - S(42);
-            c.Circle(tx + Sf(5), ty + Sf(11), Sf(5), x.p.category[i]);
-            c.Text(CategoryName(static_cast<tracker::Category>(i)), RECT{tx + S(16), ty, left + tileW, ty + S(22)},
-                   x.f.body, x.p.text2);
-            RichDuration(c, values[i], tx, ty + S(58), x.f.numL, x.f.unit, x.p.text, x.p.text2, S(3));
-            const int pct = total ? static_cast<int>((values[i] * 1000 / total + 5) / 10) : 0;
-            c.Text(total ? Format(L"占 %d%%", pct) : L"—", RECT{tx, ty + S(64), left + tileW, ty + S(84)},
-                   x.f.label, x.p.text3);
+    const int top = r.top + S(48), bottom = r.bottom - S(14);
+    const float outer = std::min(static_cast<float>(bottom - top) / 2.0f, Sf(66));
+    const float cx = r.left + S(22) + outer, cy = (top + bottom) / 2.0f;
+    PaintSunburst(x, cx, cy, outer);
+    const int x0 = static_cast<int>(cx + outer) + S(28), x1 = r.right - S(16);
+    const long long total = day.total;
+    auto pct = [total](long long v) { return total ? static_cast<int>((v * 1000 / total + 5) / 10) : 0; };
+    const std::vector<int> shown = ShownCategories();
+    const int maxColumns = std::max(0, (x1 - x0) / S(136));
+    if (maxColumns >= 2) {
+        // One column per category: its total and its busiest tags.
+        std::vector<int> columns = shown;
+        std::vector<int> folded;
+        if (static_cast<int>(columns.size()) > maxColumns) {
+            std::vector<int> byTime = shown;
+            std::stable_sort(byTime.begin(), byTime.end(), [&](int a, int b) { return day.ofCategory(a) > day.ofCategory(b); });
+            columns.assign(byTime.begin(), byTime.begin() + (maxColumns - 1));
+            folded.assign(byTime.begin() + (maxColumns - 1), byTime.end());
+            std::stable_sort(columns.begin(), columns.end(), [](int a, int b) {
+                return app.model.categoryIndex(a) < app.model.categoryIndex(b);
+            });
         }
-    } else {
-        const int rowH = S(32), startY = static_cast<int>(cy) - rowH * 3 / 2;
-        for (int i = 0; i < 3; ++i) {
-            const int y = startY + i * rowH;
-            c.Circle(x0 + Sf(5), y + rowH / 2.0f, Sf(5), x.p.category[i]);
-            c.Text(CategoryName(static_cast<tracker::Category>(i)), RECT{x0 + S(16), y, x0 + S(80), y + rowH},
-                   x.f.body, x.p.text2);
-            const int pct = total ? static_cast<int>((values[i] * 1000 / total + 5) / 10) : 0;
-            c.Text(total ? Format(L"%d%%", pct) : L"—", RECT{x1 - S(44), y, x1, y + rowH}, x.f.label, x.p.text3,
-                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-            c.Text(DurationText(values[i]), RECT{x0 + S(80), y, x1 - S(52), y + rowH}, x.f.bodyBold, x.p.text,
-                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        const int count = static_cast<int>(columns.size()) + (folded.empty() ? 0 : 1);
+        const int tileW = (x1 - x0) / std::max(1, count);
+        const int lineH = S(20), linesTop = top + S(64);
+        const int maxLines = std::max(0, (bottom - linesTop) / lineH);
+        for (int i = 0; i < count; ++i) {
+            const int left = x0 + i * tileW, right = left + tileW - S(12);
+            if (i) c.Fill(float(left), float(top + S(6)), Sf(1), float(bottom - top - S(12)), x.p.grid);
+            const int tx = left + (i ? S(16) : S(2));
+            const bool rest = i >= static_cast<int>(columns.size());
+            long long seconds = 0;
+            std::wstring name;
+            COLORREF dot = x.p.text3;
+            if (rest) {
+                for (int id : folded) seconds += day.ofCategory(id);
+                name = Format(L"其余 %d 类", static_cast<int>(folded.size()));
+            } else {
+                seconds = day.ofCategory(columns[static_cast<std::size_t>(i)]);
+                name = CategoryName(columns[static_cast<std::size_t>(i)]);
+                dot = CategoryColor(columns[static_cast<std::size_t>(i)]);
+            }
+            c.Circle(tx + Sf(5), top + Sf(12), Sf(5), dot);
+            c.Text(total ? Format(L"%d%%", pct(seconds)) : L"—", RECT{right - S(48), top + S(1), right, top + S(23)},
+                   x.f.label, x.p.text3, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            c.Text(name, RECT{tx + S(16), top + S(1), right - S(50), top + S(23)}, x.f.body, x.p.text2);
+            RichDuration(c, seconds, tx, top + S(54), x.f.numL, x.f.unit, x.p.text, x.p.text2, S(3));
+            // the breakdown: busiest tags (or the folded categories)
+            struct Line { COLORREF color; std::wstring name; long long seconds; };
+            std::vector<Line> lines;
+            if (rest) for (int id : folded) lines.push_back({CategoryColor(id), CategoryName(id), day.ofCategory(id)});
+            else for (const auto* tag : BusyTags(day, columns[static_cast<std::size_t>(i)]))
+                lines.push_back({tag->color, tag->name, day.ofTag(tag->id)});
+            const int visible = static_cast<int>(lines.size()) > maxLines ? std::max(0, maxLines - 1)
+                                                                         : static_cast<int>(lines.size());
+            for (int k = 0; k < visible; ++k) {
+                const auto& line = lines[static_cast<std::size_t>(k)];
+                const int y = linesTop + k * lineH;
+                c.Circle(tx + Sf(4), y + lineH / 2.0f, Sf(3.5f), line.color);
+                const std::wstring time = DurationText(line.seconds);
+                const int timeW = c.Measure(time, x.f.label).cx;
+                c.Text(line.name, RECT{tx + S(13), y, right - timeW - S(6), y + lineH}, x.f.label, x.p.text2,
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                c.Text(time, RECT{right - timeW - S(2), y, right, y + lineH}, x.f.label, x.p.text3,
+                       DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            }
+            if (visible < static_cast<int>(lines.size())) {
+                long long more = 0;
+                for (std::size_t k = static_cast<std::size_t>(visible); k < lines.size(); ++k) more += lines[k].seconds;
+                c.Text(Format(L"+%d 个子类 · ", static_cast<int>(lines.size()) - visible) + DurationText(more),
+                       RECT{tx + S(13), linesTop + visible * lineH, right, linesTop + (visible + 1) * lineH},
+                       x.f.caption, x.p.text3, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
         }
+        return;
+    }
+    // Narrow: one row per category, its busiest tags on a second line.
+    const int rowH = S(40);
+    const int rows = std::max(1, (bottom - top) / rowH);
+    for (int i = 0; i < std::min<int>(rows, static_cast<int>(shown.size())); ++i) {
+        const int id = shown[static_cast<std::size_t>(i)];
+        const int y = top + i * rowH + std::max(0, (bottom - top - std::min<int>(rows, static_cast<int>(shown.size())) * rowH) / 2);
+        c.Circle(x0 + Sf(5), y + Sf(11), Sf(5), CategoryColor(id));
+        c.Text(CategoryName(id), RECT{x0 + S(16), y, x1 - S(150), y + S(22)}, x.f.body, x.p.text2);
+        c.Text(total ? Format(L"%d%%", pct(day.ofCategory(id))) : L"—", RECT{x1 - S(44), y, x1, y + S(22)}, x.f.label,
+               x.p.text3, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        c.Text(DurationText(day.ofCategory(id)), RECT{x1 - S(150), y, x1 - S(52), y + S(22)}, x.f.bodyBold, x.p.text,
+               DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        std::wstring parts;
+        for (const auto* tag : BusyTags(day, id))
+            parts += (parts.empty() ? L"" : L" · ") + tag->name + L" " + DurationText(day.ofTag(tag->id));
+        if (!parts.empty())
+            c.Text(parts, RECT{x0 + S(16), y + S(20), x1, y + S(37)}, x.f.caption, x.p.text3,
+                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 }
 
@@ -1453,14 +1970,22 @@ void PaintWeek(Ctx& x, const RECT& r) {
     if (app.week.size() != 7) return;
     const bool current = app.week.front().day <= x.today && x.today <= app.week.back().day;
     CardTitle(x, r, current ? L"本周" : MonthDay(app.week.front().day) + L" – " + MonthDay(app.week.back().day));
-    long long work = 0, play = 0, maxTotal = 0;
+    long long maxTotal = 0;
+    std::map<int, long long> weekTotals;
     for (const auto& d : app.week) {
-        work += d.stats.work;
-        play += d.stats.play;
         maxTotal = std::max(maxTotal, d.stats.total);
+        for (const auto& entry : d.stats.byCategory) weekTotals[entry.first] += entry.second;
     }
-    c.Text(L"工作 " + DurationText(work) + L"  ·  娱乐 " + DurationText(play),
-           RECT{r.left + S(20), r.top + S(40), r.right - S(16), r.top + S(58)}, x.f.label, x.p.text2);
+    std::vector<int> ranked;
+    for (const auto& category : app.model.categories)
+        if (weekTotals[category.id] > 0) ranked.push_back(category.id);
+    std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) { return weekTotals[a] > weekTotals[b]; });
+    std::wstring subtitle;
+    for (std::size_t i = 0; i < std::min<std::size_t>(2, ranked.size()); ++i)
+        subtitle += (i ? L"  ·  " : L"") + CategoryName(ranked[i]) + L" " + DurationText(weekTotals[ranked[i]]);
+    c.Text(subtitle.empty() ? std::wstring(L"这一周还没有记录") : subtitle,
+           RECT{r.left + S(20), r.top + S(40), r.right - S(16), r.top + S(58)}, x.f.label, x.p.text2,
+           DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     const RECT plot{r.left + S(46), r.top + S(78), r.right - S(18), r.bottom - S(58)};
     if (Ht(plot) < S(30)) return;
     const long long base = std::max(maxTotal, 4LL * 3600);     // keep short days from filling the chart
@@ -1487,17 +2012,19 @@ void PaintWeek(Ctx& x, const RECT& r) {
         else if (hot) under = x.p.hover;
         if (under != x.p.surface) c.Round(band, Sf(8), under);
         const float cx = plot.left + slot * (d + 0.5f);
-        const long long values[3] = {day.stats.work, day.stats.play, day.stats.other};
+        const auto& categories = app.model.categories;
         int topIndex = -1;
-        for (int i = 0; i < 3; ++i) if (values[i] > 0) topIndex = i;
+        for (std::size_t i = 0; i < categories.size(); ++i)
+            if (day.stats.ofCategory(categories[i].id) > 0) topIndex = static_cast<int>(i);
         float y = static_cast<float>(plot.bottom);
         std::vector<float> joins;
-        for (int i = 0; i < 3; ++i) {
-            if (values[i] <= 0) continue;
-            const float h = std::max(Sf(2), static_cast<float>(plotH * values[i] / axisMax));
-            const float radius = i == topIndex ? Sf(4) : 0.0f;
-            c.RoundEx(cx - barW / 2, y - h, barW, h, radius, radius, 0, 0, x.p.category[i]);
-            if (i != topIndex) joins.push_back(y - h);
+        for (std::size_t i = 0; i < categories.size(); ++i) {
+            const long long value = day.stats.ofCategory(categories[i].id);
+            if (value <= 0) continue;
+            const float h = std::max(Sf(2), static_cast<float>(plotH * value / axisMax));
+            const float radius = static_cast<int>(i) == topIndex ? Sf(4) : 0.0f;
+            c.RoundEx(cx - barW / 2, y - h, barW, h, radius, radius, 0, 0, categories[i].color);
+            if (static_cast<int>(i) != topIndex) joins.push_back(y - h);
             y -= h;
         }
         for (float j : joins) c.Fill(cx - barW / 2 - 1, j - Sf(1), barW + 2, Sf(2), under);
@@ -1508,25 +2035,427 @@ void PaintWeek(Ctx& x, const RECT& r) {
                DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         if (!future) {
             std::wstring tip = MonthDay(day.day) + L" " + WeekdayShort(LocalTm(day.day).tm_wday);
-            if (day.stats.total > 0)
-                tip += L"\n工作 " + DurationText(day.stats.work) + L" · 娱乐 " + DurationText(day.stats.play) +
-                       L" · 其他 " + DurationText(day.stats.other) + L"\n合计 " + DurationText(day.stats.total) +
+            if (day.stats.total > 0) {
+                std::wstring parts;
+                for (const auto& category : app.model.categories) {
+                    const long long value = day.stats.ofCategory(category.id);
+                    if (value > 0) parts += (parts.empty() ? L"" : L" · ") + category.name + L" " + DurationText(value);
+                }
+                tip += L"\n" + parts + L"\n合计 " + DurationText(day.stats.total) +
                        (day.stats.pomodoros ? Format(L" · 番茄 %d 个", day.stats.pomodoros) : std::wstring());
+            }
             else tip += L"\n没有记录";
             if (!selected) tip += L"\n单击查看这一天";
             Hot(x, band, id, tip);
         }
     }
-    // legend
+    // legend: the categories with time this week (all of them on an empty week)
     int lx = r.left + S(20);
     const int ly = r.bottom - S(24);
-    for (int i = 0; i < 3; ++i) {
-        c.Circle(lx + Sf(4), float(ly), Sf(4), x.p.category[i]);
-        const std::wstring name = CategoryName(static_cast<tracker::Category>(i));
-        const int w = c.Measure(name, x.f.caption).cx;
-        c.Text(name, RECT{lx + S(12), ly - S(9), lx + S(12) + w + 2, ly + S(9)}, x.f.caption, x.p.text2);
+    for (const auto& category : app.model.categories) {
+        if (!ranked.empty() && weekTotals[category.id] <= 0) continue;
+        const int w = c.Measure(category.name, x.f.caption).cx;
+        if (lx + S(12) + w > r.right - S(16)) {
+            c.Text(L"…", RECT{lx, ly - S(9), lx + S(16), ly + S(9)}, x.f.caption, x.p.text3);
+            break;
+        }
+        c.Circle(lx + Sf(4), float(ly), Sf(4), category.color);
+        c.Text(category.name, RECT{lx + S(12), ly - S(9), lx + S(12) + w + 2, ly + S(9)}, x.f.caption, x.p.text2);
         lx += S(12) + w + S(16);
     }
+}
+
+// ---------------------------------------------------------------- painting: statistics page
+
+// An axis step giving at most four steps up to maxValue: minutes for hours of the day, hours for
+// days, days of hours for months.
+long long NiceAxisStep(long long maxValue) {
+    static const long long steps[] = {300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 28800, 43200,
+                                      86400, 2 * 86400, 4 * 86400, 5 * 86400, 10 * 86400, 20 * 86400, 40 * 86400};
+    for (long long step : steps) if (maxValue <= step * 4) return step;
+    return steps[sizeof(steps) / sizeof(steps[0]) - 1];
+}
+
+int Percent(long long part, long long whole) {
+    return whole > 0 ? static_cast<int>((part * 1000 / whole + 5) / 10) : 0;
+}
+
+// One column of category segments (category order, the top one rounded), split by thin gaps.
+template <typename Value>
+void StackedColumn(Ctx& x, float cx, float width, float bottom, double plotH, double axisMax, COLORREF under,
+                   Value value) {
+    const auto& categories = app.model.categories;
+    int topIndex = -1;
+    for (std::size_t i = 0; i < categories.size(); ++i) if (value(categories[i].id) > 0) topIndex = static_cast<int>(i);
+    float y = bottom;
+    std::vector<float> joins;
+    for (std::size_t i = 0; i < categories.size(); ++i) {
+        const double v = value(categories[i].id);
+        if (v <= 0) continue;
+        const float h = std::max(Sf(2), static_cast<float>(plotH * v / axisMax));
+        const float radius = static_cast<int>(i) == topIndex ? std::min(Sf(4), width / 2) : 0.0f;
+        x.c.RoundEx(cx - width / 2, y - h, width, h, radius, radius, 0, 0, categories[i].color);
+        if (static_cast<int>(i) != topIndex) joins.push_back(y - h);
+        y -= h;
+    }
+    for (float j : joins) x.c.Fill(cx - width / 2 - 1, j - Sf(1), width + 2, Sf(1.5f), under);
+}
+
+// "工作 3小时 · 娱乐 1小时" for a tooltip.
+std::wstring CategoryParts(const tracker::DayStats& stats) {
+    std::wstring parts;
+    for (const auto& category : app.model.categories) {
+        const long long value = stats.ofCategory(category.id);
+        if (value > 0) parts += (parts.empty() ? L"" : L" · ") + category.name + L" " + DurationText(value);
+    }
+    return parts;
+}
+
+void PaintLegend(Ctx& x, int left, int right, int y, const std::map<int, long long>& seconds) {
+    auto& c = x.c;
+    bool any = false;
+    for (const auto& entry : seconds) any = any || entry.second > 0;
+    int lx = left;
+    for (const auto& category : app.model.categories) {
+        const auto found = seconds.find(category.id);
+        if (any && (found == seconds.end() || found->second <= 0)) continue;
+        const int w = c.Measure(category.name, x.f.caption).cx;
+        if (lx + S(12) + w > right) {
+            c.Text(L"…", RECT{lx, y - S(9), lx + S(16), y + S(9)}, x.f.caption, x.p.text3);
+            break;
+        }
+        c.Circle(lx + Sf(4), float(y), Sf(4), category.color);
+        c.Text(category.name, RECT{lx + S(12), y - S(9), lx + S(12) + w + 2, y + S(9)}, x.f.caption, x.p.text2);
+        lx += S(12) + w + S(16);
+    }
+}
+
+void PaintKpis(Ctx& x, const RECT& r) {
+    auto& c = x.c;
+    Card(x, r);
+    const auto& p = app.period;
+    const long long total = p.total.total;
+    const int days = std::max(1, p.elapsedDays);
+    static const wchar_t* previousNames[] = {L"上周", L"上月", L"去年"};
+    int topTag = 0;
+    long long topSeconds = 0;
+    for (const auto& entry : p.total.byTag)
+        if (entry.second > topSeconds && app.model.findTag(entry.first)) { topTag = entry.first; topSeconds = entry.second; }
+    const int tileW = (Wd(r) - S(8)) / 4;
+    for (int i = 0; i < 4; ++i) {
+        const int left = r.left + S(4) + i * tileW, right = left + tileW;
+        if (i) c.Fill(float(left), float(r.top + S(18)), Sf(1), float(Ht(r) - S(36)), x.p.grid);
+        const int tx = left + S(18), maxW = right - tx - S(10);
+        const int baseline = r.top + S(64);
+        std::wstring label, sub, tip;
+        auto duration = [&](long long seconds) {
+            HFONT number = x.f.numL, unit = x.f.unit;
+            if (RichDuration(c, seconds, 0, 0, number, unit, x.p.text, x.p.text2, S(3), true) > maxW) {
+                number = x.f.numM;
+                unit = x.f.label;
+            }
+            RichDuration(c, seconds, tx, baseline, number, unit, x.p.text, x.p.text2, S(3));
+        };
+        switch (i) {
+        case 0: {
+            label = L"总计";
+            duration(total);
+            const std::wstring against = std::wstring(L"比") + previousNames[app.range] + (p.samePoint ? L"同期" : L"");
+            if (p.previous.total <= 0) sub = total > 0 ? std::wstring(previousNames[app.range]) + (p.samePoint ? L"同期" : L"") + L"没有记录" : L"还没有记录";
+            else sub = against + L" " + Delta(total, p.previous.total);
+            tip = std::wstring(previousNames[app.range]) + (p.samePoint ? L"同期 " : L" ") + DurationText(p.previous.total);
+            break;
+        }
+        case 1:
+            label = L"日均";
+            duration(total / days);
+            sub = Format(L"%d / %d 天有记录", p.activeDays, p.elapsedDays);
+            tip = Format(L"按 %d 天平均（截至今天）", p.elapsedDays);
+            break;
+        case 2: {
+            label = L"完成番茄";
+            const int w = c.TextAt(std::to_wstring(p.total.pomodoros), tx, baseline, x.f.numL, x.p.text);
+            c.TextAt(L"个", tx + w + S(3), baseline, x.f.unit, x.p.text2);
+            sub = p.total.pomodoros ? L"共专注 " + DurationText(p.focusSeconds) : std::wstring(L"番茄钟模式下完成");
+            tip = Format(L"专注阶段走完的番茄 · 日均 %.1f 个", p.total.pomodoros / static_cast<double>(days));
+            break;
+        }
+        default: {
+            label = L"用时最多";
+            if (const auto* tag = app.model.findTag(topTag)) {
+                c.Circle(tx + Sf(5), baseline - Sf(9), Sf(5), tag->color);
+                c.Text(tag->name, RECT{tx + S(16), baseline - S(24), right - S(10), baseline + S(4)}, x.f.name, x.p.text);
+                sub = DurationText(topSeconds) + Format(L" · 占 %d%%", Percent(topSeconds, total));
+                tip = tag->name + L" · " + CategoryName(tag->category);
+            } else {
+                c.Text(L"—", RECT{tx, baseline - S(24), right - S(10), baseline + S(4)}, x.f.name, x.p.text3);
+                sub = L"还没有记录";
+            }
+            break;
+        }
+        }
+        c.Text(label, RECT{tx, r.top + S(14), right - S(10), r.top + S(32)}, x.f.label, x.p.text2);
+        c.Text(sub, RECT{tx, baseline + S(8), right - S(10), baseline + S(26)}, x.f.label, x.p.text3);
+        if (!tip.empty()) Hot(x, RECT{left, r.top + S(6), right, r.bottom - S(6)}, Hid(HK_KPI, i), tip);
+    }
+}
+
+void PaintTrend(Ctx& x, const RECT& r) {
+    auto& c = x.c;
+    Card(x, r);
+    const auto& p = app.period;
+    const bool months = app.range == 2;
+    const std::size_t count = p.trend.size();
+    std::size_t busiest = count;
+    long long most = 0;
+    std::map<int, long long> totals;
+    for (std::size_t i = 0; i < count; ++i) {
+        if (p.trend[i].total > most) { most = p.trend[i].total; busiest = i; }
+        for (const auto& entry : p.trend[i].byCategory) totals[entry.first] += entry.second;
+    }
+    const std::wstring note = busiest < count ? (months ? Format(L"%d月", LocalTm(p.buckets[busiest]).tm_mon + 1)
+                                                         : MonthDay(p.buckets[busiest])) + L" 最多 " + DurationText(most)
+                                              : std::wstring(L"还没有记录");
+    CardTitle(x, r, months ? L"每月用时" : L"每日用时", note);
+    const RECT plot{r.left + S(48), r.top + S(58), r.right - S(18), r.bottom - S(58)};
+    if (Ht(plot) < S(40) || !count) return;
+    const long long base = std::max(most, months ? 40LL * 3600 : 4LL * 3600);
+    const long long step = NiceAxisStep(base);
+    const long long axisMax = (base + step - 1) / step * step;
+    const double plotH = Ht(plot);
+    for (long long v = 0; v <= axisMax; v += step) {
+        const float y = static_cast<float>(plot.bottom - plotH * static_cast<double>(v) / axisMax);
+        c.Fill(float(plot.left), y, float(Wd(plot)), Sf(1), v ? x.p.grid : x.p.borderStrong);
+        c.Text(HoursLabel(v), RECT{r.left + S(6), int(y) - S(9), plot.left - S(8), int(y) + S(9)}, x.f.caption,
+               x.p.text3, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+    const float slot = Wd(plot) / static_cast<float>(count);
+    const float barW = std::max(Sf(3), std::min(Sf(months ? 26 : 22), slot * (count > 12 ? 0.62f : 0.46f)));
+    const bool everyLabel = slot >= Sf(30) || count <= 12;
+    for (std::size_t i = 0; i < count; ++i) {
+        const long long start = p.buckets[i], end = p.buckets[i + 1];
+        const bool future = start > x.today, current = start <= x.today && x.today < end;
+        const int id = Hid(HK_TREND_BAR, static_cast<int>(i));
+        const bool hot = !future && app.hot == id;
+        const RECT band{int(plot.left + slot * i + Sf(1)), plot.top - S(8), int(plot.left + slot * (i + 1) - Sf(1)),
+                        plot.bottom + S(26)};
+        COLORREF under = x.p.surface;
+        if (current) under = x.p.accentSoft;
+        else if (hot) under = x.p.hover;
+        if (under != x.p.surface) c.Round(band, Sf(std::min(8.0f, slot / 3)), under);
+        const float cx = plot.left + slot * (i + 0.5f);
+        const auto& stats = p.trend[i];
+        StackedColumn(x, cx, barW, float(plot.bottom), plotH, double(axisMax), under,
+                      [&](int category) { return static_cast<double>(stats.ofCategory(category)); });
+        const auto t = LocalTm(start);
+        std::wstring label;
+        if (months) label = Format(L"%d月", t.tm_mon + 1);
+        else if (app.range == 0) label = current ? std::wstring(L"今天") : std::wstring(WeekdayShort(t.tm_wday));
+        else if (everyLabel || t.tm_mday == 1 || t.tm_mday % 5 == 0) label = std::to_wstring(t.tm_mday);
+        if (!label.empty())
+            c.Text(label, RECT{int(cx - slot * 1.5f), plot.bottom + S(7), int(cx + slot * 1.5f), plot.bottom + S(24)},
+                   current ? x.f.labelBold : x.f.caption,
+                   current ? x.p.text : future ? Mix(x.p.text3, x.p.surface, 0.55) : x.p.text3,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (future) continue;
+        std::wstring tip = months ? Format(L"%d年%d月", t.tm_year + 1900, t.tm_mon + 1)
+                                  : MonthDay(start) + L" " + WeekdayShort(t.tm_wday);
+        if (stats.total > 0)
+            tip += L"\n" + CategoryParts(stats) + L"\n合计 " + DurationText(stats.total) +
+                   (stats.pomodoros ? Format(L" · 番茄 %d 个", stats.pomodoros) : std::wstring());
+        else tip += L"\n没有记录";
+        tip += months ? L"\n单击查看这个月" : L"\n单击查看这一天";
+        Hot(x, band, id, tip);
+    }
+    // the average per day (per month for a year) so far
+    const long long average = p.elapsedBuckets ? p.total.total / p.elapsedBuckets : 0;
+    if (average > 0) {
+        const float y = static_cast<float>(plot.bottom - plotH * static_cast<double>(average) / axisMax);
+        for (float lx = float(plot.left); lx < plot.right; lx += Sf(7))
+            c.Fill(lx, y - Sf(0.5f), std::min(Sf(4), float(plot.right) - lx), Sf(1.2f), x.p.text2, 150);
+        const std::wstring text = (months ? L"月均 " : L"日均 ") + Format(L"%.1fh", average / 3600.0);
+        const int w = c.Measure(text, x.f.caption).cx + S(10);
+        const RECT tag{plot.right - w, int(y) - S(18), plot.right, int(y) - S(3)};
+        c.Round(tag, Sf(4), x.p.surface, 230);
+        c.Text(text, tag, x.f.caption, x.p.text2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    PaintLegend(x, r.left + S(20), r.right - S(16), r.bottom - S(22), totals);
+}
+
+void PaintHours(Ctx& x, const RECT& r) {
+    auto& c = x.c;
+    Card(x, r);
+    const auto& p = app.period;
+    const double days = std::max(1, p.activeDays);       // a typical day with records
+    double perHour[24]{};
+    std::map<int, long long> totals;
+    for (const auto& entry : p.hours) {
+        if (!app.model.findCategory(entry.first)) continue;
+        for (int h = 0; h < 24; ++h) {
+            perHour[h] += entry.second[static_cast<std::size_t>(h)] / days;
+            totals[entry.first] += entry.second[static_cast<std::size_t>(h)];
+        }
+    }
+    int peak = 0;
+    for (int h = 1; h < 24; ++h) if (perHour[h] > perHour[peak]) peak = h;
+    CardTitle(x, r, L"时段分布", perHour[peak] > 0 ? Format(L"有记录的日子平均 · 最忙 %d–%d 点", peak, peak + 1)
+                                                   : std::wstring(L"有记录的日子平均"));
+    const RECT plot{r.left + S(48), r.top + S(56), r.right - S(18), r.bottom - S(56)};
+    if (Ht(plot) < S(30)) return;
+    const long long base = std::max<long long>(static_cast<long long>(perHour[peak]), 900);
+    const long long step = NiceAxisStep(base);
+    const long long axisMax = std::min<long long>(3600, (base + step - 1) / step * step);
+    const double plotH = Ht(plot);
+    for (long long v = 0; v <= axisMax; v += step) {
+        const float y = static_cast<float>(plot.bottom - plotH * static_cast<double>(v) / axisMax);
+        c.Fill(float(plot.left), y, float(Wd(plot)), Sf(1), v ? x.p.grid : x.p.borderStrong);
+        c.Text(HoursLabel(v), RECT{r.left + S(6), int(y) - S(9), plot.left - S(8), int(y) + S(9)}, x.f.caption,
+               x.p.text3, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    }
+    const float slot = Wd(plot) / 24.0f;
+    const float barW = std::max(Sf(3), std::min(Sf(18), slot * 0.64f));
+    for (int h = 0; h < 24; ++h) {
+        const int id = Hid(HK_HOUR, h);
+        const bool hot = app.hot == id;
+        const RECT band{int(plot.left + slot * h), plot.top - S(6), int(plot.left + slot * (h + 1)), plot.bottom + S(2)};
+        if (hot) c.Round(band, Sf(std::min(6.0f, slot / 3)), x.p.hover);
+        StackedColumn(x, plot.left + slot * (h + 0.5f), barW, float(plot.bottom), plotH, double(axisMax),
+                      hot ? x.p.hover : x.p.surface, [&](int category) {
+                          const auto found = p.hours.find(category);
+                          return found == p.hours.end() ? 0.0 : found->second[static_cast<std::size_t>(h)] / days;
+                      });
+        std::wstring tip = Format(L"%02d:00 – %02d:00", h, h + 1);
+        if (perHour[h] > 0) {
+            tip += Format(L"\n%d 天平均 ", p.activeDays) + DurationText(static_cast<long long>(perHour[h] + 0.5));
+            std::wstring parts;
+            for (const auto& category : app.model.categories) {
+                const auto found = p.hours.find(category.id);
+                const double v = found == p.hours.end() ? 0 : found->second[static_cast<std::size_t>(h)] / days;
+                if (v >= 1) parts += (parts.empty() ? L"" : L" · ") + category.name + L" " +
+                                     DurationText(static_cast<long long>(v + 0.5));
+            }
+            tip += L"\n" + parts;
+        } else tip += L"\n没有记录";
+        Hot(x, band, id, tip);
+        if (h % 3 == 0)
+            c.Text(std::to_wstring(h), RECT{int(plot.left + slot * h) - S(12), plot.bottom + S(6),
+                   int(plot.left + slot * h) + S(12), plot.bottom + S(22)}, x.f.caption, x.p.text3,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    c.Text(L"24", RECT{plot.right - S(12), plot.bottom + S(6), plot.right + S(12), plot.bottom + S(22)}, x.f.caption,
+           x.p.text3, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    PaintLegend(x, r.left + S(20), r.right - S(16), r.bottom - S(22), totals);
+}
+
+// Categories by time (busiest first), each with its tags: duration, share of the total, a bar.
+void PaintBreakdown(Ctx& x, const RECT& r) {
+    auto& c = x.c;
+    Card(x, r);
+    const auto& p = app.period;
+    const auto& model = app.model;
+    const long long total = p.total.total;
+    struct Row { bool category; int id; long long seconds; };
+    std::vector<Row> rows;
+    std::vector<int> categories;
+    for (const auto& category : model.categories) if (p.total.ofCategory(category.id) > 0) categories.push_back(category.id);
+    std::stable_sort(categories.begin(), categories.end(), [&](int a, int b) {
+        return p.total.ofCategory(a) > p.total.ofCategory(b);
+    });
+    int tagCount = 0;
+    for (int id : categories) {
+        rows.push_back({true, id, p.total.ofCategory(id)});
+        for (const auto* tag : BusyTags(p.total, id)) {
+            rows.push_back({false, tag->id, p.total.ofTag(tag->id)});
+            ++tagCount;
+        }
+    }
+    CardTitle(x, r, L"分类明细", tagCount ? Format(L"%d 个标签有记录", tagCount) : std::wstring());
+    const RECT list{r.left + S(8), r.top + S(50), r.right - S(8), r.bottom - S(10)};
+    app.layout.breakdownList = list;
+    const int categoryH = S(40), tagH = S(32);
+    int content = S(4);
+    for (const auto& row : rows) content += row.category ? categoryH : tagH;
+    app.breakdownContent = rows.empty() ? 0 : content;
+    app.breakdownScroll = std::clamp(app.breakdownScroll, 0, std::max(0, app.breakdownContent - Ht(list)));
+    if (rows.empty()) {
+        c.Text(L"这段时间还没有记录", RECT{list.left, list.top + S(30), list.right, list.top + S(54)}, x.f.body,
+               x.p.text3, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        return;
+    }
+    const bool narrow = Wd(list) < S(250);
+    c.PushClip(list);
+    int y = list.top - app.breakdownScroll;
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        const auto& row = rows[i];
+        const int h = row.category ? categoryH : tagH;
+        const RECT box{list.left, y, list.right, y + h};
+        y += h;
+        if (box.bottom < list.top || box.top > list.bottom) continue;
+        const int id = Hid(HK_BREAKDOWN, static_cast<int>(i));
+        if (app.hot == id) c.Round(RECT{box.left, box.top + S(1), box.right, box.bottom - S(1)}, Sf(8), x.p.hover);
+        const int pct = Percent(row.seconds, total);
+        const int right = box.right - S(10);
+        const int pctW = narrow ? 0 : S(38);
+        const std::wstring time = DurationText(row.seconds);
+        if (row.category) {
+            const auto* category = model.findCategory(row.id);
+            const COLORREF color = category ? category->color : x.p.text3;
+            const int textTop = box.top + S(6), textBottom = box.bottom - S(12);
+            c.Round(float(box.left + S(12)), (textTop + textBottom) / 2.0f - Sf(5), Sf(10), Sf(10), Sf(3), color);
+            const int timeW = c.Measure(time, x.f.bodyBold).cx;
+            c.Text(category ? category->name : L"?", RECT{box.left + S(30), textTop, right - pctW - timeW - S(10), textBottom},
+                   x.f.bodyBold, x.p.text);
+            c.Text(time, RECT{right - pctW - timeW - S(2), textTop, right - pctW, textBottom}, x.f.bodyBold, x.p.text,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            if (pctW) c.Text(Format(L"%d%%", pct), RECT{right - pctW, textTop, right, textBottom}, x.f.label, x.p.text3,
+                             DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            const float barLeft = float(box.left + S(30)), full = float(right - S(30) - box.left);
+            c.Round(barLeft, float(box.bottom - S(9)), full, Sf(4), Sf(2), x.p.track);
+            if (total > 0)
+                c.Round(barLeft, float(box.bottom - S(9)), std::max(Sf(4), full * row.seconds / static_cast<float>(total)),
+                        Sf(4), Sf(2), color);
+            int tags = 0;
+            for (const auto& other : rows) if (!other.category && model.findTag(other.id) && model.findTag(other.id)->category == row.id) ++tags;
+            Hot(x, box, id, (category ? category->name : std::wstring()) + L"\n" + time + Format(L" · 占总计 %d%%", pct) +
+                Format(L"\n%d 个标签有记录", tags));
+        } else {
+            const auto* tag = model.findTag(row.id);
+            if (!tag) continue;
+            const int textBottom = box.bottom - S(8);
+            const float cy = (box.top + textBottom) / 2.0f;
+            c.Circle(box.left + Sf(35), cy, Sf(3.5f), tag->color);
+            const int timeW = c.Measure(time, x.f.label).cx;
+            c.Text(tag->name, RECT{box.left + S(46), box.top, right - pctW - timeW - S(10), textBottom}, x.f.body, x.p.text2);
+            c.Text(time, RECT{right - pctW - timeW - S(2), box.top, right - pctW, textBottom}, x.f.label, x.p.text2,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            if (pctW) c.Text(Format(L"%d%%", pct), RECT{right - pctW, box.top, right, textBottom}, x.f.caption, x.p.text3,
+                             DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            const float barLeft = float(box.left + S(46)), full = float(right - S(46) - box.left);
+            if (total > 0)
+                c.Round(barLeft, float(box.bottom - S(6)), std::max(Sf(3), full * row.seconds / static_cast<float>(total)),
+                        Sf(3), Sf(1.5f), tag->color, 220);
+            const long long inCategory = p.total.ofCategory(tag->category);
+            const auto tomatoes = p.total.pomodorosByTag.find(tag->id);
+            Hot(x, box, id, tag->name + L" · " + CategoryName(tag->category) + L"\n" + time +
+                Format(L" · 占总计 %d%% · 占「", pct) + CategoryName(tag->category) +
+                Format(L"」%d%%", Percent(row.seconds, inCategory)) +
+                (tomatoes != p.total.pomodorosByTag.end() ? Format(L"\n完成番茄 %d 个", tomatoes->second) : std::wstring()));
+        }
+    }
+    c.PopClip();
+    PaintScrollbar(x, list, app.breakdownContent, app.breakdownScroll, HK_BREAKDOWN_SCROLL);
+}
+
+void PaintStatsPage(Ctx& x, const RECT& area, int gap, bool compact) {
+    const RECT kpi{area.left, area.top, area.right, area.top + S(compact ? 96 : 104)};
+    PaintKpis(x, kpi);
+    const int top = kpi.bottom + gap, bottom = std::max<int>(area.bottom, top + S(320));
+    const int sideW = std::clamp(Wd(area) * 38 / 100, S(210), S(400));
+    const RECT breakdown{area.right - sideW, top, area.right, bottom};
+    const int trendH = (bottom - top - gap) * 56 / 100;
+    PaintTrend(x, RECT{area.left, top, breakdown.left - gap, top + trendH});
+    PaintHours(x, RECT{area.left, top + trendH + gap, breakdown.left - gap, bottom});
+    PaintBreakdown(x, breakdown);
 }
 
 void PaintToast(Ctx& x, const RECT& main, int height) {
@@ -1582,25 +2511,40 @@ void PaintTooltip(Ctx& x, int width, int height) {
 
 void PaintMain(Canvas& c, int width, int height) {
     app.hits.clear();
+    app.layout.recordsList = app.layout.breakdownList = RECT{};
     Ctx x{c, app.pal, app.fonts, Now(), TodayStart()};
     c.Fill(0, 0, float(width), float(height), x.p.bg);
     const bool compact = height < S(720);
     const int pad = width >= S(1100) ? S(28) : S(20);
     const int sideW = width >= S(1180) ? S(330) : (width >= S(1000) ? S(312) : S(290));
     const int gap = compact ? S(12) : S(16);
-    // left column
     const int left = pad, right = pad + sideW;
-    PaintBrand(x, RECT{left, S(14), right, S(14) + S(44)});
-    const RECT timer{left, S(70), right, S(70) + S(234)};
-    PaintTimer(x, timer);
-    const RECT status{left, height - S(14) - S(30), right, height - S(14)};
-    PaintTags(x, RECT{left, timer.bottom + gap, right, std::max<int>(timer.bottom + gap + S(120), status.top - S(6))});
-    PaintStatus(x, status);
-    // right column
     const RECT main{right + S(24), 0, width - pad, height};
     app.layout.main = main;
-    PaintHeader(x, RECT{main.left, S(16), main.right, S(16) + S(44)});
-    const RECT summary{main.left, S(70), main.right, S(70) + (compact ? S(176) : S(188))};
+    // title bar: brand over the left column, the date over the main one, then the window buttons
+    const int titleH = TitleHeight();
+    const int captionLeft = app.customFrame ? CaptionButtonRect(0, width).left : width - pad;
+    PaintBrand(x, RECT{left, 0, right, titleH});
+    PaintHeader(x, RECT{main.left, 0, captionLeft - (app.customFrame ? S(12) : 0), titleH});
+    if (app.customFrame) {
+        PaintCaptionButtons(x, width);
+        // Windows 10 draws no border along the top of a window without a caption: draw the line.
+        if (WindowsBuild() < 22000 && !IsZoomed(app.hwnd))
+            c.Fill(0, 0, float(width), Sf(1) < 1.5f ? 1.0f : Sf(1), Mix(x.p.bg, x.p.text, app.active ? 0.28 : 0.16));
+    }
+    const int top = titleH + S(8);
+    // left column
+    const RECT timer{left, top, right, top + S(234)};
+    PaintTimer(x, timer);
+    PaintTags(x, RECT{left, timer.bottom + gap, right, std::max<int>(timer.bottom + gap + S(120), height - pad)});
+    // right column: the statistics page, or the day
+    if (app.view == 1) {
+        PaintStatsPage(x, RECT{main.left, top, main.right, height - pad}, gap, compact);
+        PaintToast(x, main, height);
+        PaintTooltip(x, width, height);
+        return;
+    }
+    const RECT summary{main.left, top, main.right, top + (compact ? S(188) : S(206))};
     PaintSummary(x, summary);
     const RECT timeline{main.left, summary.bottom + gap, main.right, summary.bottom + gap + S(120)};
     PaintTimeline(x, timeline);
@@ -1625,6 +2569,27 @@ constexpr COLORREF kSwatches[] = {
     RGB(0x0e, 0xa5, 0xe9), RGB(0x9b, 0x59, 0xd0), RGB(0xa0, 0x67, 0x3b), RGB(0x64, 0x74, 0x8b),
 };
 constexpr int kSwatchCount = static_cast<int>(sizeof(kSwatches) / sizeof(kSwatches[0]));
+
+// Lays out pill-shaped chips in rows (96-DPI units), measured in the bold face selected chips use.
+std::vector<RECT> FlowChips(const std::vector<std::wstring>& labels, int left, int top, int width) {
+    std::vector<RECT> boxes;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HFONT font = MakeFont(L"Microsoft YaHei UI", 14, FW_SEMIBOLD, 96);
+    HGDIOBJ old = SelectObject(dc, font);
+    int x = left, y = top;
+    for (const auto& label : labels) {
+        SIZE size{};
+        GetTextExtentPoint32W(dc, label.c_str(), static_cast<int>(label.size()), &size);
+        const int w = std::min(static_cast<int>(size.cx) + 42, width);
+        if (x + w > left + width && x > left) { x = left; y += 40; }
+        boxes.push_back(RECT{x, y, x + w, y + 32});
+        x += w + 8;
+    }
+    SelectObject(dc, old);
+    DeleteObject(font);
+    DeleteDC(dc);
+    return boxes;
+}
 
 // A modal, custom-painted dialog. Subclasses lay out in 96-DPI units and paint with the app palette.
 class Dialog {
@@ -1685,6 +2650,73 @@ protected:
     }
     void Label(Canvas& c, int x, int y, const std::wstring& text) {
         c.Text(text, RECT{S(x), S(y), S(Width() - 24), S(y + 20)}, fonts_.labelBold, app.pal.text2);
+    }
+    void PaintSwitch(Canvas& c, const RECT& r, bool on, bool hot) {
+        const Palette& p = app.pal;
+        if (on) c.Round(r, Sf(12), hot ? p.accentHover : p.accent);
+        else c.Bordered(r, Sf(12), hot ? p.pressed : p.track, p.borderStrong);
+        const float knob = Sf(8.5f), cy = (r.top + r.bottom) / 2.0f;
+        const float cx = on ? r.right - Sf(12) : r.left + Sf(12);
+        c.Circle(cx, cy, knob, on ? p.onAccent : (p.dark ? p.text2 : p.surface));
+        if (!on && !p.dark) c.Ring(cx, cy, knob, p.borderStrong, Sf(1));
+    }
+    // The standard footer: [Save] [Cancel] on the right; returns its top edge (pixels).
+    int Footer(Canvas& c, const wchar_t* save = L"保存", bool canSave = true) {
+        const int top = S(Height() - 24 - 38), bottom = S(Height() - 24);
+        c.Fill(0, float(top - S(18)), float(S(Width())), Sf(1), app.pal.border);
+        const RECT ok{S(Width() - 24 - 92), top, S(Width() - 24), bottom};
+        const RECT cancel{ok.left - S(10) - S(84), top, ok.left - S(10), bottom};
+        DialogButton(c, ok, save, -1, Btn::Primary, IDOK, canSave);
+        DialogButton(c, cancel, L"取消", -1, Btn::Secondary, IDCANCEL);
+        return top;
+    }
+    // A row of colour swatches (96-DPI units); `custom` adds a last "pick any colour" swatch that is
+    // selected when the colour is none of the others. Returns nothing; registers hits.
+    void Swatches(Canvas& c, const std::vector<unsigned>& colors, unsigned current, int left, int top, int perRow,
+                  int firstId, int customId, const std::vector<std::wstring>& tips = {}) {
+        const Palette& p = app.pal;
+        const int size = 32;
+        const int count = static_cast<int>(colors.size()) + 1;
+        const int spacing = (Width() - 2 * left - perRow * size) / std::max(1, perRow - 1);
+        const bool preset = std::find(colors.begin(), colors.end(), current & 0xFFFFFFu) != colors.end();
+        for (int i = 0; i < count; ++i) {
+            const int col = i % perRow, row = i / perRow;
+            const float cx = Sf(left + col * (size + spacing) + size / 2.0f);
+            const float cy = Sf(top + row * (size + 12) + size / 2.0f);
+            const bool custom = i == count - 1;
+            const COLORREF swatch = custom ? current : colors[static_cast<std::size_t>(i)];
+            const bool selected = custom ? !preset : swatch == (current & 0xFFFFFFu);
+            const int id = custom ? customId : firstId + i;
+            const bool hot = hot_ == id;
+            if (selected) c.Ring(cx, cy, Sf(size / 2.0f + 3.5f), p.text, Sf(2));
+            else if (hot) c.Ring(cx, cy, Sf(size / 2.0f + 3.5f), p.borderStrong, Sf(2));
+            if (custom && !selected) {
+                c.Circle(cx, cy, Sf(size / 2.0f), p.track);
+                PaintIcon(c, Icon::Plus, cx, cy, Sf(16), p.text2);
+            } else {
+                c.Circle(cx, cy, Sf(size / 2.0f), swatch);
+                if (selected) PaintIcon(c, Icon::Check, cx, cy, Sf(16), InkOn(swatch));
+            }
+            std::wstring tip = custom ? std::wstring(L"自定义颜色…") : std::wstring();
+            if (!custom && static_cast<std::size_t>(i) < tips.size() && !tips[static_cast<std::size_t>(i)].empty()) {
+                tip = tips[static_cast<std::size_t>(i)];
+                c.Circle(cx, cy + Sf(size / 2.0f + 8.0f), Sf(2.2f), p.text3);     // in use elsewhere
+            }
+            const int half = S(size / 2 + 4);
+            AddHit(hits_, c, RECT{int(cx) - half, int(cy) - half, int(cx) + half, int(cy) + half}, id, tip);
+        }
+    }
+    bool PickColor(unsigned& color) {
+        static COLORREF custom[16]{};
+        CHOOSECOLORW choose{};
+        choose.lStructSize = sizeof(choose);
+        choose.hwndOwner = hwnd_;
+        choose.rgbResult = color;
+        choose.lpCustColors = custom;
+        choose.Flags = CC_FULLOPEN | CC_RGBINIT;
+        if (!ChooseColorW(&choose)) return false;
+        color = choose.rgbResult & 0xFFFFFFu;
+        return true;
     }
     void PaintTip(Canvas& c);
 
@@ -1911,106 +2943,89 @@ LRESULT Dialog::Handle(UINT message, WPARAM wp, LPARAM lp) {
 
 class TagDialog : public Dialog {
 public:
-    explicit TagDialog(const tracker::Tag* tag) {
+    // A new tag starts in `categoryId`, in the next free shade of that category's colour.
+    TagDialog(const tracker::Tag* tag, int categoryId) {
+        const auto& model = app.model;
         if (tag) {
             editingId_ = tag->id;
             name = tag->name;
             color = tag->color;
             category = tag->category;
-            records_ = app.model.sessionCount(tag->id);
-            canDelete_ = app.model.deletable(tag->id);
+            records_ = model.sessionCount(tag->id);
+            canDelete_ = model.deletable(tag->id);
         } else {
-            // Suggest the first preset colour no tag uses yet.
-            color = kSwatches[0];
-            for (COLORREF swatch : kSwatches) {
-                if (std::none_of(app.model.tags.begin(), app.model.tags.end(),
-                                 [swatch](const tracker::Tag& t) { return t.color == swatch; })) {
-                    color = swatch;
-                    break;
-                }
-            }
+            category = model.findCategory(categoryId) ? categoryId : model.categories.front().id;
+            color = model.nextTagColor(category);
         }
+        originalCategory_ = category;
+        originalColor_ = color;
     }
     std::wstring name;
     unsigned color = 0;
-    tracker::Category category = tracker::Category::Work;
+    int category = 0;
 
 protected:
-    int Height() override { return 428; }
-    void Build() override { edit_ = MakeEdit(TD_NAME, name, L"例如：工作、阅读、健身、刷剧", 40, false); }
+    static constexpr int kChipsTop = 146;
+    const std::vector<RECT>& Chips() {
+        if (chips_.empty()) {
+            std::vector<std::wstring> labels;
+            for (const auto& c : app.model.categories) labels.push_back(c.name);
+            chips_ = FlowChips(labels, 24, kChipsTop, Width() - 48);
+        }
+        return chips_;
+    }
+    int ColorTop() { return (Chips().empty() ? kChipsTop + 32 : static_cast<int>(Chips().back().bottom)) + 40; }
+    int Height() override { return ColorTop() + 24 + 32 + 14 + 94; }
+    void Build() override { edit_ = MakeEdit(TD_NAME, name, L"例如：写研报、开会、阅读、刷剧", 40, false); }
     void Place() override { PlaceEdit(edit_, Field()); }
     RECT Field() { return RECT{S(24), S(48), S(Width() - 24), S(48 + 42)}; }
 
     void Draw(Canvas& c) override {
         const Palette& p = app.pal;
+        const auto& model = app.model;
         Label(c, 24, 22, L"名称");
         PaintField(c, Field(), edit_, !error_.empty());
         if (!error_.empty()) {
             PaintIcon(c, Icon::Alert, Sf(31), Sf(105), Sf(13), p.danger);
             c.Text(error_, RECT{S(42), S(96), S(Width() - 24), S(114)}, fonts_.label, p.danger);
         }
-        Label(c, 24, 122, L"分类");
-        const RECT seg{S(24), S(146), S(Width() - 24), S(146 + 42)};
-        c.Round(seg, Sf(10), p.track);
-        const int partW = (Wd(seg) - S(6)) / 3;
-        for (int i = 0; i < 3; ++i) {
-            const int id = TD_CATEGORY_FIRST + i;
-            const RECT part{seg.left + S(3) + i * partW, seg.top + S(3), seg.left + S(3) + (i + 1) * partW,
-                            seg.bottom - S(3)};
-            const bool selected = static_cast<int>(category) == i, hot = hot_ == id;
-            if (selected) {
-                c.Shadow(part, Sf(8), p.shadow ? 14 : 0);
-                c.Round(part, Sf(8), p.dark ? p.pressed : p.surface);
-            } else if (hot) c.Round(part, Sf(8), p.hover);
-            const std::wstring text = CategoryName(static_cast<tracker::Category>(i));
-            const int tw = c.Measure(text, fonts_.body).cx;
-            const int cx = (part.left + part.right) / 2;
-            c.Circle(cx - tw / 2.0f - Sf(9), (part.top + part.bottom) / 2.0f, Sf(4.5f), p.category[i]);
-            c.Text(text, RECT{cx - tw / 2 + S(2), part.top, cx + tw / 2 + S(6), part.bottom},
-                   selected ? fonts_.bodyBold : fonts_.body, selected || hot ? p.text : p.text2,
-                   DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-            AddHit(hits_, c, part, id);
+        Label(c, 24, 122, L"所属大类");
+        const auto& chips = Chips();
+        for (std::size_t i = 0; i < chips.size() && i < model.categories.size(); ++i) {
+            const auto& option = model.categories[i];
+            const RECT box{S(chips[i].left), S(chips[i].top), S(chips[i].right), S(chips[i].bottom)};
+            const int id = TD_CATEGORY_FIRST + static_cast<int>(i);
+            const bool selected = option.id == category, hot = hot_ == id;
+            if (selected) c.Bordered(box, Sf(16), Mix(p.surface, option.color, p.dark ? 0.26 : 0.13), option.color, Sf(1.5f));
+            else c.Bordered(box, Sf(16), hot ? p.hover : p.surface, p.border);
+            c.Circle(box.left + Sf(16), (box.top + box.bottom) / 2.0f, Sf(5), option.color);
+            c.Text(option.name, RECT{box.left + S(27), box.top, box.right - S(10), box.bottom},
+                   selected ? fonts_.bodyBold : fonts_.body, selected ? p.text : p.text2);
+            AddHit(hits_, c, box, id);
         }
-        c.Text(L"分类决定这段时间计入「工作」「娱乐」还是「其他」统计", RECT{S(24), S(192), S(Width() - 24), S(212)},
-               fonts_.label, p.text3);
-        Label(c, 24, 226, L"颜色");
-        const int per = 7, size = 32;
-        const int spacing = (Width() - 48 - per * size) / (per - 1);
-        bool preset = false;
-        for (int i = 0; i <= kSwatchCount; ++i) {
-            const int col = i % per, row = i / per;
-            const float cx = Sf(24.0f + col * (size + spacing) + size / 2.0f);
-            const float cy = Sf(250.0f + row * (size + 12) + size / 2.0f);
-            const bool custom = i == kSwatchCount;
-            const COLORREF swatch = custom ? color : kSwatches[i];
-            const bool selected = !custom ? swatch == color : !preset;
-            if (!custom && selected) preset = true;
-            const int id = custom ? TD_CUSTOM_COLOR : TD_COLOR_FIRST + i;
-            const bool hot = hot_ == id;
-            if (selected) c.Ring(cx, cy, Sf(size / 2.0f + 3.5f), p.text, Sf(2));
-            else if (hot) c.Ring(cx, cy, Sf(size / 2.0f + 3.5f), p.borderStrong, Sf(2));
-            if (custom && !selected) {
-                c.Circle(cx, cy, Sf(size / 2.0f), p.track);
-                PaintIcon(c, Icon::Plus, cx, cy, Sf(16), p.text2);
-            } else {
-                c.Circle(cx, cy, Sf(size / 2.0f), swatch);
-                if (selected) PaintIcon(c, Icon::Check, cx, cy, Sf(16), InkOn(swatch));
+        const int top = ColorTop();
+        c.Text(L"这个标签的时间计入所选大类", RECT{S(24), S(top - 32), S(Width() - 24), S(top - 14)}, fonts_.label, p.text3);
+        const auto* current = model.findCategory(category);
+        Label(c, 24, top, L"颜色");
+        if (current)
+            c.Text(L"「" + current->name + L"」的色系，由深到浅", RECT{S(110), S(top), S(Width() - 24), S(top + 20)},
+                   fonts_.label, p.text3, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const auto family = current ? tracker::ColorFamily(current->color) : std::vector<unsigned>{};
+        std::vector<std::wstring> tips(family.size());
+        for (std::size_t i = 0; i < family.size(); ++i) {
+            for (const auto& tag : model.tags) {
+                if (tag.id == editingId_ || tag.category != category || tracker::ColorDistance(tag.color, family[i]) >= 0.02)
+                    continue;
+                tips[i] += (tips[i].empty() ? L"已用于「" : L"「") + tag.name + L"」";
             }
-            const int half = S(size / 2 + 4);
-            AddHit(hits_, c, RECT{int(cx) - half, int(cy) - half, int(cx) + half, int(cy) + half}, id,
-                   custom ? L"自定义颜色…" : L"");
         }
-        // footer
-        const int top = S(Height() - 24 - 38), bottom = S(Height() - 24);
-        c.Fill(0, float(top - S(18)), float(S(Width())), Sf(1), p.border);
-        const RECT save{S(Width() - 24 - 92), top, S(Width() - 24), bottom};
-        const RECT cancel{save.left - S(10) - S(84), top, save.left - S(10), bottom};
-        DialogButton(c, save, L"保存", -1, Btn::Primary, IDOK);
-        DialogButton(c, cancel, L"取消", -1, Btn::Secondary, IDCANCEL);
+        Swatches(c, family, color, 24, top + 24, static_cast<int>(family.size()) + 1, TD_COLOR_FIRST, TD_CUSTOM_COLOR,
+                 tips);
+        const int footer = Footer(c);
         if (editingId_) {
-            const std::wstring why = Format(L"已有 %d 条记录，不能删除；仍可修改名称、颜色和分类",
+            const std::wstring why = Format(L"已有 %d 条记录，不能删除；仍可修改名称、颜色和大类",
                                             static_cast<int>(records_));
-            DialogButton(c, RECT{S(16), top, S(16 + 112), bottom}, L"删除标签", static_cast<int>(Icon::Trash),
+            DialogButton(c, RECT{S(16), footer, S(16 + 112), footer + S(38)}, L"删除标签", static_cast<int>(Icon::Trash),
                          Btn::Danger, TD_DELETE, canDelete_ && !app.readOnly,
                          canDelete_ ? std::wstring() : (editingId_ == app.model.activeTagId ?
                              std::wstring(L"正在计时，不能删除") : why));
@@ -2018,19 +3033,18 @@ protected:
     }
 
     void Click(int id) override {
-        if (id >= TD_CATEGORY_FIRST && id < TD_CATEGORY_FIRST + 3) {
-            category = static_cast<tracker::Category>(id - TD_CATEGORY_FIRST);
-        } else if (id >= TD_COLOR_FIRST && id < TD_COLOR_FIRST + kSwatchCount) {
-            color = kSwatches[id - TD_COLOR_FIRST];
+        const auto& model = app.model;
+        if (id >= TD_CATEGORY_FIRST && id < TD_CATEGORY_FIRST + static_cast<int>(model.categories.size())) {
+            const int next = model.categories[static_cast<std::size_t>(id - TD_CATEGORY_FIRST)].id;
+            if (next != category) {      // the colour follows into the new category's family
+                category = next;
+                color = next == originalCategory_ ? originalColor_ : model.nextTagColor(next);
+            }
+        } else if (id >= TD_COLOR_FIRST && id < TD_COLOR_FIRST + tracker::kFamilySize) {
+            if (const auto* current = model.findCategory(category))
+                color = tracker::ColorFamily(current->color)[static_cast<std::size_t>(id - TD_COLOR_FIRST)];
         } else if (id == TD_CUSTOM_COLOR) {
-            static COLORREF custom[16]{};
-            CHOOSECOLORW choose{};
-            choose.lStructSize = sizeof(choose);
-            choose.hwndOwner = hwnd_;
-            choose.rgbResult = color;
-            choose.lpCustColors = custom;
-            choose.Flags = CC_FULLOPEN | CC_RGBINIT;
-            if (ChooseColorW(&choose)) color = choose.rgbResult & 0xFFFFFFu;
+            PickColor(color);
         } else if (id == TD_DELETE) {
             if (canDelete_) Finish(TD_DELETE);
         } else if (id == IDOK) Accept();
@@ -2041,8 +3055,7 @@ protected:
         if (!error_.empty()) { error_.clear(); Redraw(); }
     }
     void Accept() override {
-        const std::wstring raw = WindowText(edit_);
-        const std::wstring value = Trim(raw);
+        const std::wstring value = Trim(WindowText(edit_));
         if (value.empty()) error_ = L"请输入标签名称（不能只有空格）";
         else if (value.size() > 40) error_ = L"名称最多 40 个字符";
         else {
@@ -2068,6 +3081,140 @@ private:
     int editingId_ = 0;
     std::size_t records_ = 0;
     bool canDelete_ = false;
+    int originalCategory_ = 0;
+    unsigned originalColor_ = 0;
+    std::vector<RECT> chips_;
+    std::wstring error_;
+};
+
+// ---- category dialog
+
+class CategoryDialog : public Dialog {
+public:
+    explicit CategoryDialog(const tracker::Category* category) {
+        const auto& model = app.model;
+        if (category) {
+            editing_ = true;
+            editingId_ = category->id;
+            name = category->name;
+            color = category->color;
+            tags_ = model.tagsIn(category->id);
+        } else {
+            // The first preset colour that no category is close to yet.
+            color = kSwatches[0];
+            for (COLORREF swatch : kSwatches) {
+                if (std::none_of(model.categories.begin(), model.categories.end(), [swatch](const tracker::Category& c) {
+                        return tracker::ColorDistance(c.color, swatch) < 0.1;
+                    })) {
+                    color = swatch;
+                    break;
+                }
+            }
+        }
+        originalColor_ = color;
+    }
+    std::wstring name;
+    unsigned color = 0;
+    bool recolor = false;         // give the category's tags shades of the (new) colour
+
+protected:
+    bool HasToggle() const { return editing_ && tags_ > 0; }
+    int Height() override { return (HasToggle() ? 334 : 296) + 94; }
+    void Build() override { edit_ = MakeEdit(CD_NAME, name, L"例如：工作、学习、运动、生活", 20, false); }
+    void Place() override { PlaceEdit(edit_, Field()); }
+    RECT Field() { return RECT{S(24), S(48), S(Width() - 24), S(48 + 42)}; }
+
+    void Draw(Canvas& c) override {
+        const Palette& p = app.pal;
+        Label(c, 24, 22, L"大类名称");
+        PaintField(c, Field(), edit_, !error_.empty());
+        if (!error_.empty()) {
+            PaintIcon(c, Icon::Alert, Sf(31), Sf(105), Sf(13), p.danger);
+            c.Text(error_, RECT{S(42), S(96), S(Width() - 24), S(114)}, fonts_.label, p.danger);
+        }
+        Label(c, 24, 122, L"颜色");
+        Swatches(c, std::vector<unsigned>(std::begin(kSwatches), std::end(kSwatches)), color, 24, 146, 7, CD_COLOR_FIRST,
+                 CD_CUSTOM_COLOR);
+        Label(c, 24, 238, L"标签色系");
+        c.Text(L"这个大类下的标签从中取色", RECT{S(120), S(238), S(Width() - 24), S(258)}, fonts_.label, p.text3,
+               DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        const auto family = tracker::ColorFamily(color);
+        const float gap = Sf(4), stripW = static_cast<float>(S(Width() - 48));
+        const float cell = (stripW - gap * (family.size() - 1)) / static_cast<float>(family.size());
+        for (std::size_t i = 0; i < family.size(); ++i) {
+            const float x = S(24) + i * (cell + gap);
+            c.Round(x, Sf(262), cell, Sf(24), Sf(6), family[i]);
+            if (family[i] == (color & 0xFFFFFFu)) c.Circle(x + cell / 2, Sf(274), Sf(3), InkOn(family[i]));
+        }
+        if (HasToggle()) {
+            const RECT row{S(16), S(296), S(Width() - 16), S(332)};
+            const bool hot = hot_ == CD_RECOLOR;
+            if (hot) c.Round(row, Sf(8), p.hover);
+            c.Text(Format(L"把它的 %d 个标签换成这个色系", static_cast<int>(tags_)),
+                   RECT{row.left + S(8), row.top, row.right - S(64), row.bottom}, fonts_.body, p.text);
+            PaintSwitch(c, RECT{row.right - S(8) - S(42), row.top + S(7), row.right - S(8), row.bottom - S(7)}, recolor,
+                        hot);
+            AddHit(hits_, c, row, CD_RECOLOR, L"每个标签取一个不同深浅，第一个用大类本色");
+        }
+        const int footer = Footer(c);
+        if (editing_) {
+            const bool last = app.model.categories.size() <= 1;
+            DialogButton(c, RECT{S(16), footer, S(16 + 112), footer + S(38)}, L"删除大类", static_cast<int>(Icon::Trash),
+                         Btn::Danger, CD_DELETE, !last && !app.readOnly, last ? L"至少要保留一个大类" : L"");
+        }
+    }
+
+    void SetColor(unsigned next) {
+        color = next & 0xFFFFFFu;
+        if (!recolorTouched_) recolor = color != (originalColor_ & 0xFFFFFFu);
+    }
+    void Click(int id) override {
+        if (id >= CD_COLOR_FIRST && id < CD_COLOR_FIRST + kSwatchCount) SetColor(kSwatches[id - CD_COLOR_FIRST]);
+        else if (id == CD_CUSTOM_COLOR) {
+            unsigned picked = color;
+            if (PickColor(picked)) SetColor(picked);
+        } else if (id == CD_RECOLOR && HasToggle()) {
+            recolor = !recolor;
+            recolorTouched_ = true;
+        } else if (id == CD_DELETE) {
+            if (editing_ && app.model.categories.size() > 1) Finish(CD_DELETE);
+        } else if (id == IDOK) Accept();
+        else if (id == IDCANCEL) Finish(IDCANCEL);
+        Redraw();
+    }
+    void Changed(int) override {
+        if (!error_.empty()) { error_.clear(); Redraw(); }
+    }
+    void Accept() override {
+        const std::wstring value = Trim(WindowText(edit_));
+        if (value.empty()) error_ = L"请输入大类名称（不能只有空格）";
+        else if (value.size() > 20) error_ = L"名称最多 20 个字符";
+        else {
+            for (const auto& category : app.model.categories) {
+                if ((!editing_ || category.id != editingId_) &&
+                    CompareStringOrdinal(category.name.c_str(), -1, value.c_str(), -1, TRUE) == CSTR_EQUAL) {
+                    error_ = L"已经有一个叫“" + value + L"”的大类了";
+                    break;
+                }
+            }
+        }
+        if (!error_.empty()) {
+            SetFocus(edit_);
+            SendMessageW(edit_, EM_SETSEL, 0, -1);
+            Redraw();
+            return;
+        }
+        name = value;
+        if (!HasToggle()) recolor = false;
+        Finish(IDOK);
+    }
+
+private:
+    HWND edit_ = nullptr;
+    bool editing_ = false, recolorTouched_ = false;
+    int editingId_ = 0;
+    std::size_t tags_ = 0;
+    unsigned originalColor_ = 0;
     std::wstring error_;
 };
 
@@ -2101,29 +3248,17 @@ protected:
         if (endEdit_) PlaceEdit(endEdit_, EndField());
     }
 
-    // Chip geometry (96-DPI units), laid out in a flow of rows.
+    // Chip geometry (96-DPI units): one chip per tag, in sidebar order, flowing in rows.
     struct Chip { int index; RECT box; };
     const std::vector<Chip>& Chips() {
         if (chipsReady_) return chips_;
         chipsReady_ = true;
-        auto& chips = chips_;
-        HDC dc = CreateCompatibleDC(nullptr);
-        HFONT font = MakeFont(L"Microsoft YaHei UI", 13, FW_NORMAL, 96);
-        HGDIOBJ old = SelectObject(dc, font);
-        int x = 24, y = 48;
-        for (std::size_t i = 0; i < app.model.tags.size(); ++i) {
-            const auto& name = app.model.tags[i].name;
-            SIZE size{};
-            GetTextExtentPoint32W(dc, name.c_str(), static_cast<int>(name.size()), &size);
-            const int w = std::min(static_cast<int>(size.cx) + 40, Width() - 48);
-            if (x + w > Width() - 24 && x > 24) { x = 24; y += 40; }
-            chips.push_back({static_cast<int>(i), RECT{x, y, x + w, y + 32}});
-            x += w + 8;
-        }
-        SelectObject(dc, old);
-        DeleteObject(font);
-        DeleteDC(dc);
-        return chips;
+        const auto order = DisplayTags();
+        std::vector<std::wstring> labels;
+        for (int index : order) labels.push_back(app.model.tags[static_cast<std::size_t>(index)].name);
+        const auto boxes = FlowChips(labels, 24, 48, Width() - 48);
+        for (std::size_t i = 0; i < order.size(); ++i) chips_.push_back({order[i], boxes[i]});
+        return chips_;
     }
     int ChipsHeight() {
         const auto& chips = Chips();
@@ -2175,12 +3310,7 @@ protected:
                   ok_ ? p.text2 : p.danger);
         c.Text(message_, RECT{info.left + S(34), info.top, info.right - S(10), info.bottom}, fonts_.body,
                ok_ ? p.text : p.danger);
-        const int fTop = S(Height() - 24 - 38), fBottom = S(Height() - 24);
-        c.Fill(0, float(fTop - S(18)), float(S(Width())), Sf(1), p.border);
-        const RECT save{S(Width() - 24 - 92), fTop, S(Width() - 24), fBottom};
-        const RECT cancel{save.left - S(10) - S(84), fTop, save.left - S(10), fBottom};
-        DialogButton(c, save, mode_ == Mode::Add ? L"添加" : L"保存", -1, Btn::Primary, IDOK, ok_);
-        DialogButton(c, cancel, L"取消", -1, Btn::Secondary, IDCANCEL);
+        const int fTop = Footer(c, mode_ == Mode::Add ? L"添加" : L"保存", ok_), fBottom = fTop + S(38);
         if (mode_ != Mode::Add)
             DialogButton(c, RECT{S(16), fTop, S(16 + 112), fBottom}, mode_ == Mode::Running ? L"放弃计时" : L"删除记录",
                          static_cast<int>(Icon::Trash), Btn::Danger, RD_DELETE, true,
@@ -2338,15 +3468,6 @@ protected:
             PlaceEdit(edits_[i], r);
         }
     }
-    void PaintSwitch(Canvas& c, const RECT& r, bool on, bool hot) {
-        const Palette& p = app.pal;
-        if (on) c.Round(r, Sf(12), hot ? p.accentHover : p.accent);
-        else c.Bordered(r, Sf(12), hot ? p.pressed : p.track, p.borderStrong);
-        const float knob = Sf(8.5f), cy = (r.top + r.bottom) / 2.0f;
-        const float cx = on ? r.right - Sf(12) : r.left + Sf(12);
-        c.Circle(cx, cy, knob, on ? p.onAccent : (p.dark ? p.text2 : p.surface));
-        if (!on && !p.dark) c.Ring(cx, cy, knob, p.borderStrong, Sf(1));
-    }
     void Draw(Canvas& c) override {
         const Palette& p = app.pal;
         static const wchar_t* labels[] = {L"专注时长", L"短休息", L"长休息", L"长休息间隔"};
@@ -2375,13 +3496,8 @@ protected:
                         states[i], hot);
             AddHit(hits_, c, row, id);
         }
-        const int top = S(Height() - 24 - 38), bottom = S(Height() - 24);
-        c.Fill(0, float(top - S(18)), float(S(Width())), Sf(1), p.border);
-        const RECT save{S(Width() - 24 - 92), top, S(Width() - 24), bottom};
-        const RECT cancel{save.left - S(10) - S(84), top, save.left - S(10), bottom};
-        DialogButton(c, save, L"保存", -1, Btn::Primary, IDOK);
-        DialogButton(c, cancel, L"取消", -1, Btn::Secondary, IDCANCEL);
-        DialogButton(c, RECT{S(16), top, S(16 + 104), bottom}, L"恢复默认", static_cast<int>(Icon::Undo), Btn::Ghost,
+        const int top = Footer(c);
+        DialogButton(c, RECT{S(16), top, S(16 + 104), top + S(38)}, L"恢复默认", static_cast<int>(Icon::Undo), Btn::Ghost,
                      PD_DEFAULTS);
     }
     void Click(int id) override {
@@ -2774,17 +3890,116 @@ void GoToDay(long long day) {
     Refresh();
 }
 
+void CloseCalendar();
+
+// The day or the statistics page; the statistics open on the period around the chosen day.
+void SetView(int view) {
+    view = std::clamp(view, 0, 1);
+    if (view == app.view) return;
+    app.view = view;
+    if (view == 1) {
+        app.periodStart = PeriodStart(app.range, app.chosenDay);
+        app.breakdownScroll = 0;
+    }
+    if (app.calendar) CloseCalendar();
+    app.tipVisible = false;
+    SaveSetting(L"ui", L"view", view);
+    Refresh();
+}
+
+void SetRange(int range) {
+    range = std::clamp(range, 0, 2);
+    if (range == app.range && app.periodStart) return;
+    const auto& p = app.period;
+    const long long anchor = app.chosenDay >= p.start && app.chosenDay < p.end ? app.chosenDay :
+                             p.start ? p.start : TodayStart();
+    app.range = range;
+    app.periodStart = PeriodStart(range, std::min(anchor, TodayStart()));
+    app.breakdownScroll = 0;
+    SaveSetting(L"ui", L"range", range);
+    Refresh();
+}
+
+void ShiftPeriodBy(int delta) {
+    const long long from = app.periodStart ? app.periodStart : PeriodStart(app.range, TodayStart());
+    const long long next = ShiftPeriod(app.range, from, delta);
+    if (next <= 0 || next > TodayStart()) return;   // nothing recorded in the future (or before 1970)
+    app.periodStart = next;
+    app.breakdownScroll = 0;
+    Refresh();
+}
+
+void CurrentPeriod() {
+    app.periodStart = PeriodStart(app.range, TodayStart());
+    app.breakdownScroll = 0;
+    Refresh();
+}
+
+// A bar of the trend chart: a day opens on the day page, a month (of a year) as a month.
+void OpenTrendBar(int index) {
+    const auto& p = app.period;
+    if (index < 0 || index + 1 >= static_cast<int>(p.buckets.size())) return;
+    const long long start = p.buckets[static_cast<std::size_t>(index)];
+    if (start > TodayStart()) return;
+    if (app.range == 2) {
+        app.range = 1;
+        SaveSetting(L"ui", L"range", 1);
+        app.periodStart = start;
+        app.breakdownScroll = 0;
+        Refresh();
+        return;
+    }
+    app.chosenDay = DayStart(start);
+    app.recordScroll = 0;
+    SetView(0);
+}
+
 void Navigate(int delta) {
     if (delta > 0 && app.chosenDay >= TodayStart()) return;
     GoToDay(ShiftDay(app.chosenDay, delta));
 }
 
-void EnsureTagVisible(int index) {
-    const int rowH = S(54), view = Ht(app.layout.tagsList);
+// Scrolls the tag list so a row is in view (with its category header, for a category's first tag).
+void EnsureSideVisible(SideKind kind, int index) {
+    const int view = Ht(app.layout.tagsList);
     if (view <= 0) return;
-    const int top = index * rowH;
-    if (top < app.tagScroll) app.tagScroll = top;
-    else if (top + rowH > app.tagScroll + view) app.tagScroll = top + rowH - view;
+    const auto items = SidebarItems();
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        if (items[i].kind != kind || items[i].index != index) continue;
+        int top = items[i].top, bottom = items[i].top + items[i].height;
+        if (kind == SIDE_HEADER && i + 1 < items.size()) bottom = items[i + 1].top + items[i + 1].height;
+        if (kind != SIDE_HEADER && i > 0 && items[i - 1].kind == SIDE_HEADER) top = items[i - 1].top;
+        if (top < app.tagScroll) app.tagScroll = top;
+        else if (bottom > app.tagScroll + view) app.tagScroll = std::min(top, bottom - view);
+        InvalidateRect(app.hwnd, nullptr, FALSE);
+        return;
+    }
+}
+void EnsureTagVisible(int index) { EnsureSideVisible(SIDE_TAG, index); }
+
+// Gives a tag the next free shade of its category's colour family.
+void AdoptFamily(int tagId) {
+    auto& model = app.model;
+    const int index = model.tagIndex(tagId);
+    if (index < 0) return;
+    auto& tag = model.tags[static_cast<std::size_t>(index)];
+    const int category = tag.category;
+    tag.category = -1;                         // so its own colour does not count as taken
+    const unsigned shade = model.nextTagColor(category);
+    tag.category = category;
+    tag.color = shade;
+}
+
+// Moves a tag that just changed category to the end of that category's group.
+void PlaceLastInCategory(int tagId) {
+    auto& tags = app.model.tags;
+    const int from = app.model.tagIndex(tagId);
+    if (from < 0) return;
+    const tracker::Tag tag = tags[static_cast<std::size_t>(from)];
+    tags.erase(tags.begin() + from);
+    std::size_t at = tags.size();
+    for (std::size_t i = 0; i < tags.size(); ++i) if (tags[i].category == tag.category) at = i + 1;
+    tags.insert(tags.begin() + static_cast<std::ptrdiff_t>(at), tag);
 }
 
 void DeleteTag(int id) {
@@ -2794,7 +4009,7 @@ void DeleteTag(int id) {
     const std::wstring name = tag->name;
     if (!app.model.deletable(id)) {
         ModalScope modal;
-        MessageBoxW(app.hwnd, L"这个标签正在计时或已有历史记录，不能删除。您仍可修改它的名称、颜色和分类。",
+        MessageBoxW(app.hwnd, L"这个标签正在计时或已有历史记录，不能删除。您仍可修改它的名称、颜色和大类。",
                     L"保留历史记录", MB_OK | MB_ICONINFORMATION);
         return;
     }
@@ -2810,9 +4025,14 @@ void DeleteTag(int id) {
     ShowToast(L"已删除标签“" + name + L"”");
 }
 
-void NewTag() {
+// A new tag; it starts in `categoryId`, or in the category of the selected tag.
+void NewTag(int categoryId = -1) {
     if (!GuardWritable()) return;
-    TagDialog dialog(nullptr);
+    if (!app.model.findCategory(categoryId)) {
+        const auto* selected = app.model.findTag(app.selectedTagId);
+        categoryId = selected ? selected->category : app.model.categories.front().id;
+    }
+    TagDialog dialog(nullptr, categoryId);
     if (dialog.Run(L"DayLedgerTagEditor", L"新建标签") != IDOK) return;
     const int id = app.model.addTag(dialog.name, dialog.color, dialog.category);
     if (!id) {
@@ -2831,7 +4051,8 @@ void EditTag(int id) {
     const auto* tag = app.model.findTag(id);
     if (!tag) return;
     app.selectedTagId = id;
-    TagDialog dialog(tag);
+    const int before = tag->category;
+    TagDialog dialog(tag, tag->category);
     const int result = dialog.Run(L"DayLedgerTagEditor", L"编辑标签");
     if (result == TD_DELETE) { DeleteTag(id); return; }
     if (result != IDOK) return;
@@ -2839,8 +4060,10 @@ void EditTag(int id) {
         ShowToast(L"标签未保存：请检查名称");
         return;
     }
+    if (dialog.category != before) PlaceLastInCategory(id);
     Persist(true);
     Refresh();
+    EnsureTagVisible(app.model.tagIndex(id));
 }
 
 void MoveTag(int id, int delta) {
@@ -2848,6 +4071,143 @@ void MoveTag(int id, int delta) {
     Persist(true);
     Refresh();
     EnsureTagVisible(app.model.tagIndex(id));
+}
+
+void MoveTagToCategory(int tagId, int categoryId) {
+    if (!GuardWritable()) return;
+    const auto* tag = app.model.findTag(tagId);
+    const auto* category = app.model.findCategory(categoryId);
+    if (!tag || !category || tag->category == categoryId) return;
+    const std::wstring name = tag->name, target = category->name;
+    if (!app.model.updateTag(tagId, tag->name, tag->color, categoryId)) return;
+    AdoptFamily(tagId);
+    PlaceLastInCategory(tagId);
+    Persist(true);
+    Refresh();
+    EnsureTagVisible(app.model.tagIndex(tagId));
+    ShowToast(L"已把“" + name + L"”移到「" + target + L"」，颜色换成了它的色系");
+}
+
+void NewCategory() {
+    if (!GuardWritable()) return;
+    if (app.model.categories.size() >= tracker::kMaxCategories) {
+        ShowToast(L"大类数量已达上限");
+        return;
+    }
+    CategoryDialog dialog(nullptr);
+    if (dialog.Run(L"DayLedgerCategoryEditor", L"新建大类") != IDOK) return;
+    const int id = app.model.addCategory(dialog.name, dialog.color);
+    if (id < 0) {
+        ShowToast(L"无法添加大类：名称无效");
+        return;
+    }
+    Persist(true);
+    Refresh();
+    EnsureSideVisible(SIDE_HEADER, app.model.categoryIndex(id));
+    ShowToast(L"已添加大类“" + dialog.name + L"” · 在它下面新建标签吧");
+}
+
+void DeleteCategory(int id) {
+    if (!GuardWritable()) return;
+    const auto& model = app.model;
+    const auto* category = model.findCategory(id);
+    if (!category) return;
+    const std::wstring name = category->name;
+    if (model.categories.size() <= 1) {
+        ModalScope modal;
+        MessageBoxW(app.hwnd, L"至少要保留一个大类。", L"删除大类", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::vector<int> others;
+    for (const auto& other : model.categories) if (other.id != id) others.push_back(other.id);
+    const std::size_t count = model.tagsIn(id);
+    int target = others.front();
+    if (count == 0) {
+        ModalScope modal;
+        const std::wstring question = L"删除大类“" + name + L"”？";
+        if (MessageBoxW(app.hwnd, question.c_str(), L"删除大类", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES)
+            return;
+    } else {
+        // Its tags (and their records) move to a category the user picks.
+        std::vector<std::wstring> labels;
+        for (int other : others) labels.push_back(L"移到「" + model.findCategory(other)->name + L"」");
+        std::vector<TASKDIALOG_BUTTON> buttons;
+        for (std::size_t i = 0; i < labels.size() && i < 20; ++i)
+            buttons.push_back({1000 + static_cast<int>(i), labels[i].c_str()});
+        const std::wstring instruction = L"删除大类“" + name + L"”";
+        const std::wstring content = Format(L"它下面有 %d 个标签。标签和它们的记录会移到下面选择的大类，"
+                                            L"并换成那个大类的色系。", static_cast<int>(count));
+        TASKDIALOGCONFIG config{};
+        config.cbSize = sizeof(config);
+        config.hwndParent = app.hwnd;
+        config.dwFlags = TDF_USE_COMMAND_LINKS | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ALLOW_DIALOG_CANCELLATION;
+        config.pszWindowTitle = L"删除大类";
+        config.pszMainInstruction = instruction.c_str();
+        config.pszContent = content.c_str();
+        config.cButtons = static_cast<UINT>(buttons.size());
+        config.pButtons = buttons.data();
+        config.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+        config.nDefaultButton = IDCANCEL;
+        int choice = 0;
+        {
+            ModalScope modal;
+            if (FAILED(TaskDialogIndirect(&config, &choice, nullptr, nullptr))) return;
+        }
+        if (choice < 1000 || choice >= 1000 + static_cast<int>(buttons.size())) return;
+        target = others[static_cast<std::size_t>(choice - 1000)];
+    }
+    std::vector<int> moved;
+    for (const auto& tag : model.tags) if (tag.category == id) moved.push_back(tag.id);
+    if (!app.model.removeCategory(id, target)) return;
+    for (int tagId : moved) {
+        AdoptFamily(tagId);
+        PlaceLastInCategory(tagId);
+    }
+    Persist(true);
+    Refresh();
+    ShowToast(moved.empty() ? L"已删除大类“" + name + L"”" :
+              L"已删除大类“" + name + L"”，" + Format(L"%d 个标签移到了「", static_cast<int>(moved.size())) +
+              CategoryName(target) + L"」");
+}
+
+void EditCategory(int id) {
+    if (!GuardWritable()) return;
+    const auto* category = app.model.findCategory(id);
+    if (!category) return;
+    CategoryDialog dialog(category);
+    const int result = dialog.Run(L"DayLedgerCategoryEditor", L"编辑大类");
+    if (result == CD_DELETE) { DeleteCategory(id); return; }
+    if (result != IDOK) return;
+    if (!app.model.updateCategory(id, dialog.name, dialog.color)) {
+        ShowToast(L"大类未保存：请检查名称");
+        return;
+    }
+    if (dialog.recolor) app.model.recolorCategory(id);
+    Persist(true);
+    Refresh();
+}
+
+void MoveCategory(int id, int delta) {
+    if (!GuardWritable() || !app.model.moveCategory(id, delta)) return;
+    Persist(true);
+    Refresh();
+    EnsureSideVisible(SIDE_HEADER, app.model.categoryIndex(id));
+}
+
+void RecolorCategory(int id) {
+    if (!GuardWritable()) return;
+    const auto* category = app.model.findCategory(id);
+    if (!category || !app.model.tagsIn(id)) return;
+    {
+        ModalScope modal;
+        const std::wstring question = L"把「" + category->name + Format(L"」下的 %d 个标签换成它的色系？\n\n",
+            static_cast<int>(app.model.tagsIn(id))) + L"每个标签取一个不同的深浅，第一个标签用大类本色。";
+        if (MessageBoxW(app.hwnd, question.c_str(), L"统一色系", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    }
+    app.model.recolorCategory(id);
+    Persist(true);
+    Refresh();
+    ShowToast(L"已换成「" + CategoryName(id) + L"」的色系");
 }
 
 void RememberUndo(bool active, const tracker::Session& session) {
@@ -3050,8 +4410,9 @@ void ShowShortcuts() {
         L"P\t切换番茄钟模式\n"
         L"S / R\t番茄钟：跳过当前阶段 / 放弃\n"
         L"M\t迷你悬浮窗\n"
-        L"← / →\t前一天 / 后一天\n"
-        L"Home\t回到今天\n"
+        L"V\t切换「今日」/「统计」\n"
+        L"← / →\t前一天 / 后一天（统计页：上一段 / 下一段）\n"
+        L"Home\t回到今天（统计页：回到本周 / 本月 / 今年）\n"
         L"Ctrl+N\t新建标签\n"
         L"Ctrl+B\t补录一段时间\n"
         L"Ctrl+Z\t撤销删除\n\n"
@@ -3158,6 +4519,12 @@ void ShowMainMenu(POINT screen) {
     AppendMenuW(theme, MF_STRING | (app.themeMode == 0 ? MF_CHECKED : 0), CMD_THEME_SYSTEM, L"跟随系统");
     AppendMenuW(theme, MF_STRING | (app.themeMode == 1 ? MF_CHECKED : 0), CMD_THEME_LIGHT, L"浅色");
     AppendMenuW(theme, MF_STRING | (app.themeMode == 2 ? MF_CHECKED : 0), CMD_THEME_DARK, L"深色");
+    const UINT gray = app.readOnly ? MF_GRAYED : 0;
+    AppendMenuW(menu, MF_STRING | gray, CMD_NEW_TAG, L"新建标签…\tCtrl+N");
+    AppendMenuW(menu, MF_STRING | gray, CMD_NEW_CATEGORY, L"新建大类…");
+    AppendMenuW(menu, MF_STRING | gray, CMD_ADD_RECORD, L"补录一段时间…\tCtrl+B");
+    AppendMenuW(menu, MF_STRING | (app.view ? MF_CHECKED : 0), CMD_VIEW_TOGGLE, L"统计页\tV");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (app.pomodoroMode ? MF_CHECKED : 0), CMD_POMODORO_TOGGLE, L"番茄钟模式\tP");
     AppendMenuW(menu, MF_STRING, CMD_POMODORO_SETTINGS, L"番茄钟设置…");
     AppendMenuW(menu, MF_STRING | (app.soundOn ? MF_CHECKED : 0), CMD_SOUND, L"提示音");
@@ -3171,6 +4538,7 @@ void ShowMainMenu(POINT screen) {
     AppendMenuW(menu, MF_STRING | (app.dataDir.empty() ? MF_GRAYED : 0), CMD_OPEN_FOLDER, L"打开数据文件夹");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(theme), L"主题");
+    AppendMenuW(menu, MF_STRING | (app.customFrame ? 0 : MF_CHECKED), CMD_SYSTEM_TITLEBAR, L"使用系统标题栏");
     AppendMenuW(menu, MF_STRING, CMD_SHORTCUTS, L"键盘快捷键\tF1");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, CMD_ABOUT, L"关于时光账本");
@@ -3210,10 +4578,17 @@ void ShowTrayMenu(POINT at) {
         AppendMenuW(menu, MF_STRING | gray, CMD_SPACE, (L"继续「" + last->name + L"」").c_str());
     }
     HMENU tags = CreatePopupMenu();
-    const std::size_t shown = std::min<std::size_t>(model.tags.size(), 20);
+    const auto order = DisplayTags();
+    const std::size_t shown = std::min<std::size_t>(order.size(), 30);
+    int lastCategory = -1;
     for (std::size_t i = 0; i < shown; ++i) {
-        const auto& tag = model.tags[i];
-        std::wstring label = tag.name;
+        const auto& tag = model.tags[static_cast<std::size_t>(order[i])];
+        if (tag.category != lastCategory) {         // a disabled heading per category
+            if (i) AppendMenuW(tags, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(tags, MF_STRING | MF_GRAYED, 0, CategoryName(tag.category).c_str());
+            lastCategory = tag.category;
+        }
+        std::wstring label = L"    " + tag.name;
         if (i < 9) label += Format(L"\t%d", static_cast<int>(i) + 1);
         AppendMenuW(tags, MF_STRING | gray | (tag.id == model.activeTagId ? MF_CHECKED : 0),
                     static_cast<UINT_PTR>(CMD_TAG_FIRST + static_cast<int>(i)), label.c_str());
@@ -3237,20 +4612,34 @@ void ShowTrayMenu(POINT at) {
 }
 
 void ShowTagMenu(int index, POINT screen) {
-    if (index < 0 || index >= static_cast<int>(app.model.tags.size())) return;
-    const auto& tag = app.model.tags[static_cast<std::size_t>(index)];
+    const auto& model = app.model;
+    if (index < 0 || index >= static_cast<int>(model.tags.size())) return;
+    const auto& tag = model.tags[static_cast<std::size_t>(index)];
     const int id = tag.id;
-    const bool active = id == app.model.activeTagId, writable = !app.readOnly;
+    const bool active = id == model.activeTagId, writable = !app.readOnly;
     const UINT gray = writable ? 0 : MF_GRAYED;
+    bool first = true, last = true;           // within its category
+    for (std::size_t i = 0; i < model.tags.size(); ++i) {
+        if (model.tags[i].category != tag.category || static_cast<int>(i) == index) continue;
+        if (static_cast<int>(i) < index) first = false;
+        else last = false;
+    }
     HMENU menu = CreatePopupMenu();
     AppendMenuW(menu, MF_STRING | gray, 1, active ? L"停止计时" : L"开始计时");
     AppendMenuW(menu, MF_STRING | gray, 2, L"编辑标签…");
+    HMENU move = CreatePopupMenu();
+    for (std::size_t i = 0; i < model.categories.size(); ++i) {
+        const bool here = model.categories[i].id == tag.category;
+        AppendMenuW(move, MF_STRING | (here ? MF_CHECKED | MF_GRAYED : gray), 100 + static_cast<UINT_PTR>(i),
+                    model.categories[i].name.c_str());
+    }
+    AppendMenuW(menu, MF_POPUP | (model.categories.size() > 1 ? gray : MF_GRAYED), reinterpret_cast<UINT_PTR>(move),
+                L"移到大类");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | (index == 0 || !writable ? MF_GRAYED : 0), 3, L"上移");
-    AppendMenuW(menu, MF_STRING | (index + 1 == static_cast<int>(app.model.tags.size()) || !writable ? MF_GRAYED : 0),
-                4, L"下移");
+    AppendMenuW(menu, MF_STRING | (first || !writable ? MF_GRAYED : 0), 3, L"上移");
+    AppendMenuW(menu, MF_STRING | (last || !writable ? MF_GRAYED : 0), 4, L"下移");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    const bool deletable = writable && app.model.deletable(id);
+    const bool deletable = writable && model.deletable(id);
     AppendMenuW(menu, MF_STRING | (deletable ? 0 : MF_GRAYED), 5,
                 deletable ? L"删除标签" : (active ? L"删除标签（正在计时）" : L"删除标签（已有记录）"));
     PopupAt(menu, screen, [id](int command) {
@@ -3260,6 +4649,42 @@ void ShowTagMenu(int index, POINT screen) {
         case 3: MoveTag(id, -1); break;
         case 4: MoveTag(id, 1); break;
         case 5: DeleteTag(id); break;
+        default:
+            if (command >= 100 && command < 100 + static_cast<int>(app.model.categories.size()))
+                MoveTagToCategory(id, app.model.categories[static_cast<std::size_t>(command - 100)].id);
+            break;
+        }
+    });
+}
+
+void ShowCategoryMenu(int index, POINT screen) {
+    const auto& model = app.model;
+    if (index < 0 || index >= static_cast<int>(model.categories.size())) return;
+    const auto& category = model.categories[static_cast<std::size_t>(index)];
+    const int id = category.id;
+    const bool writable = !app.readOnly;
+    const UINT gray = writable ? 0 : MF_GRAYED;
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING | gray, 1, (L"在「" + category.name + L"」新建标签…").c_str());
+    AppendMenuW(menu, MF_STRING | gray, 2, L"编辑大类…");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (index == 0 || !writable ? MF_GRAYED : 0), 3, L"上移");
+    AppendMenuW(menu, MF_STRING | (index + 1 == static_cast<int>(model.categories.size()) || !writable ? MF_GRAYED : 0),
+                4, L"下移");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (model.tagsIn(id) && writable ? 0 : MF_GRAYED), 5, L"标签统一换成这个色系…");
+    AppendMenuW(menu, MF_STRING | gray, 7, L"新建大类…");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (model.categories.size() > 1 && writable ? 0 : MF_GRAYED), 6, L"删除大类…");
+    PopupAt(menu, screen, [id](int command) {
+        switch (command) {
+        case 1: NewTag(id); break;
+        case 2: EditCategory(id); break;
+        case 3: MoveCategory(id, -1); break;
+        case 4: MoveCategory(id, 1); break;
+        case 5: RecolorCategory(id); break;
+        case 6: DeleteCategory(id); break;
+        case 7: NewCategory(); break;
         }
     });
 }
@@ -3589,23 +5014,6 @@ LRESULT CALLBACK MiniProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
 // A month calendar under the date title. Days with records carry a dot; future days are inert.
 constexpr int kCalW = 304, kCalH = 348;
 
-long long MonthStart(long long time) {
-    auto t = LocalTm(time);
-    t.tm_mday = 1;
-    t.tm_hour = t.tm_min = t.tm_sec = 0;
-    t.tm_isdst = -1;
-    return static_cast<long long>(std::mktime(&t));
-}
-
-long long ShiftMonth(long long month, int delta) {
-    auto t = LocalTm(month);
-    t.tm_mon += delta;
-    t.tm_mday = 1;
-    t.tm_hour = t.tm_min = t.tm_sec = 0;
-    t.tm_isdst = -1;
-    return static_cast<long long>(std::mktime(&t));
-}
-
 long long CalendarFirstCell() {           // weeks start on Monday
     return ShiftDay(app.calendarMonth, -((LocalTm(app.calendarMonth).tm_wday + 6) % 7));
 }
@@ -3873,6 +5281,20 @@ void Activate(int id) {
     case HK_STOP: StopTimer(); break;
     case HK_RESUME: ResumeTimer(); break;
     case HK_NEW_TAG: NewTag(); break;
+    case HK_CAT_ADD: case HK_CAT_EMPTY:
+        if (index < static_cast<int>(app.model.categories.size())) NewTag(app.model.categories[static_cast<std::size_t>(index)].id);
+        break;
+    case HK_CAT_EDIT:
+        if (index < static_cast<int>(app.model.categories.size()))
+            EditCategory(app.model.categories[static_cast<std::size_t>(index)].id);
+        break;
+    case HK_NEW_CATEGORY: NewCategory(); break;
+    case HK_VIEW_DAY: SetView(index); break;
+    case HK_RANGE: SetRange(index); break;
+    case HK_PERIOD_PREV: ShiftPeriodBy(-1); break;
+    case HK_PERIOD_NEXT: ShiftPeriodBy(1); break;
+    case HK_PERIOD_NOW: CurrentPeriod(); break;
+    case HK_TREND_BAR: OpenTrendBar(index); break;
     case HK_ADD_RECORD: AddRecord(); break;
     case HK_WEEK_DAY:
         if (index < static_cast<int>(app.week.size())) GoToDay(app.week[static_cast<std::size_t>(index)].day);
@@ -3897,13 +5319,26 @@ void Activate(int id) {
 }
 
 void Command(int id) {
-    const auto tagCount = static_cast<int>(app.model.tags.size());
+    const auto& model = app.model;
+    const auto categoryCount = static_cast<int>(model.categories.size());
     if (id >= CMD_TAG_FIRST && id < CMD_TAG_FIRST + CMD_RANGE) {
-        if (id - CMD_TAG_FIRST < tagCount) ClickTag(app.model.tags[static_cast<std::size_t>(id - CMD_TAG_FIRST)].id);
+        const int index = DisplayTagAt(id - CMD_TAG_FIRST);
+        if (index >= 0) ClickTag(model.tags[static_cast<std::size_t>(index)].id);
         return;
     }
     if (id >= CMD_EDIT_TAG_FIRST && id < CMD_EDIT_TAG_FIRST + CMD_RANGE) {
-        if (id - CMD_EDIT_TAG_FIRST < tagCount) EditTag(app.model.tags[static_cast<std::size_t>(id - CMD_EDIT_TAG_FIRST)].id);
+        const int index = DisplayTagAt(id - CMD_EDIT_TAG_FIRST);
+        if (index >= 0) EditTag(model.tags[static_cast<std::size_t>(index)].id);
+        return;
+    }
+    if (id >= CMD_EDIT_CATEGORY_FIRST && id < CMD_EDIT_CATEGORY_FIRST + CMD_RANGE) {
+        if (id - CMD_EDIT_CATEGORY_FIRST < categoryCount)
+            EditCategory(model.categories[static_cast<std::size_t>(id - CMD_EDIT_CATEGORY_FIRST)].id);
+        return;
+    }
+    if (id >= CMD_NEW_TAG_IN_FIRST && id < CMD_NEW_TAG_IN_FIRST + CMD_RANGE) {
+        if (id - CMD_NEW_TAG_IN_FIRST < categoryCount)
+            NewTag(model.categories[static_cast<std::size_t>(id - CMD_NEW_TAG_IN_FIRST)].id);
         return;
     }
     if (id >= CMD_EDIT_RECORD_FIRST && id < CMD_EDIT_RECORD_FIRST + CMD_RANGE) { EditRow(id - CMD_EDIT_RECORD_FIRST); return; }
@@ -3912,10 +5347,18 @@ void Command(int id) {
         return;
     }
     switch (id) {
-    case CMD_PREV_DAY: Navigate(-1); break;
-    case CMD_NEXT_DAY: Navigate(1); break;
-    case CMD_TODAY: GoToDay(Now()); break;
+    case CMD_PREV_DAY: if (app.view) ShiftPeriodBy(-1); else Navigate(-1); break;
+    case CMD_NEXT_DAY: if (app.view) ShiftPeriodBy(1); else Navigate(1); break;
+    case CMD_TODAY: if (app.view) CurrentPeriod(); else GoToDay(Now()); break;
+    case CMD_VIEW_DAY: SetView(0); break;
+    case CMD_VIEW_STATS: SetView(1); break;
+    case CMD_VIEW_TOGGLE: SetView(app.view ? 0 : 1); break;
+    case CMD_RANGE_WEEK: case CMD_RANGE_MONTH: case CMD_RANGE_YEAR:
+        if (!app.view) SetView(1);
+        SetRange(id - CMD_RANGE_WEEK);
+        break;
     case CMD_NEW_TAG: NewTag(); break;
+    case CMD_NEW_CATEGORY: NewCategory(); break;
     case CMD_EDIT_TAG: EditTag(app.selectedTagId ? app.selectedTagId : app.model.lastUsedTag()); break;
     case CMD_DELETE_TAG: DeleteTag(app.selectedTagId); break;
     case CMD_TOGGLE:
@@ -3968,20 +5411,39 @@ void Command(int id) {
     case CMD_SHORTCUTS: ShowShortcuts(); break;
     case CMD_ABOUT: ShowAbout(); break;
     case CMD_MENU: {
-        POINT pt{S(300), S(60)};
+        POINT pt{S(300), S(48)};
+        for (const auto& h : app.hits) if (h.id == Hid(HK_MENU)) pt = POINT{h.rect.left, h.rect.bottom + S(4)};
         ClientToScreen(app.hwnd, &pt);
         ShowMainMenu(pt);
         break;
     }
+    case CMD_SYSTEM_TITLEBAR:
+        app.customFrame = !app.customFrame;
+        SaveSetting(L"window", L"systemTitleBar", app.customFrame ? 0 : 1);
+        app.captionHot = app.captionPressed = 0;
+        SetWindowPos(app.hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOACTIVATE);
+        InvalidateRect(app.hwnd, nullptr, FALSE);
+        ShowToast(app.customFrame ? L"已使用时光账本的标题栏" : L"已切换为系统标题栏");
+        break;
     default: break;
     }
 }
 
+// The scroll position, content height and view of a scrollable list.
+struct ScrollState { int* scroll; int content; RECT view; };
+ScrollState ScrollOf(int kind) {
+    switch (kind) {
+    case HK_TAG_SCROLL: return {&app.tagScroll, app.tagContent, app.layout.tagsList};
+    case HK_BREAKDOWN_SCROLL: return {&app.breakdownScroll, app.breakdownContent, app.layout.breakdownList};
+    default: return {&app.recordScroll, app.recordContent, app.layout.recordsList};
+    }
+}
+
 void ScrollList(int kind, int delta) {
-    int& scroll = kind == HK_TAG_SCROLL ? app.tagScroll : app.recordScroll;
-    const int content = kind == HK_TAG_SCROLL ? app.tagContent : app.recordContent;
-    const RECT& view = kind == HK_TAG_SCROLL ? app.layout.tagsList : app.layout.recordsList;
-    const int next = std::clamp(scroll + delta, 0, std::max(0, content - Ht(view)));
+    const auto state = ScrollOf(kind);
+    int& scroll = *state.scroll;
+    const int next = std::clamp(scroll + delta, 0, std::max(0, state.content - Ht(state.view)));
     if (next != scroll) {
         scroll = next;
         app.tipVisible = false;
@@ -4027,6 +5489,8 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         app.selectedTagId = app.model.lastUsedTag();
         app.lastTick = Now();
         Refresh();
+        if (app.upgraded && !app.readOnly)
+            ShowToast(L"标签现在按大类分组：右键大类可以改名、换色，或把标签统一成同色系", TOAST_PLAIN, 15);
         SetTimer(window, TID_TICK, 1000, nullptr);
         return 0;
     case WM_DL_ACTIVATE:
@@ -4067,6 +5531,11 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         case Q_TOPMOST: return app.topmost;
         case Q_TRAY: return app.trayAdded;
         case Q_CALENDAR: return app.calendar != nullptr;
+        case Q_CATEGORIES: return static_cast<LRESULT>(app.model.categories.size());
+        case Q_VIEW: return app.view;
+        case Q_RANGE: return app.range;
+        case Q_PERIOD_TOTAL: return app.view ? static_cast<LRESULT>(app.period.total.total) : -1;
+        case Q_PERIOD_START: return app.view ? static_cast<LRESULT>(app.period.start) : -1;
         default: return -1;
         }
     case WM_SIZE:
@@ -4083,9 +5552,92 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         static AdjustDpi adjust = LoadProc<AdjustDpi>(GetModuleHandleW(L"user32.dll"), "AdjustWindowRectExForDpi");
         if (adjust) adjust(&r, WS_OVERLAPPEDWINDOW, FALSE, 0, app.dpi);
         else AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
-        info->ptMinTrackSize = POINT{Wd(r), Ht(r)};
+        // Our own title bar: the frame keeps its sides and bottom, the caption and top border go.
+        info->ptMinTrackSize = POINT{Wd(r), app.customFrame ? r.bottom : Ht(r)};
         return 0;
     }
+    case WM_NCCALCSIZE:
+        if (wp && app.customFrame) {
+            auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
+            const LONG top = params->rgrc[0].top;
+            const LRESULT result = DefWindowProcW(window, message, wp, lp);   // sides and bottom as usual
+            if (result != 0) return result;
+            // No caption: the client area reaches the top. A maximised window hangs over the screen
+            // edge by its frame, so keep that much out of view.
+            params->rgrc[0].top = top + (IsZoomed(window) ? ResizeBorder() : 0);
+            return 0;
+        }
+        break;
+    case WM_NCHITTEST: {
+        if (!app.customFrame) break;
+        const LRESULT hit = DefWindowProcW(window, message, wp, lp);
+        if (hit != HTCLIENT) return hit;
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(window, &pt);
+        RECT client{};
+        GetClientRect(window, &client);
+        const int button = CaptionButtonAt(pt, client.right);
+        if (!IsZoomed(window) && pt.y < (button ? S(2) : ResizeBorder())) {
+            const int corner = ResizeBorder() * 2;
+            return pt.x < corner ? HTTOPLEFT : pt.x >= client.right - corner ? HTTOPRIGHT : HTTOP;
+        }
+        if (pt.y >= TitleHeight() || app.modal) return HTCLIENT;
+        if (button) return button;
+        return HitAt(pt) ? HTCLIENT : HTCAPTION;      // empty title bar drags the window
+    }
+    case WM_NCMOUSEMOVE: {
+        if (!app.customFrame) break;
+        const int hit = wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE ? static_cast<int>(wp) : 0;
+        if (!app.ncTracking) {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE | TME_NONCLIENT, window, 0};
+            TrackMouseEvent(&track);
+            app.ncTracking = true;
+        }
+        if (app.hot) SetHot(0);
+        if (hit != app.captionHot) {
+            app.captionHot = hit;
+            if (!hit) app.captionPressed = 0;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        if (hit) return 0;
+        break;
+    }
+    case WM_NCMOUSELEAVE:
+        app.ncTracking = false;
+        if (app.captionHot || app.captionPressed) {
+            app.captionHot = app.captionPressed = 0;
+            InvalidateRect(window, nullptr, FALSE);
+        }
+        break;
+    case WM_NCLBUTTONDOWN:
+    case WM_NCLBUTTONDBLCLK:
+        if (app.customFrame && (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE)) {
+            app.captionPressed = app.captionHot = static_cast<int>(wp);
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;                   // the system would draw its own (classic) buttons
+        }
+        break;
+    case WM_NCLBUTTONUP:
+        if (app.customFrame && (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE)) {
+            const bool clicked = app.captionPressed == static_cast<int>(wp);
+            app.captionPressed = app.captionHot = 0;
+            InvalidateRect(window, nullptr, FALSE);
+            if (clicked) {
+                if (wp == HTMINBUTTON) ShowWindow(window, SW_MINIMIZE);
+                else if (wp == HTMAXBUTTON) ShowWindow(window, IsZoomed(window) ? SW_RESTORE : SW_MAXIMIZE);
+                else PostMessageW(window, WM_SYSCOMMAND, SC_CLOSE, 0);
+            }
+            return 0;
+        }
+        break;
+    case WM_NCRBUTTONDOWN:
+    case WM_NCRBUTTONUP:
+        if (app.customFrame && (wp == HTMINBUTTON || wp == HTMAXBUTTON || wp == HTCLOSE)) return 0;
+        break;
+    case WM_ACTIVATEAPP:
+        app.active = wp != FALSE;
+        InvalidateRect(window, nullptr, FALSE);
+        break;
     case WM_DPICHANGED: {
         app.dpi = HIWORD(wp);
         app.fonts.Create(app.dpi, app.numberFace);
@@ -4111,6 +5663,8 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         app.lastTick = now;
         if (today != app.lastDaySeen) {
             if (app.chosenDay == app.lastDaySeen) app.chosenDay = today;
+            if (app.periodStart && app.periodStart == PeriodStart(app.range, app.lastDaySeen))
+                app.periodStart = PeriodStart(app.range, today);
             app.lastDaySeen = today;
         }
         if (!app.toast.empty() && now > app.toastUntil) {
@@ -4144,12 +5698,12 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         if (app.dragKind) {
-            const RECT& view = app.dragKind == HK_TAG_SCROLL ? app.layout.tagsList : app.layout.recordsList;
-            const int content = app.dragKind == HK_TAG_SCROLL ? app.tagContent : app.recordContent;
-            const int viewH = Ht(view);
+            const auto state = ScrollOf(app.dragKind);
+            const int content = state.content;
+            const int viewH = Ht(state.view);
             const int thumbH = std::max(S(28), static_cast<int>(static_cast<long long>(viewH) * viewH / std::max(1, content)));
             const int track = std::max(1, viewH - thumbH);
-            int& scroll = app.dragKind == HK_TAG_SCROLL ? app.tagScroll : app.recordScroll;
+            int& scroll = *state.scroll;
             const int target = app.dragStartScroll + static_cast<int>(
                 static_cast<long long>(pt.y - app.dragStartY) * (content - viewH) / track);
             const int clamped = std::clamp(target, 0, std::max(0, content - viewH));
@@ -4174,16 +5728,17 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         const int id = HitAt(pt);
         const int kind = KindOf(id);
         // A double click on a tag or record must not undo the first click's action.
-        if (message == WM_LBUTTONDBLCLK && kind != HK_PREV && kind != HK_NEXT) {
+        if (message == WM_LBUTTONDBLCLK && kind != HK_PREV && kind != HK_NEXT && kind != HK_PERIOD_PREV &&
+            kind != HK_PERIOD_NEXT) {
             app.pressed = 0;
             return 0;
         }
         app.pressed = id;
         app.tipVisible = false;
-        if (kind == HK_TAG_SCROLL || kind == HK_RECORD_SCROLL) {
+        if (kind == HK_TAG_SCROLL || kind == HK_RECORD_SCROLL || kind == HK_BREAKDOWN_SCROLL) {
             app.dragKind = kind;
             app.dragStartY = pt.y;
-            app.dragStartScroll = kind == HK_TAG_SCROLL ? app.tagScroll : app.recordScroll;
+            app.dragStartScroll = *ScrollOf(kind).scroll;
         }
         if (id) SetCapture(window);
         InvalidateRect(window, nullptr, FALSE);
@@ -4218,6 +5773,9 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         ClientToScreen(window, &screen);
         switch (KindOf(id)) {
         case HK_TAG: case HK_TAG_EDIT: ShowTagMenu(IndexOf(id), screen); break;
+        case HK_CAT_HEADER: case HK_CAT_ADD: case HK_CAT_EDIT: case HK_CAT_EMPTY:
+            ShowCategoryMenu(IndexOf(id), screen);
+            break;
         case HK_RECORD: case HK_RECORD_EDIT: case HK_RECORD_DELETE: case HK_SEGMENT:
             ShowRecordMenu(IndexOf(id), screen);
             break;
@@ -4229,8 +5787,9 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         ScreenToClient(window, &pt);
         const int delta = -GET_WHEEL_DELTA_WPARAM(wp);
-        if (PtInRect(&app.layout.tagsList, pt)) ScrollList(HK_TAG_SCROLL, delta * S(54) / WHEEL_DELTA);
+        if (PtInRect(&app.layout.tagsList, pt)) ScrollList(HK_TAG_SCROLL, delta * S(kTagRowHeight) / WHEEL_DELTA);
         else if (PtInRect(&app.layout.recordsList, pt)) ScrollList(HK_RECORD_SCROLL, delta * S(46) / WHEEL_DELTA);
+        else if (PtInRect(&app.layout.breakdownList, pt)) ScrollList(HK_BREAKDOWN_SCROLL, delta * S(36) / WHEEL_DELTA);
         return 0;
     }
     case WM_ERASEBKGND: return 1;
@@ -4341,7 +5900,7 @@ HACCEL CreateAccelerators() {
         {FVIRTKEY | FCONTROL, 'N', CMD_NEW_TAG}, {FVIRTKEY | FCONTROL, 'B', CMD_ADD_RECORD},
         {FVIRTKEY | FCONTROL, 'Z', CMD_UNDO}, {FVIRTKEY | FCONTROL, 'S', CMD_RETRY_SAVE},
         {FVIRTKEY, 'P', CMD_POMODORO_TOGGLE}, {FVIRTKEY, 'S', CMD_POMODORO_SKIP},
-        {FVIRTKEY, 'R', CMD_POMODORO_ABANDON}, {FVIRTKEY, 'M', CMD_MINI},
+        {FVIRTKEY, 'R', CMD_POMODORO_ABANDON}, {FVIRTKEY, 'M', CMD_MINI}, {FVIRTKEY, 'V', CMD_VIEW_TOGGLE},
         {FVIRTKEY | FCONTROL, 'Q', CMD_EXIT}, {FVIRTKEY | FCONTROL, 'W', CMD_CLOSE},
     };
     for (int i = 0; i < 9; ++i) {
@@ -4399,7 +5958,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     if (!app.iconBig) app.iconBig = LoadIconW(nullptr, IDI_APPLICATION);
     if (!app.iconSmall) app.iconSmall = app.iconBig;
 
-    for (const wchar_t* name : {L"DayLedgerTagEditor", L"DayLedgerRecordEditor", L"DayLedgerPomodoroSettings"}) {
+    for (const wchar_t* name : {L"DayLedgerTagEditor", L"DayLedgerCategoryEditor", L"DayLedgerRecordEditor",
+                                L"DayLedgerPomodoroSettings"}) {
         WNDCLASSEXW dialog{};
         dialog.cbSize = sizeof(dialog);
         dialog.style = CS_DBLCLKS;
@@ -4460,6 +6020,9 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     if (!window) return 14;
     if (key) SetPropW(window, L"DayLedgerKey", reinterpret_cast<HANDLE>(key));
     ApplyFrame(window, app.pal.bg);
+    if (app.customFrame)                     // recompute the frame now that the window exists
+        SetWindowPos(window, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                     SWP_NOACTIVATE);
     bool maximized = false;
     RestorePlacement(maximized);
     if (show == SW_SHOWNORMAL || show == SW_SHOWDEFAULT || show == SW_SHOW) show = maximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;

@@ -31,7 +31,6 @@ struct Palette {
     COLORREF accent, accentHover, accentPressed, accentSoft, accentText, onAccent;
     COLORREF danger, dangerSoft;
     COLORREF track, grid;
-    COLORREF category[3];               // work, play, other
     COLORREF tipBg, tipText, toastBg, toastText, toastAction;
     BYTE shadow;                        // alpha of the card drop shadow (0 = none)
 };
@@ -49,9 +48,6 @@ inline Palette LightPalette() {
     p.accentText = RGB(67, 78, 200); p.onAccent = RGB(255, 255, 255);
     p.danger = RGB(208, 59, 59);     p.dangerSoft = RGB(253, 236, 236);
     p.track = RGB(238, 240, 244);    p.grid = RGB(233, 235, 240);
-    p.category[0] = RGB(0x2a, 0x78, 0xd6);   // blue
-    p.category[1] = RGB(0xeb, 0x68, 0x34);   // orange
-    p.category[2] = RGB(0x1b, 0xaf, 0x7a);   // aqua
     p.tipBg = RGB(31, 35, 43);       p.tipText = RGB(245, 246, 248);
     p.toastBg = RGB(31, 35, 43);     p.toastText = RGB(245, 246, 248);
     p.toastAction = RGB(158, 168, 255);
@@ -72,9 +68,6 @@ inline Palette DarkPalette() {
     p.accentText = RGB(160, 170, 255); p.onAccent = RGB(255, 255, 255);
     p.danger = RGB(240, 106, 106);   p.dangerSoft = RGB(58, 34, 38);
     p.track = RGB(38, 42, 50);       p.grid = RGB(42, 46, 54);
-    p.category[0] = RGB(0x39, 0x87, 0xe5);
-    p.category[1] = RGB(0xd9, 0x59, 0x26);
-    p.category[2] = RGB(0x19, 0x9e, 0x70);
     p.tipBg = RGB(48, 53, 63);       p.tipText = RGB(242, 244, 247);
     p.toastBg = RGB(48, 53, 63);     p.toastText = RGB(242, 244, 247);
     p.toastAction = RGB(165, 173, 255);

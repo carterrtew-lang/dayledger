@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <set>
 #include <iterator>
 #include <stdexcept>
 
@@ -43,19 +44,25 @@ std::uint64_t number(const std::vector<unsigned char>& bytes, std::size_t offset
 void put(std::vector<unsigned char>& bytes, std::size_t offset, std::uint64_t value, unsigned size) {
     for (unsigned i = 0; i < size; ++i) bytes.at(offset + i) = (value >> (8 * i)) & 255;
 }
-// Rewrites a TRACKER3 file as TRACKER2 (no session flags) or TRACKER1 (also no checkpoint).
+// Rewrites a TRACKER4 file in an older layout: TRACKER3 has no category table (the default
+// categories are implied), TRACKER2 no session flags either, TRACKER1 also no checkpoint.
 std::vector<unsigned char> downgrade(const std::vector<unsigned char>& bytes, char version) {
-    std::vector<unsigned char> out(bytes.begin(), bytes.begin() + 12);
+    std::vector<unsigned char> out(bytes.begin(), bytes.begin() + 8);
     out[7] = static_cast<unsigned char>(version);
     std::size_t cursor = 12;
     for (std::uint64_t i = 0; i < number(bytes, 8, 4); ++i)
+        cursor += 12 + static_cast<std::size_t>(number(bytes, cursor + 8, 4));
+    const std::size_t tagsStart = cursor;
+    cursor += 4;
+    for (std::uint64_t i = 0; i < number(bytes, tagsStart, 4); ++i)
         cursor += 16 + static_cast<std::size_t>(number(bytes, cursor + 12, 4));
-    out.insert(out.end(), bytes.begin() + 12, bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 4));
+    out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(tagsStart),
+               bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 4));
     const auto sessions = number(bytes, cursor, 4);
     cursor += 4;
     for (std::uint64_t i = 0; i < sessions; ++i, cursor += 24)
         out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
-                   bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 20));
+                   bytes.begin() + static_cast<std::ptrdiff_t>(cursor + (version >= '3' ? 24 : 20)));
     out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
                bytes.begin() + static_cast<std::ptrdiff_t>(cursor + (version == '1' ? 12 : 20)));
     return out;
@@ -75,13 +82,13 @@ void timingTests() {
     model.stop(200);
     model.stop(220);
     auto stats = model.stats(0, 300, 300);
-    check(stats.work == 60 && stats.play == 40 && stats.other == 0 && stats.total == 100,
+    check(stats.ofCategory(0) == 60 && stats.ofCategory(1) == 40 && stats.ofCategory(2) == 0 && stats.total == 100,
           "switch and stop totals");
     check(stats.byTag[1] == 60 && stats.byTag[2] == 40, "per-tag totals");
     check(model.activeTagId == 0 && model.activeSince == 0 && model.sessions.size() == 2,
           "stop is idempotent");
     model.start(3, 250);
-    check(model.stats(0, 400, 275).other == 25, "active segment counted");
+    check(model.stats(0, 400, 275).ofCategory(2) == 25, "active segment counted");
     model.stop(300);
     check(model.stats(0, 400, 400).total == 150, "pause gaps excluded");
     check(model.stats(0, 400, 180).total == 80, "closed intervals clipped to now");
@@ -115,32 +122,33 @@ void timingTests() {
     midnight.start(2, 86430);
     auto first = midnight.stats(0, 86400, 86490);
     auto second = midnight.stats(86400, 172800, 86490);
-    check(first.work == 30 && first.total == 30, "previous day intersection");
-    check(second.work == 30 && second.play == 60 && second.total == 90, "next day and active intersection");
+    check(first.ofCategory(0) == 30 && first.total == 30, "previous day intersection");
+    check(second.ofCategory(0) == 30 && second.ofCategory(1) == 60 && second.total == 90,
+          "next day and active intersection");
     midnight.stop(86520);
     check(midnight.stats(86400, 86460, 90000).total == 60, "arbitrary day boundary intersection");
 }
 
 void tagTests() {
     tracker::Model model;
-    const int id = model.addTag(L"\u9605\u8bfb", 0x00563412u, tracker::Category::Other);
+    const int id = model.addTag(L"\u9605\u8bfb", 0x00563412u, 2);
     check(id == 4 && model.findTag(id)->color == 0x00563412u, "add tag preserves COLORREF");
-    check(model.updateTag(id, L"Reading", 0x00112233u, tracker::Category::Work), "update tag");
-    check(model.findTag(id)->category == tracker::Category::Work, "updated category");
-    check(!model.updateTag(999, L"Missing", 0, tracker::Category::Work), "unknown update fails");
-    check(model.addTag(L"", 0, tracker::Category::Work) == 0, "empty tag rejected");
-    check(model.addTag(L"Bad", 0xFF000000u, tracker::Category::Work) == 0, "invalid color rejected");
-    check(model.addTag(L"Bad", 0, static_cast<tracker::Category>(3)) == 0, "invalid category rejected");
-    check(model.addTag(std::wstring(4097, L'x'), 0, tracker::Category::Work) == 0, "oversize name rejected");
-    check(model.addTag(std::wstring(1, wchar_t(0xD800)), 0, tracker::Category::Work) == 0,
+    check(model.updateTag(id, L"Reading", 0x00112233u, 0), "update tag");
+    check(model.findTag(id)->category == 0, "updated category");
+    check(!model.updateTag(999, L"Missing", 0, 0), "unknown update fails");
+    check(model.addTag(L"", 0, 0) == 0, "empty tag rejected");
+    check(model.addTag(L"Bad", 0xFF000000u, 0) == 0, "invalid color rejected");
+    check(model.addTag(L"Bad", 0, 3) == 0, "invalid category rejected");
+    check(model.addTag(std::wstring(4097, L'x'), 0, 0) == 0, "oversize name rejected");
+    check(model.addTag(std::wstring(1, wchar_t(0xD800)), 0, 0) == 0,
           "unpaired surrogate rejected");
-    check(model.addTag(std::wstring(L"a\0b", 3), 0, tracker::Category::Work) == 0, "embedded NUL rejected");
+    check(model.addTag(std::wstring(L"a\0b", 3), 0, 0) == 0, "embedded NUL rejected");
     model.start(id, 10);
     check(!model.removeTag(id), "active tag cannot be removed");
     model.stop(20);
     check(!model.removeTag(id), "referenced tag cannot be removed");
-    check(model.updateTag(id, L"Renamed", 0, tracker::Category::Play), "referenced tag editable");
-    check(model.stats(0, 30, 30).play == 10, "history uses current tag category");
+    check(model.updateTag(id, L"Renamed", 0, 1), "referenced tag editable");
+    check(model.stats(0, 30, 30).ofCategory(1) == 10, "history uses current tag category");
     check(model.removeTag(3) && !model.findTag(3), "unused tag removable");
     check(!model.removeTag(999), "unknown remove fails");
 }
@@ -194,9 +202,12 @@ void editingTests() {
     model.stop(1200);
     check(model.updateActive(1, 1100, 1300).status == EditStatus::NotRunning, "nothing running");
 
-    check(model.moveTag(3, -1) && model.tags[1].id == 3 && model.tagIndex(3) == 1, "move tag up");
-    check(!model.moveTag(1, -1) && !model.moveTag(99, 1), "move tag at edge or unknown");
-    check(model.moveTag(3, 1) && model.tags[2].id == 3, "move tag down");
+    const int extra = model.addTag(L"Extra", 0x00112233u, 0);   // tags: 1(c0) 2(c1) 3(c2) extra(c0)
+    check(model.moveTag(extra, -1) && model.tags[0].id == extra && model.tagIndex(1) == 3,
+          "move tag up within its category");
+    check(!model.moveTag(extra, -1) && !model.moveTag(99, 1) && !model.moveTag(2, 1),
+          "move tag at the edge of its category or unknown");
+    check(model.moveTag(extra, 1) && model.tags[3].id == extra, "move tag down within its category");
 }
 
 void flagTests(const std::filesystem::path& directory) {
@@ -245,7 +256,7 @@ void pomodoroTests() {
     check(e.focusCompleted && e.breakStarted && !e.longBreak && e.restTagCreated, "focus completes into a break");
     const int rest = p.restTag;
     check(rest == 4 && m.findTag(rest)->name == L"\u4f11\u606f" &&
-          m.findTag(rest)->category == tracker::Category::Other, "rest tag created");
+          m.findTag(rest)->category == 2, "rest tag created");
     check(m.sessions.size() == 1 && m.sessions[0].start == 1000 && m.sessions[0].end == 1100 &&
           m.sessions[0].flags == flag, "completed focus flagged at the exact end");
     check(m.activeTagId == rest && m.activeSince == 1100 && p.phaseEnd == 1120, "break records to the rest tag");
@@ -320,7 +331,7 @@ void pomodoroTests() {
     check(p.phase == PomodoroPhase::Ready && m.activeTagId == 3, "leaving pomodoro mode keeps recording");
 
     tracker::Model fresh;
-    fresh.addTag(L"\u4f11\u606f", 0x123456u, tracker::Category::Play);
+    fresh.addTag(L"\u4f11\u606f", 0x123456u, 1);
     tracker::Pomodoro q;
     q.config = {10, 5, 5, 4, false};
     q.focus(fresh, 1, 100);
@@ -330,12 +341,138 @@ void pomodoroTests() {
     check(fresh.findTag(1) && !q.focus(fresh, 99, 120).any(), "unknown tag ignored");
 }
 
+bool sameHue(unsigned a, unsigned b) {
+    const double d = std::abs(tracker::ToOklch(a).h - tracker::ToOklch(b).h);
+    return std::min(d, 2 * 3.14159265358979 - d) < 0.12;
+}
+
+void categoryTests(const std::filesystem::path& directory) {
+    tracker::Model m;
+    check(m.categories.size() == 3 && m.findCategory(0)->name == L"\u5de5\u4f5c" && m.categoryIndex(2) == 2,
+          "default categories");
+    const int study = m.addCategory(L"\u5b66\u4e60", 0x00D65062u);
+    check(study == 3 && m.findCategory(study)->color == 0x00D65062u, "add category");
+    check(m.addCategory(L"", 0) == -1 && m.addCategory(L"Bad", 0x01000000u) == -1, "invalid category rejected");
+    check(m.addTag(L"Lost", 0, 42) == 0, "tag needs an existing category");
+
+    const auto family = tracker::ColorFamily(0x00D6782Au);
+    check(family.size() == 8 && std::count(family.begin(), family.end(), 0x00D6782Au) == 1 &&
+          tracker::ToOklch(family.front()).L < tracker::ToOklch(family.back()).L, "family: base included, deep to light");
+    check(std::all_of(family.begin(), family.end(), [](unsigned c) { return sameHue(c, 0x00D6782Au); }) &&
+          std::set<unsigned>(family.begin(), family.end()).size() == 8, "family keeps the hue, all distinct");
+    const auto grey = tracker::ColorFamily(0x00808080u);
+    check(std::set<unsigned>(grey.begin(), grey.end()).size() == 8, "a grey family varies lightness");
+
+    const int a = m.addTag(L"\u5199\u7814\u62a5", m.nextTagColor(0), 0);
+    const int b = m.addTag(L"\u5f00\u4f1a", m.nextTagColor(0), 0);
+    const unsigned work = m.findCategory(0)->color;
+    check(a && b && m.findTag(a)->color != work && m.findTag(b)->color != work &&
+          m.findTag(a)->color != m.findTag(b)->color && sameHue(m.findTag(a)->color, work) &&
+          sameHue(m.findTag(b)->color, work), "new tags take unused shades of the category colour");
+    check(m.nextTagColor(study) == 0x00D65062u, "first tag of a category gets the category colour");
+
+    m.start(a, 100);
+    m.start(b, 160);
+    m.start(2, 200);
+    m.stop(260);
+    const auto stats = m.stats(0, 1000, 1000);
+    check(stats.ofCategory(0) == 100 && stats.ofCategory(1) == 60 && stats.ofCategory(study) == 0 &&
+          stats.ofTag(a) == 60 && stats.total == 160, "stats by category");
+
+    // tags: 1(c0) 2(c1) 3(c2) a(c0) b(c0)
+    check(m.moveTag(b, -1) && m.tags[3].id == b && m.tags[4].id == a, "move tag within its category");
+    check(m.moveTag(b, -1) && m.tags[0].id == b && m.tags[3].id == 1, "moving skips other categories");
+    check(!m.moveTag(b, -1) && !m.moveTag(2, 1) && !m.moveTag(2, -1), "edges of a category");
+
+    check(m.updateCategory(0, L"Work", 0x003468EBu) && !m.updateCategory(99, L"X", 0), "update category");
+    m.recolorCategory(0);
+    std::vector<unsigned> colors;
+    for (const auto& tag : m.tags) if (tag.category == 0) colors.push_back(tag.color);
+    check(colors.size() == 3 && colors[0] == 0x003468EBu && std::set<unsigned>(colors.begin(), colors.end()).size() == 3 &&
+          std::all_of(colors.begin(), colors.end(), [](unsigned c) { return sameHue(c, 0x003468EBu); }),
+          "recolouring gives the category's tags distinct shades, the first its colour");
+
+    check(m.moveCategory(study, -1) && m.categories[2].id == study && !m.moveCategory(0, -1), "reorder categories");
+    const int maths = m.addTag(L"Maths", m.nextTagColor(study), study);
+    check(!m.removeCategory(study, study) && !m.removeCategory(study, 99) && !m.removeCategory(99, 0),
+          "removal needs another existing category");
+    check(m.removeCategory(study, 2) && !m.findCategory(study) && m.findTag(maths)->category == 2,
+          "removing a category moves its tags");
+    tracker::Model one;
+    check(one.removeCategory(1, 0) && one.removeCategory(2, 0) && !one.removeCategory(0, 0) &&
+          one.categories.size() == 1 && one.tagsIn(0) == 3, "the last category stays");
+
+    const auto path = directory / L"categories.dat";
+    check(m.save(path.wstring()), "save categories");
+    tracker::Model loaded;
+    check(loaded.load(path.wstring()) && loaded.categories.size() == m.categories.size() &&
+          loaded.categories[0].name == L"Work" && loaded.categories[0].color == 0x003468EBu &&
+          loaded.findTag(maths)->category == 2 && loaded.tags.size() == m.tags.size(), "categories roundtrip");
+    auto invalid = m;
+    invalid.tags[0].category = 42;
+    check(!invalid.save(path.wstring()), "tag with a missing category rejected on save");
+    invalid = m;
+    invalid.categories.push_back(invalid.categories[0]);
+    check(!invalid.save(path.wstring()), "duplicate category id rejected on save");
+}
+
+// statsBetween() and hoursByCategory(): the per-range numbers the statistics page draws.
+void rangeTests() {
+    tracker::Model m;
+    const int game = m.addTag(L"\u6e38\u620f", m.nextTagColor(1), 1);
+    const long long now = 100000;
+    check(m.addSession(1, 100, 400, now).status == tracker::EditStatus::Ok, "range fixture 1");
+    check(m.addSession(game, 500, 700, now).status == tracker::EditStatus::Ok, "range fixture 2");
+    check(m.addSession(1, 800, 1000, now, tracker::SessionPomodoro).status == tracker::EditStatus::Ok, "range fixture 3");
+    m.start(3, 1100);
+    const std::vector<long long> bounds{0, 600, 1000, 2000};
+    const auto ranges = m.statsBetween(bounds, 1300);
+    check(ranges.size() == 3, "one result per range");
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto single = m.stats(bounds[i], bounds[i + 1], 1300);
+        check(ranges[i].total == single.total && ranges[i].byTag == single.byTag &&
+              ranges[i].byCategory == single.byCategory && ranges[i].pomodoros == single.pomodoros,
+              "statsBetween matches stats per range");
+    }
+    check(ranges[0].ofTag(game) == 100 && ranges[1].ofTag(game) == 100, "a record split at a boundary");
+    check(ranges[1].pomodoros == 1 && ranges[2].pomodoros == 0, "a pomodoro counts where it ended");
+    check(ranges[2].ofCategory(2) == 200, "the running segment up to now");
+    check(m.statsBetween({0}, now).empty() && m.statsBetween({}, now).empty(), "no ranges");
+    check(m.statsBetween({5000, 6000}, 1300).at(0).total == 0, "a range after every record");
+    check(m.statsBetween({5000, 6000}, now).at(0).ofCategory(2) == 1000, "the running segment fills later ranges");
+    check(m.statsBetween({0, 600}, 300).at(0).total == 200, "clipped to now");
+
+    // hours: two 24-hour days (86400 s), a day of 23 hours spread evenly, the running segment
+    tracker::Model h;
+    const long long day = 86400;
+    check(h.addSession(1, 3600 + 1800, 2 * 3600 + 600, 10 * day).status == tracker::EditStatus::Ok, "hour fixture 1");
+    check(h.addSession(2, day - 1800, day + 1800, 10 * day).status == tracker::EditStatus::Ok, "hour fixture 2");
+    const auto hours = h.hoursByCategory({0, day, 2 * day}, 10 * day);
+    check(hours.at(0)[1] == 1800 && hours.at(0)[2] == 600 && hours.at(0)[0] == 0, "work split at the hour");
+    check(hours.at(1)[23] == 1800 && hours.at(1)[0] == 1800, "a record across midnight");
+    long long sum = 0;
+    for (const auto& entry : hours) for (long long seconds : entry.second) sum += seconds;
+    check(sum == 2400 + 3600, "every second lands in one hour");
+    tracker::Model dst;
+    const long long shortDay = 23 * 3600;
+    check(dst.addSession(1, 0, shortDay, 10 * day).status == tracker::EditStatus::Ok, "dst fixture");
+    const auto spread = dst.hoursByCategory({0, shortDay}, 10 * day);
+    long long dstSum = 0;
+    bool even = true;
+    for (long long seconds : spread.at(0)) { dstSum += seconds; even = even && seconds >= 3449 && seconds <= 3451; }
+    check(dstSum == shortDay && even, "a 23-hour day spreads over 24 hours");
+    tracker::Model running;
+    running.start(1, 7200);
+    check(running.hoursByCategory({0, day}, 7200 + 900).at(0)[2] == 900, "running segment by hour");
+    check(running.hoursByCategory({0}, 9000).empty(), "no days, no hours");
+}
+
 void persistenceTests(const std::filesystem::path& directory) {
     const auto path = directory / L"\u65f6\u95f4-\u8bb0\u5f55.bin";
     const auto corruptPath = directory / L"corrupt.bin";
     tracker::Model original;
     const std::wstring unicode = L"\u4e13\u6ce8 \U0001F345 \u00e9\n\"\t";
-    const int id = original.addTag(unicode, 0x00ABCDEFu, tracker::Category::Other);
+    const int id = original.addTag(unicode, 0x00ABCDEFu, 2);
     original.start(1, 100);
     original.start(id, 200);
     original.stop(300);
@@ -355,10 +492,16 @@ void persistenceTests(const std::filesystem::path& directory) {
           "stopped state roundtrip");
     check(original.save(path.wstring()), "restore fixture");
     const auto valid = readBytes(path);
-    check(valid.size() > 8 && valid[0] == 'T' && valid[7] == '3', "versioned persistence");
-    std::vector<std::size_t> tagOffsets;
+    check(valid.size() > 8 && valid[0] == 'T' && valid[7] == '4', "versioned persistence");
+    std::vector<std::size_t> categoryOffsets, tagOffsets;
     std::size_t cursor = 12;
     for (std::uint64_t i = 0; i < number(valid, 8, 4); ++i) {
+        categoryOffsets.push_back(cursor);
+        cursor += 12 + static_cast<std::size_t>(number(valid, cursor + 8, 4));
+    }
+    const auto tagCountOffset = cursor;
+    cursor += 4;
+    for (std::uint64_t i = 0; i < number(valid, tagCountOffset, 4); ++i) {
         tagOffsets.push_back(cursor);
         cursor += 16 + static_cast<std::size_t>(number(valid, cursor + 12, 4));
     }
@@ -371,14 +514,19 @@ void persistenceTests(const std::filesystem::path& directory) {
         check(loaded.activeTagId == 0 && loaded.sessions.size() == 3 && loaded.findTag(id)->name == unicode,
               "failed load leaves model unchanged");
     };
-    auto bad = valid; bad[7] = '4'; rejects(bad);
+    auto bad = valid; bad[7] = '5'; rejects(bad);
     bad = valid; put(bad, activeOffset + 12, ~std::uint64_t(0), 8); rejects(bad);
     bad = valid; put(bad, activeOffset + 12, 253402300800ULL, 8); rejects(bad);
     bad = valid; bad.push_back(0); rejects(bad);
     for (const auto length : {std::size_t(0), std::size_t(7), std::size_t(11),
                               valid.size() / 2, valid.size() - 1})
         rejects(std::vector<unsigned char>(valid.begin(), valid.begin() + length));
-    bad = valid; put(bad, 8, 4097, 4); rejects(bad);
+    bad = valid; put(bad, 8, 0, 4); rejects(bad);
+    bad = valid; put(bad, 8, 65, 4); rejects(bad);
+    bad = valid; put(bad, categoryOffsets[1], 0, 4); rejects(bad);
+    bad = valid; put(bad, categoryOffsets[0] + 4, 0xFFFFFFFFu, 4); rejects(bad);
+    bad = valid; put(bad, categoryOffsets[0] + 8, 0, 4); rejects(bad);
+    bad = valid; put(bad, tagCountOffset, 4097, 4); rejects(bad);
     bad = valid; put(bad, countOffset, 1000001, 4); rejects(bad);
     bad = valid; put(bad, tagOffsets[0], 0, 4); rejects(bad);
     bad = valid; put(bad, tagOffsets[1], 1, 4); rejects(bad);
@@ -401,12 +549,13 @@ void persistenceTests(const std::filesystem::path& directory) {
     bad = valid; put(bad, activeOffset, 0, 4); rejects(bad);
     bad = valid; put(bad, activeOffset + 4, ~std::uint64_t(0), 8); rejects(bad);
 
-    for (const char version : {'2', '1'}) {
+    for (const char version : {'3', '2', '1'}) {
         writeBytes(corruptPath, downgrade(valid, version));
         tracker::Model old;
         check(old.load(corruptPath.wstring()) && old.sessions.size() == 2 && old.activeTagId == 2 &&
-              old.sessions[1].tagId == id && old.sessions[1].flags == 0, "older formats with records load");
-        check(old.lastSaved == (version == '2' ? static_cast<long long>(number(valid, activeOffset + 12, 8)) : 0),
+              old.sessions[1].tagId == id && old.sessions[1].flags == 0 && old.categories.size() == 3 &&
+              old.findTag(id)->category == 2, "older formats with records load");
+        check(old.lastSaved == (version >= '2' ? static_cast<long long>(number(valid, activeOffset + 12, 8)) : 0),
               "older format checkpoint");
     }
     check(!loaded.load((directory / L"missing.bin").wstring()), "missing load fails");
@@ -441,6 +590,8 @@ int main() {
         pomodoroTests();
         persistenceTests(files.directory);
         flagTests(files.directory);
+        categoryTests(files.directory);
+        rangeTests();
         tracker::Model recovery;
         recovery.start(1, 100);
         const auto recoveryPath = files.directory / L"recovery.dat";
@@ -455,10 +606,7 @@ int main() {
         check(!discarded.activeTagId && discarded.sessions.empty(), "discard only open segment");
         recovery.resolveRecovery(tracker::Recovery::EndAtLastSaved);
         check(!recovery.activeTagId && recovery.sessions.back().end == 160, "recover to checkpoint");
-        auto legacy = readBytes(recoveryPath);
-        legacy[7] = '1';
-        legacy.resize(legacy.size() - 8);
-        writeBytes(recoveryPath, legacy);
+        writeBytes(recoveryPath, downgrade(readBytes(recoveryPath), '1'));
         check(recovery.load(recoveryPath.wstring()) && recovery.lastSaved == 0, "legacy has unknown checkpoint");
         check(recovery.needsRecovery(200), "legacy open segment requires decision");
         recovery.resolveRecovery(tracker::Recovery::EndAtLastSaved);
