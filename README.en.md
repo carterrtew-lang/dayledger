@@ -20,11 +20,18 @@ English | [简体中文](README.md)
 
 **Statistics**
 
-- Today's overview: a two-ring chart (categories inside, tags outside), each category's busiest tags, compared with the previous day
-- 24-hour timeline with hover details
-- Today's record list
-- Weekly stacked bar chart; click a day to jump to it
-- Date picker: days with records are marked, scroll to flip months
+- Two pages, 「今日 / 统计」(Today / Statistics), switched in the title bar (`V`)
+- Today
+  - Today's overview: a two-ring chart (categories inside, tags outside), each category's busiest tags, compared with the previous day
+  - 24-hour timeline with hover details
+  - Today's record list
+  - Weekly stacked bar chart; click a day to jump to it
+  - Date picker: days with records are marked, scroll to flip months
+- Statistics, by week / month / year, paged with `←` / `→`
+  - Total, daily average, completed pomodoros and focus time, the busiest tag, compared with the same point of the previous period
+  - Stacked daily bars (monthly for a year) with an average line; click a day to open it
+  - Time of day: the average time per hour of a recorded day, by category
+  - Breakdown: every category and its tags, with time and share
 
 **Pomodoro**
 
@@ -72,8 +79,9 @@ MSVC is also supported: run `build-msvc.bat` in an x64 Native Tools Command Prom
 | `P` | Toggle Pomodoro mode |
 | `S` / `R` | Pomodoro: skip the current phase / abandon |
 | `M` | Mini floating window |
-| `←` / `→` | Previous / next day |
-| `Home` | Back to today |
+| `V` | Switch between Today and Statistics |
+| `←` / `→` | Previous / next day (Statistics: previous / next period) |
+| `Home` | Back to today (Statistics: back to this week / month / year) |
 | `Ctrl+N` | New tag |
 | `Ctrl+B` | Backfill a time range |
 | `Ctrl+Z` | Undo delete |
@@ -111,7 +119,7 @@ Model and Pomodoro state machine tests:
 ```sh
 g++ -std=c++17 -O2 -static tests/tracker_model_test.cpp -o build/tracker_model_test.exe
 ./build/tracker_model_test.exe
-# PASS: 271 checks
+# PASS: 294 checks
 ```
 
 Desktop smoke test (needs Windows Python and an interactive desktop):

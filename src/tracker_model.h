@@ -441,6 +441,69 @@ public:
         return result;
     }
 
+    // The same numbers as stats() for each of the consecutive ranges [bounds[i], bounds[i + 1])
+    // (bounds ascending), in one pass over the ledger: a record crossing a boundary is split.
+    std::vector<DayStats> statsBetween(const std::vector<long long>& bounds, long long now) const {
+        std::vector<DayStats> result(bounds.size() > 1 ? bounds.size() - 1 : 0);
+        if (result.empty()) return result;
+        const auto add = [&](int id, long long start, long long end) {
+            const auto* tag = findTag(id);
+            if (!tag || !validTime(start) || !validTime(end) || end <= start) return;
+            end = (std::min)(end, now);
+            const auto first = std::upper_bound(bounds.begin(), bounds.end(), start);
+            std::size_t i = first == bounds.begin() ? 0 : static_cast<std::size_t>(first - bounds.begin()) - 1;
+            for (; i < result.size() && bounds[i] < end; ++i) {
+                const auto from = (std::max)(bounds[i], start), to = (std::min)(bounds[i + 1], end);
+                if (to <= from) continue;
+                auto& range = result[i];
+                range.byTag[id] += to - from;
+                range.byCategory[tag->category] += to - from;
+                range.total += to - from;
+            }
+        };
+        for (const auto& session : sessions) {
+            add(session.tagId, session.start, session.end);
+            if (!(session.flags & SessionPomodoro) || session.end > now || !findTag(session.tagId)) continue;
+            const auto after = std::lower_bound(bounds.begin(), bounds.end(), session.end);   // ended in (b[i], b[i+1]]
+            if (after == bounds.begin() || after == bounds.end()) continue;
+            auto& range = result[static_cast<std::size_t>(after - bounds.begin()) - 1];
+            ++range.pomodoros;
+            ++range.pomodorosByTag[session.tagId];
+        }
+        if (activeTagId) add(activeTagId, activeSince, (std::min)(now, maxTime));
+        return result;
+    }
+
+    // Seconds per hour of the day, by category, over the days [dayBounds[i], dayBounds[i + 1]).
+    // A day that is not 24 hours long (a daylight-saving change) is spread evenly over its hours.
+    std::map<int, std::array<long long, 24>> hoursByCategory(const std::vector<long long>& dayBounds,
+                                                             long long now) const {
+        std::map<int, std::array<long long, 24>> result;
+        if (dayBounds.size() < 2) return result;
+        const auto add = [&](int id, long long start, long long end) {
+            const auto* tag = findTag(id);
+            if (!tag || !validTime(start) || !validTime(end) || end <= start) return;
+            end = (std::min)(end, now);
+            const auto first = std::upper_bound(dayBounds.begin(), dayBounds.end(), start);
+            std::size_t i = first == dayBounds.begin() ? 0 : static_cast<std::size_t>(first - dayBounds.begin()) - 1;
+            for (; i + 1 < dayBounds.size() && dayBounds[i] < end; ++i) {
+                const long long day = dayBounds[i], length = dayBounds[i + 1] - day;
+                if (length <= 0) continue;
+                auto& hours = result[tag->category];
+                for (long long t = (std::max)(day, start), to = (std::min)(day + length, end); t < to;) {
+                    const long long hour = (std::min)(23LL, (t - day) * 24 / length);
+                    const long long hourEnd = day + (hour + 1) * length / 24;
+                    const long long stop = (std::min)(to, (std::max)(hourEnd, t + 1));
+                    hours[static_cast<std::size_t>(hour)] += stop - t;
+                    t = stop;
+                }
+            }
+        };
+        for (const auto& session : sessions) add(session.tagId, session.start, session.end);
+        if (activeTagId) add(activeTagId, activeSince, (std::min)(now, maxTime));
+        return result;
+    }
+
     bool load(const std::wstring& path) {
         try {
             std::ifstream in(std::filesystem::path(path), std::ios::binary | std::ios::ate);

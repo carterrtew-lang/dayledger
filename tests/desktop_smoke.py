@@ -6,6 +6,7 @@ against the binary ledger written to an isolated LOCALAPPDATA."""
 import argparse
 import ctypes as C
 from ctypes import wintypes as W
+from datetime import datetime, timedelta
 import json
 import math
 import os
@@ -27,13 +28,15 @@ BLUE = 0xD6782A    # COLORREF of category preset swatch 0, #2a78d6 (also the def
 WM_DL_QUERY = 0x8000 + 0x40
 (Q_TAGS, Q_RECORDS, Q_ACTIVE, Q_READONLY, Q_IS_TODAY, Q_SAVE_FAILED, Q_DARK, Q_SELECTED, Q_LOADED,
  Q_POMODORO_MODE, Q_POMODORO_PHASE, Q_POMODORO_PAUSED, Q_POMODORO_REMAINING, Q_POMODOROS_TODAY,
- Q_MINI, Q_REST_TAG, Q_TOPMOST, Q_TRAY, Q_CALENDAR, Q_CATEGORIES) = range(20)
+ Q_MINI, Q_REST_TAG, Q_TOPMOST, Q_TRAY, Q_CALENDAR, Q_CATEGORIES, Q_VIEW, Q_RANGE, Q_PERIOD_TOTAL,
+ Q_PERIOD_START) = range(24)
 CMD_PREV_DAY, CMD_NEXT_DAY, CMD_TODAY = 101, 102, 103
 CMD_NEW_TAG, CMD_STOP, CMD_ADD_RECORD, CMD_UNDO = 106, 110, 111, 112
 CMD_THEME_LIGHT, CMD_THEME_DARK = 121, 122
 CMD_POMODORO_PAUSE, CMD_POMODORO_ABANDON, CMD_MINI, CMD_POMODORO_START = 127, 129, 130, 134
 CMD_POMODORO_ON, CMD_POMODORO_OFF, CMD_EXIT, CMD_SHOW = 136, 137, 138, 139
 CMD_NEW_CATEGORY = 143
+CMD_VIEW_DAY, CMD_VIEW_STATS, CMD_RANGE_WEEK, CMD_RANGE_MONTH, CMD_RANGE_YEAR = 145, 146, 148, 149, 150
 PHASE_READY, PHASE_FOCUS, PHASE_BREAK = 0, 1, 2
 # With DAYLEDGER_TEST_SECONDS_PER_MINUTE=1 these "minutes" last one second each.
 POMODORO_SETTINGS = "[pomodoro]\nfocus=5\nshort=2\nlong=2\nevery=4\n"
@@ -254,6 +257,15 @@ def parse_tracker(path):
     return dict(categories=categories, tags=tags, sessions=sessions, active=active, since=since)
 
 
+def recorded(ledger, start, end):
+    """Seconds of the ledger's records inside [start, end) (no timer running)."""
+    return sum(max(0, min(s["end"], end) - max(s["start"], start)) for s in ledger["sessions"])
+
+
+def local_day(date):
+    return datetime.combine(date, datetime.min.time()).timestamp()
+
+
 def exercise(d, main, p, timeout, data, check):
     until = lambda probe: wait(probe, timeout, p)
     q = lambda what: d.query(main, what)
@@ -372,6 +384,37 @@ def exercise(d, main, p, timeout, data, check):
     d.command(main, CMD_TODAY)
     until(lambda: q(Q_IS_TODAY) == 1 and q(Q_RECORDS) == rows)
     check("previous_next_today_navigation")
+
+    # the statistics page: week (from Monday), month (from the 1st) and year, totals from the ledger
+    d.command(main, CMD_VIEW_STATS)
+    until(lambda: q(Q_VIEW) == 1)
+    d.command(main, CMD_RANGE_MONTH)
+    until(lambda: q(Q_RANGE) == 1)
+    ledger = parse_tracker(data)
+    start = q(Q_PERIOD_START)
+    first = datetime.fromtimestamp(start)
+    following = datetime(first.year + first.month // 12, first.month % 12 + 1, 1).timestamp()
+    need(first.day == 1 and (first.hour, first.minute) == (0, 0) and start <= time.time() < following,
+         "The month shown is not the current one")
+    need(q(Q_PERIOD_TOTAL) == recorded(ledger, start, following), "Month total differs from the ledger")
+    d.command(main, CMD_RANGE_WEEK)
+    until(lambda: q(Q_RANGE) == 0)
+    monday = q(Q_PERIOD_START)
+    week = datetime.fromtimestamp(monday).date()
+    need(week.weekday() == 0 and monday == local_day(week), "The week does not start on Monday")
+    need(q(Q_PERIOD_TOTAL) == recorded(ledger, monday, local_day(week + timedelta(days=7))),
+         "Week total differs from the ledger")
+    d.command(main, CMD_PREV_DAY)  # arrows move by the period on this page
+    until(lambda: q(Q_PERIOD_START) == local_day(week - timedelta(days=7)))
+    d.command(main, CMD_TODAY)
+    until(lambda: q(Q_PERIOD_START) == monday)
+    d.command(main, CMD_RANGE_YEAR)
+    until(lambda: q(Q_RANGE) == 2)
+    january = datetime.fromtimestamp(q(Q_PERIOD_START))
+    need((january.month, january.day) == (1, 1) and january.year == datetime.now().year, "Year period wrong")
+    d.command(main, CMD_VIEW_DAY)
+    until(lambda: q(Q_VIEW) == 0 and q(Q_PERIOD_TOTAL) == -1)
+    check("statistics_week_month_year_totals")
 
     d.command(main, CMD_THEME_DARK)
     until(lambda: q(Q_DARK) == 1)

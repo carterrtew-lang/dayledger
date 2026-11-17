@@ -416,6 +416,57 @@ void categoryTests(const std::filesystem::path& directory) {
     check(!invalid.save(path.wstring()), "duplicate category id rejected on save");
 }
 
+// statsBetween() and hoursByCategory(): the per-range numbers the statistics page draws.
+void rangeTests() {
+    tracker::Model m;
+    const int game = m.addTag(L"\u6e38\u620f", m.nextTagColor(1), 1);
+    const long long now = 100000;
+    check(m.addSession(1, 100, 400, now).status == tracker::EditStatus::Ok, "range fixture 1");
+    check(m.addSession(game, 500, 700, now).status == tracker::EditStatus::Ok, "range fixture 2");
+    check(m.addSession(1, 800, 1000, now, tracker::SessionPomodoro).status == tracker::EditStatus::Ok, "range fixture 3");
+    m.start(3, 1100);
+    const std::vector<long long> bounds{0, 600, 1000, 2000};
+    const auto ranges = m.statsBetween(bounds, 1300);
+    check(ranges.size() == 3, "one result per range");
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto single = m.stats(bounds[i], bounds[i + 1], 1300);
+        check(ranges[i].total == single.total && ranges[i].byTag == single.byTag &&
+              ranges[i].byCategory == single.byCategory && ranges[i].pomodoros == single.pomodoros,
+              "statsBetween matches stats per range");
+    }
+    check(ranges[0].ofTag(game) == 100 && ranges[1].ofTag(game) == 100, "a record split at a boundary");
+    check(ranges[1].pomodoros == 1 && ranges[2].pomodoros == 0, "a pomodoro counts where it ended");
+    check(ranges[2].ofCategory(2) == 200, "the running segment up to now");
+    check(m.statsBetween({0}, now).empty() && m.statsBetween({}, now).empty(), "no ranges");
+    check(m.statsBetween({5000, 6000}, 1300).at(0).total == 0, "a range after every record");
+    check(m.statsBetween({5000, 6000}, now).at(0).ofCategory(2) == 1000, "the running segment fills later ranges");
+    check(m.statsBetween({0, 600}, 300).at(0).total == 200, "clipped to now");
+
+    // hours: two 24-hour days (86400 s), a day of 23 hours spread evenly, the running segment
+    tracker::Model h;
+    const long long day = 86400;
+    check(h.addSession(1, 3600 + 1800, 2 * 3600 + 600, 10 * day).status == tracker::EditStatus::Ok, "hour fixture 1");
+    check(h.addSession(2, day - 1800, day + 1800, 10 * day).status == tracker::EditStatus::Ok, "hour fixture 2");
+    const auto hours = h.hoursByCategory({0, day, 2 * day}, 10 * day);
+    check(hours.at(0)[1] == 1800 && hours.at(0)[2] == 600 && hours.at(0)[0] == 0, "work split at the hour");
+    check(hours.at(1)[23] == 1800 && hours.at(1)[0] == 1800, "a record across midnight");
+    long long sum = 0;
+    for (const auto& entry : hours) for (long long seconds : entry.second) sum += seconds;
+    check(sum == 2400 + 3600, "every second lands in one hour");
+    tracker::Model dst;
+    const long long shortDay = 23 * 3600;
+    check(dst.addSession(1, 0, shortDay, 10 * day).status == tracker::EditStatus::Ok, "dst fixture");
+    const auto spread = dst.hoursByCategory({0, shortDay}, 10 * day);
+    long long dstSum = 0;
+    bool even = true;
+    for (long long seconds : spread.at(0)) { dstSum += seconds; even = even && seconds >= 3449 && seconds <= 3451; }
+    check(dstSum == shortDay && even, "a 23-hour day spreads over 24 hours");
+    tracker::Model running;
+    running.start(1, 7200);
+    check(running.hoursByCategory({0, day}, 7200 + 900).at(0)[2] == 900, "running segment by hour");
+    check(running.hoursByCategory({0}, 9000).empty(), "no days, no hours");
+}
+
 void persistenceTests(const std::filesystem::path& directory) {
     const auto path = directory / L"\u65f6\u95f4-\u8bb0\u5f55.bin";
     const auto corruptPath = directory / L"corrupt.bin";
@@ -540,6 +591,7 @@ int main() {
         persistenceTests(files.directory);
         flagTests(files.directory);
         categoryTests(files.directory);
+        rangeTests();
         tracker::Model recovery;
         recovery.start(1, 100);
         const auto recoveryPath = files.directory / L"recovery.dat";
