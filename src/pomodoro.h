@@ -1,7 +1,8 @@
 #pragma once
 // The pomodoro rhythm on top of the ledger. Focus phases record to the chosen tag, and the record
 // that reaches the end of the countdown is flagged as a completed pomodoro; breaks record to a
-// "休息" tag (created on first use). Pure logic driven by explicit timestamps, tested like the model.
+// "休息" tag (created on first use in the "other" category, in its colour family). Pure logic driven
+// by explicit timestamps, tested like the model.
 
 #include <algorithm>
 #include <string>
@@ -177,7 +178,10 @@ private:
                 return restTag;
             }
         }
-        restTag = m.addTag(restName, restColor, Category::Other);
+        if (m.categories.empty()) return 0;
+        // Breaks go to the default "other" category (id 2) when it still exists, else the last one.
+        const int category = m.findCategory(2) ? 2 : m.categories.back().id;
+        restTag = m.addTag(restName, m.nextTagColor(category), category);
         events.restTagCreated = restTag != 0;
         return restTag;
     }

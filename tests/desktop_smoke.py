@@ -7,6 +7,7 @@ import argparse
 import ctypes as C
 from ctypes import wintypes as W
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -18,25 +19,32 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 WM_CLOSE, WM_COMMAND = 0x10, 0x111
 NAME, RENAMED = "桌面冒烟中文标签", "中文标签已重命名"
-VIOLET = 0xD65062  # COLORREF (0x00BBGGRR) of preset swatch 6, #6250d6
+CATEGORY, CATEGORY_TAG = "冒烟大类", "冒烟大类的标签"
+VIOLET = 0xD65062  # COLORREF (0x00BBGGRR) of category preset swatch 6, #6250d6
+BLUE = 0xD6782A    # COLORREF of category preset swatch 0, #2a78d6 (also the default "工作" colour)
 
 # Automation interface of TimeTracker.exe (see the command enum in src/time_tracker.cpp).
 WM_DL_QUERY = 0x8000 + 0x40
 (Q_TAGS, Q_RECORDS, Q_ACTIVE, Q_READONLY, Q_IS_TODAY, Q_SAVE_FAILED, Q_DARK, Q_SELECTED, Q_LOADED,
  Q_POMODORO_MODE, Q_POMODORO_PHASE, Q_POMODORO_PAUSED, Q_POMODORO_REMAINING, Q_POMODOROS_TODAY,
- Q_MINI, Q_REST_TAG) = range(16)
+ Q_MINI, Q_REST_TAG, Q_TOPMOST, Q_TRAY, Q_CALENDAR, Q_CATEGORIES) = range(20)
 CMD_PREV_DAY, CMD_NEXT_DAY, CMD_TODAY = 101, 102, 103
 CMD_NEW_TAG, CMD_STOP, CMD_ADD_RECORD, CMD_UNDO = 106, 110, 111, 112
 CMD_THEME_LIGHT, CMD_THEME_DARK = 121, 122
 CMD_POMODORO_PAUSE, CMD_POMODORO_ABANDON, CMD_MINI, CMD_POMODORO_START = 127, 129, 130, 134
 CMD_POMODORO_ON, CMD_POMODORO_OFF, CMD_EXIT, CMD_SHOW = 136, 137, 138, 139
+CMD_NEW_CATEGORY = 143
 PHASE_READY, PHASE_FOCUS, PHASE_BREAK = 0, 1, 2
 # With DAYLEDGER_TEST_SECONDS_PER_MINUTE=1 these "minutes" last one second each.
 POMODORO_SETTINGS = "[pomodoro]\nfocus=5\nshort=2\nlong=2\nevery=4\n"
 FOCUS_SECONDS, BREAK_SECONDS = 5, 2
+# Tag positions count down the sidebar (category by category); categories by index.
 CMD_TAG_FIRST, CMD_EDIT_TAG_FIRST, CMD_DELETE_RECORD_FIRST = 0x1000, 0x2000, 0x4000
+CMD_EDIT_CATEGORY_FIRST, CMD_NEW_TAG_IN_FIRST = 0x5000, 0x6000
 IDOK, IDCANCEL = 1, 2
-TD_NAME, TD_CUSTOM_COLOR, TD_CATEGORY_OTHER, TD_COLOR_FIRST = 201, 203, 213, 220
+TD_NAME, TD_CUSTOM_COLOR, TD_CATEGORY_FIRST, TD_COLOR_FIRST = 201, 203, 211, 280  # colour: shade 0..7
+CD_NAME, CD_DELETE, CD_COLOR_FIRST = 501, 504, 520
+TDM_CLICK_BUTTON = 0x400 + 102
 RD_START, RD_END, RD_TAG_FIRST = 302, 303, 0x1000
 MIN_CLIENT = (880, 600)
 
@@ -161,10 +169,34 @@ def wait(probe, timeout, process):
         time.sleep(0.1)
 
 
+def oklch(color):
+    """(L, C, h) of a COLORREF, as the app computes colour families."""
+    def linear(c):
+        c /= 255
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = linear(color & 0xFF), linear(color >> 8 & 0xFF), linear(color >> 16 & 0xFF)
+    l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b) ** (1 / 3)
+    m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b) ** (1 / 3)
+    s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b) ** (1 / 3)
+    L = 0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s
+    a = 1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s
+    b2 = 0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s
+    return L, math.hypot(a, b2), math.atan2(b2, a)
+
+
+def same_family(color, base):
+    """A shade of `base`: the same hue (within rounding), any lightness."""
+    _, chroma, hue = oklch(color)
+    _, base_chroma, base_hue = oklch(base)
+    turn = abs(hue - base_hue) % (2 * math.pi)
+    return chroma > 0.02 and base_chroma > 0.02 and min(turn, 2 * math.pi - turn) < 0.2
+
+
 def parse_tracker(path):
-    """Read the versioned little-endian ledger with UTF-8 names (TRACKER3 adds session flags)."""
+    """Read the versioned little-endian ledger with UTF-8 names (TRACKER4 adds the category table,
+    TRACKER3 session flags, TRACKER2 the last-saved time)."""
     data, offset = path.read_bytes(), 8
-    need(data[:8] in (b"TRACKER1", b"TRACKER2", b"TRACKER3"), "Invalid tracker header")
+    need(data[:8] in (b"TRACKER1", b"TRACKER2", b"TRACKER3", b"TRACKER4"), "Invalid tracker header")
     version = data[7] - ord("0")
 
     def number(size=4):
@@ -174,15 +206,32 @@ def parse_tracker(path):
         offset += size
         return n
 
+    def name():
+        nonlocal offset
+        length = number()
+        need(0 < length <= 4096 and offset + length <= len(data), "Invalid name length")
+        text = data[offset:offset + length].decode("utf-8", errors="strict")
+        offset += length
+        return text
+
+    categories = [dict(id=0, color=BLUE, name="工作"), dict(id=1, color=0x3468EB, name="娱乐"),
+                  dict(id=2, color=0x7AAF1B, name="其他")]
+    if version >= 4:
+        count = number()
+        need(0 < count <= 64, "Invalid category count")
+        categories = []
+        for _ in range(count):
+            identifier, color = number(), number()
+            categories.append(dict(id=identifier, color=color, name=name()))
+    category_ids = {c["id"] for c in categories}
+    need(len(category_ids) == len(categories) and all(c["color"] <= 0xFFFFFF for c in categories),
+         "Invalid categories")
     tags = []
     count = number()
     need(count <= 4096, "Invalid tag count")
     for _ in range(count):
-        identifier, color, category, length = (number() for _ in range(4))
-        need(0 < length <= 4096 and offset + length <= len(data), "Invalid name length")
-        name = data[offset:offset + length].decode("utf-8", errors="strict")
-        offset += length
-        tags.append(dict(id=identifier, color=color, category=category, name=name))
+        identifier, color, category = number(), number(), number()
+        tags.append(dict(id=identifier, color=color, category=category, name=name()))
     count = number()
     need(count <= 1000000, "Invalid session count")
     sessions = [dict(tag=number(), start=number(8), end=number(8), flags=number() if version >= 3 else 0)
@@ -192,7 +241,7 @@ def parse_tracker(path):
     need(offset == len(data), "Unexpected trailing bytes")
     ids = {t["id"] for t in tags}
     need(len(ids) == len(tags) and all(0 < i <= 0x7FFFFFFF for i in ids), "Invalid tag IDs")
-    need(all(t["color"] <= 0xFFFFFF and t["category"] <= 2 and "\0" not in t["name"]
+    need(all(t["color"] <= 0xFFFFFF and t["category"] in category_ids and "\0" not in t["name"]
              for t in tags), "Invalid tag values")
     need(all(s["flags"] in (0, 1) for s in sessions), "Unknown session flags")
     previous = 0
@@ -202,15 +251,15 @@ def parse_tracker(path):
         previous = s["end"]
     need((active == 0 and since == 0) or
          (active in ids and previous <= since <= 253402300799), "Invalid active session")
-    return dict(tags=tags, sessions=sessions, active=active, since=since)
+    return dict(categories=categories, tags=tags, sessions=sessions, active=active, since=since)
 
 
 def exercise(d, main, p, timeout, data, check):
     until = lambda probe: wait(probe, timeout, p)
     q = lambda what: d.query(main, what)
     until(lambda: q(Q_LOADED) == 1)
-    need(q(Q_TAGS) == 3 and q(Q_RECORDS) == 0 and q(Q_ACTIVE) == 0 and q(Q_READONLY) == 0,
-         "Fresh ledger state wrong")
+    need(q(Q_TAGS) == 3 and q(Q_CATEGORIES) == 3 and q(Q_RECORDS) == 0 and q(Q_ACTIVE) == 0 and
+         q(Q_READONLY) == 0, "Fresh ledger state wrong")
     need(not d.children(main), "Main window should be fully custom drawn")
     check("isolated_defaults_custom_drawn_window")
 
@@ -226,8 +275,8 @@ def exercise(d, main, p, timeout, data, check):
     e = editor(CMD_NEW_TAG)
     need(not d.u.IsWindowEnabled(main), "Tag editor not modal")
     d.set_text(d.control(e, TD_NAME), NAME)
-    d.command(e, TD_CATEGORY_OTHER)
-    d.command(e, TD_COLOR_FIRST + 6)
+    d.command(e, TD_CATEGORY_FIRST + 2)  # 其他
+    d.command(e, TD_COLOR_FIRST + 6)     # a light shade of its colour
     d.command(e, TD_CUSTOM_COLOR)
     picker = until(lambda: d.top(p.pid, "#32770", e))
     for identifier in (706, 707, 708):  # Standard ChooseColor RGB edits.
@@ -238,12 +287,15 @@ def exercise(d, main, p, timeout, data, check):
     check("native_choose_color_inspected_and_canceled")
     finish(e)
     until(lambda: q(Q_TAGS) == 4)
-    added = next(t for t in parse_tracker(data)["tags"] if t["name"] == NAME)
-    need(added["category"] == 2 and added["color"] == VIOLET, "Tag category/color lost")
+    ledger = parse_tracker(data)
+    added = next(t for t in ledger["tags"] if t["name"] == NAME)
+    other = next(c for c in ledger["categories"] if c["id"] == 2)["color"]
+    need(added["category"] == 2 and added["color"] != other and same_family(added["color"], other) and
+         oklch(added["color"])[0] > oklch(other)[0], "Tag category/colour shade lost")
     need(q(Q_SELECTED) == added["id"], "New tag not selected")
     check("add_chinese_tag_category_color_persisted")
 
-    index = 3  # tags keep their order; the new tag is the fourth
+    index = 3  # 工作, 娱乐, 其他 hold one tag each; the new tag follows in 其他
     e = editor(CMD_EDIT_TAG_FIRST + index)
     need(d.text(d.control(e, TD_NAME)) == NAME, "Editor opened the wrong tag")
     d.set_text(d.control(e, TD_NAME), RENAMED)
@@ -326,6 +378,45 @@ def exercise(d, main, p, timeout, data, check):
     d.command(main, CMD_THEME_LIGHT)
     until(lambda: q(Q_DARK) == 0)
     check("theme_switch")
+
+    e = editor(CMD_NEW_CATEGORY, "DayLedgerCategoryEditor")
+    d.set_text(d.control(e, CD_NAME), CATEGORY)
+    d.command(e, CD_COLOR_FIRST + 6)
+    finish(e)
+    until(lambda: q(Q_CATEGORIES) == 4)
+    group = next(c for c in parse_tracker(data)["categories"] if c["name"] == CATEGORY)
+    need(group["color"] == VIOLET, "Category colour lost")
+    e = editor(CMD_NEW_TAG_IN_FIRST + 3)  # the new category is the fourth
+    d.set_text(d.control(e, TD_NAME), CATEGORY_TAG)
+    finish(e)
+    until(lambda: q(Q_TAGS) == 5)
+    member = next(t for t in parse_tracker(data)["tags"] if t["name"] == CATEGORY_TAG)
+    need(member["category"] == group["id"] and member["color"] == VIOLET,
+         "A category's first tag should take the category colour")
+    check("add_category_and_tag_in_its_colour")
+
+    e = editor(CMD_EDIT_CATEGORY_FIRST + 3, "DayLedgerCategoryEditor")
+    d.command(e, CD_COLOR_FIRST + 0)  # a new colour; its tags follow by default
+    finish(e)
+    ledger = parse_tracker(data)
+    need(next(c for c in ledger["categories"] if c["id"] == group["id"])["color"] == BLUE and
+         next(t for t in ledger["tags"] if t["id"] == member["id"])["color"] == BLUE,
+         "Recoloured category's tags did not follow")
+    check("recolour_category_and_its_tags")
+
+    e = editor(CMD_EDIT_CATEGORY_FIRST + 3, "DayLedgerCategoryEditor")
+    d.command(e, CD_DELETE)
+    until(lambda: not d.u.IsWindow(e))
+    task = until(lambda: d.top(p.pid, "#32770", main))  # where its tags go: the first choice is 工作
+    d.send(task, TDM_CLICK_BUTTON, 1000)
+    until(lambda: q(Q_CATEGORIES) == 3 and d.u.IsWindowEnabled(main))
+    d.send(main, 0)
+    ledger = parse_tracker(data)
+    moved = next(t for t in ledger["tags"] if t["id"] == member["id"])
+    work = next(c for c in ledger["categories"] if c["id"] == 0)["color"]
+    need(all(c["id"] != group["id"] for c in ledger["categories"]) and moved["category"] == 0 and
+         same_family(moved["color"], work), "Deleted category's tag not moved into 工作's colours")
+    check("delete_category_moves_its_tags")
 
     d.command(main, CMD_POMODORO_ON)
     until(lambda: q(Q_POMODORO_MODE) == 1 and q(Q_POMODORO_PHASE) == PHASE_READY)
@@ -457,6 +548,7 @@ def main():
                     window = wait(lambda: d.top(p.pid, "DayLedgerNativeWindow"), args.timeout, p)
                     wait(lambda: d.query(window, Q_LOADED) == 1 and
                          d.query(window, Q_TAGS) == len(saved["tags"]) and
+                         d.query(window, Q_CATEGORIES) == len(saved["categories"]) and
                          d.query(window, Q_RECORDS) == rows, args.timeout, p)
                     need(d.query(window, Q_ACTIVE) == 0, "Reopened timer active")
                     need(d.query(window, Q_READONLY) == 0, "Reopened ledger read-only")
@@ -464,8 +556,10 @@ def main():
                     close()
                     need(parse_tracker(data) == saved, "Reopen changed persisted ledger")
                     check("reopened_graceful_shutdown_binary_unchanged")
-                    result["persisted"] = dict(tags=len(saved["tags"]), sessions=len(saved["sessions"]),
-                                               active=0, chinese_tag=RENAMED, category=2, color=hex(VIOLET))
+                    renamed = next(t for t in saved["tags"] if t["name"] == RENAMED)
+                    result["persisted"] = dict(categories=len(saved["categories"]), tags=len(saved["tags"]),
+                                               sessions=len(saved["sessions"]), active=0, chinese_tag=RENAMED,
+                                               category=renamed["category"], color=hex(renamed["color"]))
             finally:
                 if p is not None and p.poll() is None:
                     for h in d.windows(p.pid):

@@ -10,7 +10,9 @@ English | [简体中文](README.md)
 
 **Time tracking**
 
-- Click a tag to start, switch, or stop tracking; hotkeys `1`–`9` do the same
+- Tags are grouped into categories (by default 工作 / 娱乐 / 其他: work / play / other); categories can be added, renamed, recoloured, reordered, and deleted
+- Click a tag to start, switch, or stop tracking; hotkeys `1`–`9` do the same (in sidebar order, top to bottom)
+- A new tag takes a shade of its category's colour (8 shades from deep to light, used ones marked); when a category changes colour, its tags can follow
 - Backfill a time range you forgot to track
 - Edit or delete records, with undo (`Ctrl+Z`)
 - Export records to CSV
@@ -18,7 +20,7 @@ English | [简体中文](README.md)
 
 **Statistics**
 
-- Today's overview: ring chart, per-tag totals and shares, compared with the previous day
+- Today's overview: a two-ring chart (categories inside, tags outside), each category's busiest tags, compared with the previous day
 - 24-hour timeline with hover details
 - Today's record list
 - Weekly stacked bar chart; click a day to jump to it
@@ -35,6 +37,7 @@ English | [简体中文](README.md)
 
 **Desktop integration**
 
+- Custom title bar: date navigation, save status, and the window buttons share one row, leaving more room for content; Windows 11 snap layouts work; 「⋯ → 使用系统标题栏」(use the system title bar) switches back
 - The close button hides to the system tray (can be disabled in the menu); the tray menu operates tracking and the Pomodoro directly
 - Only one instance per data directory
 - Light/dark theme, following the system or set manually
@@ -77,12 +80,12 @@ MSVC is also supported: run `build-msvc.bat` in an x64 Native Tools Command Prom
 | `F1` | Show shortcut help |
 | `Ctrl+Q` | Quit (after saving) |
 
-Right-click a tag or a record for more actions.
+Right-click a category, a tag, or a record for more actions (for example, moving a tag to another category).
 
 ## Data and privacy
 
 - Data directory: `%LOCALAPPDATA%\DayLedger\`
-  - `tracker.dat`: all records (TRACKER3 format; TRACKER1 / TRACKER2 files still load)
+  - `tracker.dat`: all records (TRACKER4 format with a category table; TRACKER1–3 files still load. Once saved by this version, older builds can no longer open the file)
   - `settings.ini`: settings
 - Everything stays on your machine; the app makes no network requests and has no telemetry
 - Use「⋯ → 打开数据文件夹」(Open data folder) to locate it; delete the folder to erase all data
@@ -108,7 +111,7 @@ Model and Pomodoro state machine tests:
 ```sh
 g++ -std=c++17 -O2 -static tests/tracker_model_test.cpp -o build/tracker_model_test.exe
 ./build/tracker_model_test.exe
-# PASS: 230 checks
+# PASS: 271 checks
 ```
 
 Desktop smoke test (needs Windows Python and an interactive desktop):
