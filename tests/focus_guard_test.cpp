@@ -263,12 +263,121 @@ void logTests() {
 }
 } // namespace
 
+// 强制模式: an unanswered reminder covers the window; the cover follows the distraction until it ends.
+void strictTests() {
+    auto config = TestConfig();
+    config.options |= GuardStrict;
+    config.shieldSeconds = 10;
+    const auto work = Window(L"wps.exe", L"report.docx");
+    const auto zhihu = Window(L"msedge.exe", kZhihu + L" - Edge");
+    const auto steam = Window(L"steam.exe", L"Steam");
+    GuardInput shell = work;
+    shell.neutral = true;
+    GuardMonitor m;
+    m.update(config, work, 1000);
+    m.update(config, zhihu, 1001);
+    auto out = m.update(config, zhihu, 1004);
+    check(out.show && m.popupVisible && !m.shielded && !out.cover, "strict mode reminds first");
+    out = m.update(config, zhihu, 1013);
+    check(!out.cover && !m.shielded && out.refresh, "the reminder waits for an answer");
+    out = m.update(config, zhihu, 1014);
+    check(out.cover && out.hide && m.shielded && m.shieldedAt == 1014 && !m.popupVisible &&
+          m.state == GuardState::Alerting, "unanswered for the shield time: covered");
+    out = m.update(config, steam, 1020);
+    check(m.shielded && !out.cover && out.records.empty() && m.exe == L"steam.exe",
+          "the shield follows to the next distraction");
+    check(m.update(config, shell, 1025).records.empty() && m.shielded, "the shell in front changes nothing");
+    out = m.update(config, work, 1030);
+    check(!m.shielded && out.records.size() == 1 && out.records[0].action == L"returned" &&
+          out.records[0].start == 1001 && out.records[0].end == 1030, "back at work uncovers it");
+
+    // closing the reminder unanswered covers at once
+    GuardMonitor d;
+    d.update(config, zhihu, 2000);
+    d.update(config, zhihu, 2003);
+    out = d.cover(2005);
+    check(out.cover && out.hide && d.shielded && d.shieldedAt == 2005, "closed reminder: covered");
+    check(d.cover(2006).records.empty() && !d.cover(2006).cover, "already covered");
+    GuardMonitor w;
+    w.update(config, zhihu, 2100);
+    check(!w.cover(2101).cover && !w.shielded, "nothing to cover within the grace time");
+
+    // shield time 0: covered without a reminder; releasing uncovers
+    auto direct = config;
+    direct.shieldSeconds = 0;
+    GuardMonitor z;
+    z.update(direct, zhihu, 3000);
+    out = z.update(direct, zhihu, 3003);
+    check(out.cover && !out.show && z.shielded && !z.popupVisible, "no reminder before the shield");
+    out = z.release(3010, 60);
+    check(!z.shielded && z.releases.size() == 1 && out.records.size() == 1, "a release uncovers");
+    // the release runs out with its page in front: covered without grace
+    for (long long t = 3011; t < 3070; t += 5) z.update(direct, zhihu, t);
+    out = z.update(direct, zhihu, 3071);
+    check(out.cover && z.shielded && z.since == 3071 && out.records.size() == 1 && out.records[0].action == L"expired",
+          "an expired release covers at once");
+
+    // without strict mode an expired release reminds at once
+    auto plain = TestConfig();
+    GuardMonitor e;
+    e.update(plain, zhihu, 4000);
+    e.update(plain, zhihu, 4003);
+    e.release(4004, 30);
+    e.update(plain, zhihu, 4020);
+    out = e.update(plain, zhihu, 4040);
+    check(out.show && !out.cover && !e.shielded && e.state == GuardState::Alerting, "expired: reminded at once");
+    // a release that ran out elsewhere does not snap
+    GuardMonitor f;
+    f.update(plain, zhihu, 4100);
+    f.update(plain, zhihu, 4103);
+    f.release(4104, 30);
+    f.update(plain, work, 4110);
+    f.update(plain, work, 4140);
+    check(!f.snap, "left before the end: no snap");
+    out = f.update(plain, zhihu, 4150);
+    check(!out.show && f.state == GuardState::Pending, "back on the page later: grace as usual");
+
+    // free time ran out: the next violation is covered without grace; working clears it
+    GuardMonitor s;
+    GuardInput off;
+    s.update(config, off, 5000);
+    s.armSnap();
+    out = s.update(config, zhihu, 5001);
+    check(out.cover && s.shielded && s.state == GuardState::Alerting, "after free time: covered at once");
+    GuardMonitor c;
+    c.armSnap();
+    c.update(config, work, 5100);
+    out = c.update(config, zhihu, 5101);
+    check(!out.cover && !out.show && !c.snap && c.state == GuardState::Pending, "back at work first: no snap");
+    GuardMonitor o;
+    o.armSnap();
+    o.update(config, off, 5200);
+    check(!o.snap, "not timing any more: no snap");
+
+    // strict mode switched off mid-shield: reminders again
+    GuardMonitor x;
+    x.update(direct, zhihu, 6000);
+    x.update(direct, zhihu, 6003);
+    out = x.update(plain, zhihu, 6004);
+    check(!x.shielded && out.show && x.popupVisible, "strict mode off: the reminder replaces the shield");
+    // idle ends a covered episode
+    GuardMonitor y;
+    y.update(direct, zhihu, 7000);
+    y.update(direct, zhihu, 7003);
+    GuardInput away = zhihu;
+    away.idle = true;
+    away.lastInput = 7010;
+    out = y.update(direct, away, 7200);
+    check(!y.shielded && out.records.size() == 1 && out.records[0].action == L"away", "away uncovers");
+}
+
 int main() {
     try {
         textTests();
         classifyTests();
         monitorTests();
         releaseTests();
+        strictTests();
         logTests();
         std::cout << "PASS: " << checks << " checks\n";
         return EXIT_SUCCESS;
