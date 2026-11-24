@@ -372,7 +372,7 @@ private:
 enum class Icon {
     ChevronLeft, ChevronRight, ChevronUp, ChevronDown, Plus, Play, Stop, Pencil, Trash, Moon, Sun,
     Check, Alert, Lock, Close, Clock, More, Undo, Download, Folder, Keyboard, Monitor,
-    Pause, SkipForward, Expand, MiniWindow, Sliders
+    Pause, SkipForward, Expand, MiniWindow, Sliders, Shield, ShieldCheck, Pin, PinFilled, Window, Unlock
 };
 
 // Icons are authored on a 24-unit grid and scaled to `size` pixels around (cx, cy).
@@ -502,6 +502,45 @@ inline void PaintIcon(Canvas& c, Icon icon, float cx, float cy, float size, COLO
         break;
     }
     case Icon::Clock: circle(12, 12, 9.5f); poly({12, 7, 12, 12, 15.5f, 14}); break;
+    case Icon::Shield:
+    case Icon::ShieldCheck: {
+        Gdiplus::GraphicsPath path;
+        path.AddLine(X(12), Y(2.5f), X(20), Y(5.5f));
+        path.AddLine(X(20), Y(5.5f), X(20), Y(11.5f));
+        path.AddBezier(X(20), Y(11.5f), X(20), Y(16.5f), X(16.5f), Y(20), X(12), Y(21.5f));
+        path.AddBezier(X(12), Y(21.5f), X(7.5f), Y(20), X(4), Y(16.5f), X(4), Y(11.5f));
+        path.AddLine(X(4), Y(11.5f), X(4), Y(5.5f));
+        path.CloseFigure();
+        g.DrawPath(&pen, &path);
+        if (icon == Icon::ShieldCheck) poly({8.5f, 12, 11, 14.5f, 15.5f, 9.5f});
+        break;
+    }
+    case Icon::Pin:
+    case Icon::PinFilled: {
+        Gdiplus::PointF head[] = {{X(8.5f), Y(3)}, {X(15.5f), Y(3)}, {X(14.5f), Y(9)}, {X(18), Y(13.5f)},
+                                  {X(6), Y(13.5f)}, {X(9.5f), Y(9)}};
+        if (icon == Icon::PinFilled) g.FillPolygon(&brush, head, 6);
+        g.DrawPolygon(&pen, head, 6);
+        line(12, 13.5f, 12, 21);
+        break;
+    }
+    case Icon::Window: {
+        Gdiplus::GraphicsPath body;
+        AddRound(body, X(3), Y(4), 18 * s, 16 * s, 2 * s, 2 * s, 2 * s, 2 * s);
+        g.DrawPath(&pen, &body);
+        line(3, 8.5f, 21, 8.5f);
+        break;
+    }
+    case Icon::Unlock: {
+        Gdiplus::GraphicsPath body;
+        AddRound(body, X(4.5f), Y(11), 15 * s, 10.5f * s, 2 * s, 2 * s, 2 * s, 2 * s);
+        g.DrawPath(&pen, &body);
+        Gdiplus::GraphicsPath shackle;
+        shackle.AddLine(X(7.5f), Y(11), X(7.5f), Y(7.5f));
+        shackle.AddArc(X(7.5f), Y(3), 9 * s, 9 * s, 180.0f, 150.0f);
+        g.DrawPath(&pen, &shackle);
+        break;
+    }
     case Icon::More: dot(5, 12, 2.0f); dot(12, 12, 2.0f); dot(19, 12, 2.0f); break;
     case Icon::Undo: {
         poly({8.5f, 4.5f, 4, 9, 8.5f, 13.5f});

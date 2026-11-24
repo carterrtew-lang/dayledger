@@ -29,10 +29,12 @@
 #include <ctime>
 #include <cwchar>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 #include "tracker_model.h"
 #include "pomodoro.h"
+#include "focus_guard.h"
 #include "ui_kit.h"
 
 namespace {
@@ -58,6 +60,9 @@ enum : int {
     CMD_NEW_CATEGORY = 143, CMD_SYSTEM_TITLEBAR = 144,
     CMD_VIEW_DAY = 145, CMD_VIEW_STATS = 146, CMD_VIEW_TOGGLE = 147,     // the day / the statistics page
     CMD_RANGE_WEEK = 148, CMD_RANGE_MONTH = 149, CMD_RANGE_YEAR = 150,   // statistics by week / month / year
+    CMD_GUARD_SETTINGS = 151, CMD_GUARD_TOGGLE = 152, CMD_GUARD_ON = 153, CMD_GUARD_OFF = 154,
+    CMD_POMODORO_WINDOW = 155,        // show / hide the pomodoro window
+    CMD_RELEASE_END = 156,            // end the temporary releases now
     // A tag position counts down the tag list as the sidebar shows it: category by category.
     CMD_TAG_FIRST = 0x1000,           // + tag position: start, switch to, or stop that tag
     CMD_EDIT_TAG_FIRST = 0x2000,      // + tag position: edit that tag
@@ -65,6 +70,7 @@ enum : int {
     CMD_DELETE_RECORD_FIRST = 0x4000, // + row of the record list; undoable
     CMD_EDIT_CATEGORY_FIRST = 0x5000, // + category index: edit that category
     CMD_NEW_TAG_IN_FIRST = 0x6000,    // + category index: new tag in that category
+    CMD_CATEGORY_FREE_FIRST = 0x7000, // + category index: toggle 畅玩电脑 (free time for the focus guard)
     CMD_RANGE = 0x1000,
 };
 // SendMessage(main, WM_DL_QUERY, what, 0) reads window state (automation interface).
@@ -77,10 +83,25 @@ enum : int { Q_TAGS = 0, Q_RECORDS = 1, Q_ACTIVE = 2, Q_READONLY = 3, Q_IS_TODAY
              Q_VIEW = 20,           // 0 the day, 1 statistics
              Q_RANGE = 21,          // 0 week, 1 month, 2 year
              Q_PERIOD_TOTAL = 22,   // seconds recorded in the shown period (statistics page), else -1
-             Q_PERIOD_START = 23 }; // first moment of the shown period (statistics page), else -1
+             Q_PERIOD_START = 23,   // first moment of the shown period (statistics page), else -1
+             Q_GUARD_ENABLED = 24,
+             Q_GUARD_STATE = 25,    // 0 not watching, 1 watching, 2 a violation within the grace time, 3 reminding
+             Q_GUARD_POPUP = 26,    // the reminder is visible
+             Q_GUARD_RULES = 27,
+             Q_GUARD_DISTRACTIONS_TODAY = 28,
+             Q_GUARD_SIMULATED = 29,
+             Q_GUARD_RELEASES_TODAY = 30,
+             Q_GUARD_RELEASED_SECONDS_TODAY = 31,
+             Q_GUARD_RELEASES_RUNNING = 32,
+             Q_POMODORO_WINDOW = 33,        // the pomodoro window is visible
+             Q_POMODORO_WINDOW_MINI = 34 }; // it is the small strip
 constexpr UINT WM_DL_LOAD = WM_APP + 1;
 constexpr UINT WM_DL_ACTIVATE = WM_APP + 2;
 constexpr UINT WM_DL_TRAY = WM_APP + 3;       // notification-area icon callback
+constexpr UINT WM_DL_GUARD = WM_APP + 4;      // the foreground window changed: look again
+// DAYLEDGER_TEST_GUARD=1: WM_COPYDATA with this tag and UTF-16 "exe\ttitle" stands in for the
+// window in front (empty: the real one again).
+constexpr ULONG_PTR kGuardTestData = 0x44474644;
 
 // Tag dialog (class DayLedgerTagEditor). Post WM_COMMAND with these ids to drive it.
 // TD_CATEGORY_FIRST + category index picks the category; TD_COLOR_FIRST + n picks shade n
@@ -88,7 +109,26 @@ constexpr UINT WM_DL_TRAY = WM_APP + 3;       // notification-area icon callback
 enum : int { TD_NAME = 201, TD_CUSTOM_COLOR = 203, TD_DELETE = 204, TD_CATEGORY_FIRST = 211,
              TD_COLOR_FIRST = 280 };
 // Category dialog (class DayLedgerCategoryEditor). CD_COLOR_FIRST + n picks preset colour n.
-enum : int { CD_NAME = 501, CD_CUSTOM_COLOR = 503, CD_DELETE = 504, CD_RECOLOR = 505, CD_COLOR_FIRST = 520 };
+enum : int { CD_NAME = 501, CD_CUSTOM_COLOR = 503, CD_DELETE = 504, CD_RECOLOR = 505, CD_FREE = 506,
+             CD_COLOR_FIRST = 520 };
+// Guard reminder (class DayLedgerGuardPopup).
+enum : int { GP_BACK = 601, GP_RELEASE = 602, GP_ALLOW_APP = 603, GP_ALLOW_KEYWORD = 604, GP_SWITCH_FREE = 605,
+             GP_SETTINGS = 606, GP_DISMISS = 607, GP_ALLOW_APP_CHECK = 608, GP_DROP_KEYWORD = 609,
+             GP_RELEASE_MENU = 610, GP_ALLOW_MENU = 611, GP_FREE_MENU = 612,
+             GP_FREE_TAG_FIRST = 0x1000,          // + tag index: record from the distraction on as this tag
+             GP_RELEASE_MINUTES_FIRST = 0x2000 }; // + minutes: release for that long
+// Guard settings (class DayLedgerGuardSettings).
+enum : int { GS_ENABLED = 701, GS_GRACE = 702, GS_REPEAT = 703, GS_RELEASE = 704, GS_IDLE = 705,
+             GS_MINIMIZE = 706, GS_SOUND = 707, GS_LOG_TITLES = 708, GS_TAB_FIRST = 710,
+             GS_CATEGORY_FIRST = 720,             // + 2 * category index + 0 (whitelist) / 1 (free)
+             GS_ADD_RULE = 780, GS_ADD_RUNNING = 781, GS_DEFAULT_RULES = 782, GS_KEYWORDS = 790,
+             GS_DEFAULT_KEYWORDS = 791, GS_RULE_EDIT_FIRST = 0x1000, GS_RULE_DELETE_FIRST = 0x2000 };
+// Guard rule (class DayLedgerGuardRule).
+enum : int { RG_EXE = 801, RG_KEYWORDS = 802, RG_DELETE = 804, RG_MODE_FIRST = 810, RG_SCOPE_ALL = 820,
+             RG_SCOPE_FIRST = 821, RG_RUNNING_FIRST = 0x1000 };
+// Pomodoro window (class DayLedgerPomodoro).
+enum : int { PW_START = 901, PW_ABANDON = 902, PW_SKIP = 903, PW_MINI = 904, PW_PIN = 905, PW_CLOSE = 906,
+             PW_MAIN = 907, PW_TAG_MENU = 908, PW_TAG_FIRST = 0x1000 };   // + tag position
 // Record dialog (class DayLedgerRecordEditor).
 enum : int { RD_START = 302, RD_END = 303, RD_DELETE = 304, RD_TAG_FIRST = 0x1000 };
 // Pomodoro settings dialog (class DayLedgerPomodoroSettings).
@@ -105,10 +145,11 @@ enum HitKind : int {
     HK_POMO_SKIP, HK_POMO_ABANDON, HK_POMO_SETTINGS, HK_MINI, HK_MINI_EXPAND, HK_DATE, HK_CAL_PREV,
     HK_CAL_NEXT, HK_CAL_DAY, HK_CAL_TODAY, HK_DIALOG, HK_CAT_HEADER, HK_CAT_ADD, HK_CAT_EDIT, HK_CAT_EMPTY,
     HK_NEW_CATEGORY, HK_VIEW_DAY, HK_VIEW_STATS, HK_RANGE, HK_PERIOD_PREV, HK_PERIOD_NEXT, HK_PERIOD_NOW,
-    HK_TREND_BAR, HK_HOUR, HK_BREAKDOWN, HK_BREAKDOWN_SCROLL, HK_KPI,
+    HK_TREND_BAR, HK_HOUR, HK_BREAKDOWN, HK_BREAKDOWN_SCROLL, HK_KPI, HK_GUARD, HK_RELEASE_END, HK_FREE_BADGE,
+    HK_GUARD_SOURCE, HK_POMODORO_WINDOW,
 };
 
-enum ToastKind : int { TOAST_PLAIN, TOAST_UNDO, TOAST_START_FOCUS };
+enum ToastKind : int { TOAST_PLAIN, TOAST_UNDO, TOAST_START_FOCUS, TOAST_GUARD_SETUP };
 constexpr int Hid(int kind, int index = 0) { return (kind << 20) | (index & 0xFFFFF); }
 constexpr int KindOf(int id) { return id >> 20; }
 constexpr int IndexOf(int id) { return id & 0xFFFFF; }
@@ -134,6 +175,24 @@ struct RecordRow {
 };
 
 struct WeekDay { long long day; tracker::DayStats stats; };
+
+// A custom-drawn window of its own (the guard reminder, the pomodoro window): its DPI, fonts,
+// back buffer and hit regions. Hit ids are the window's WM_COMMAND ids.
+struct Floater {
+    HWND hwnd = nullptr;
+    UINT dpi = 96;
+    Fonts fonts;
+    Surface surface;
+    std::vector<Hit> hits;
+    int hot = 0, pressed = 0;
+    bool tracking = false;
+    int S(int v) const { return MulDiv(v, static_cast<int>(dpi), 96); }
+    float Sf(float v) const { return v * static_cast<float>(dpi) / 96.0f; }
+    int HitAt(POINT pt) const {
+        for (auto it = hits.rbegin(); it != hits.rend(); ++it) if (PtInRect(&it->rect, pt)) return it->id;
+        return 0;
+    }
+};
 
 struct Layout { RECT tagsList{}, recordsList{}, breakdownList{}, main{}, date{}; };
 
@@ -217,6 +276,19 @@ struct App {
     bool calendarTracking = false;
     DWORD calendarClosedAt = 0;
     Surface calendarSurface;
+    // focus guard
+    tracker::GuardMonitor guard;
+    std::vector<tracker::GuardRecord> guardLog;   // finished distractions and releases, oldest first
+    Floater guardWin;                             // the reminder
+    HWND guardTarget = nullptr, guardLastAllowed = nullptr;
+    HWINEVENTHOOK guardHook = nullptr;
+    bool guardTest = false, guardSimulated = false;
+    std::wstring guardSimExe, guardSimTitle;
+    std::map<DWORD, std::pair<std::wstring, DWORD>> exeCache;   // pid -> (program, GetTickCount)
+    // pomodoro window
+    Floater pomoWin;
+    bool pomoMini = false, pomoPinned = true, pomoAutoShow = true;
+    long long pomoPulseUntil = 0;
     // window
     bool customFrame = true;            // our own title bar (off: the system one, [window] systemTitleBar=1)
     bool active = true;                 // the app is in the foreground (the title bar dims otherwise)
@@ -632,6 +704,18 @@ bool RestorePlacement(bool& maximized) {
 // ---------------------------------------------------------------- persistence
 
 void Refresh();
+void GuardEvaluate();
+std::wstring ProcessExe(DWORD pid);
+void MergeGuardRule(tracker::GuardConfig& config, const tracker::GuardRule& rule);
+void EditGuardSettings();
+void ShowPomodoroWindow(bool show);
+void SetGuardEnabled(bool on);
+void SetCategoryFree(int categoryId, bool free);
+void EndReleases();
+// Distractions and temporary releases that began in a range, the running ones included.
+struct GuardCounts { int distractions = 0, releases = 0; long long distracted = 0, released = 0; };
+GuardCounts CountGuard(long long from, long long to);
+const tracker::Tag* GuardedTag();
 void ShowToast(const std::wstring& text, int kind = TOAST_PLAIN, int seconds = 5);
 int LastWorkTag();
 int NextFocusTag();
@@ -846,6 +930,8 @@ void Refresh() {
     }
     if (app.selectedTagId && !model.findTag(app.selectedTagId)) app.selectedTagId = 0;
     if (app.view == 1) ComputePeriod(now);
+    GuardEvaluate();
+    if (app.pomoWin.hwnd) InvalidateRect(app.pomoWin.hwnd, nullptr, FALSE);
     UpdateTitle();
     TrayUpdate();
     InvalidateRect(app.hwnd, nullptr, FALSE);
@@ -862,6 +948,7 @@ const wchar_t* ToastActionLabel(int kind) {
     switch (kind) {
     case TOAST_UNDO: return L"撤销";
     case TOAST_START_FOCUS: return L"开始专注";
+    case TOAST_GUARD_SETUP: return L"去设置";
     default: return L"";
     }
 }
@@ -1104,6 +1191,61 @@ void PaintModeSwitch(Ctx& x, const RECT& r) {
     }
 }
 
+// While a temporary release runs, the timer card says so (and offers to end it) instead of its note.
+bool PaintReleasePill(Ctx& x, int left, int right, int y) {
+    const auto& releases = app.guard.releases;
+    if (releases.empty()) return false;
+    auto& c = x.c;
+    const auto& release = releases.back();
+    const long long left_ = std::max(0LL, release.until - x.now);
+    const std::wstring what = release.keyword.empty() ? release.exe : release.keyword;
+    const std::wstring text = L"临时放行「" + what + L"」· 剩 " + CountdownText(left_) +
+        (releases.size() > 1 ? Format(L" 等 %d 项", static_cast<int>(releases.size())) : std::wstring());
+    const std::wstring end = L"结束";
+    const int endW = c.Measure(end, x.f.labelBold).cx + S(16);
+    const RECT pill{left - S(4), y - S(3), right, y + S(21)};
+    c.Round(pill, Sf(12), Mix(x.p.surface, x.p.danger, x.p.dark ? 0.2 : 0.1));
+    PaintIcon(c, Icon::Unlock, pill.left + Sf(14), (pill.top + pill.bottom) / 2.0f, Sf(13), x.p.danger);
+    c.Text(text, RECT{pill.left + S(26), pill.top, pill.right - endW - S(4), pill.bottom}, x.f.label, x.p.text2);
+    const RECT button{pill.right - endW, pill.top + S(2), pill.right - S(2), pill.bottom - S(2)};
+    const int id = Hid(HK_RELEASE_END);
+    if (app.hot == id) c.Round(button, Sf(10), Mix(x.p.surface, x.p.danger, 0.22));
+    c.Text(end, button, x.f.labelBold, x.p.danger, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    Hot(x, button, id, L"结束临时放行，马上恢复检查");
+    return true;
+}
+
+// The shield next to the mode switch: whether the focus guard is watching what is being timed.
+void PaintGuardButton(Ctx& x, const RECT& r) {
+    auto& c = x.c;
+    const auto& guard = app.model.guard;
+    const int id = Hid(HK_GUARD);
+    const bool hot = app.hot == id;
+    const auto* tag = app.model.findTag(app.model.activeTagId);
+    Icon icon = Icon::Shield;
+    COLORREF ink = x.p.text3;
+    std::wstring tip = L"专注守护未开启 · 单击设置";
+    if (guard.enabled) {
+        if (app.guard.state == tracker::GuardState::Alerting) {
+            ink = x.p.danger;
+            tip = L"专注守护：正在提醒";
+        } else if (GuardedTag()) {
+            icon = Icon::ShieldCheck;
+            ink = x.p.accentText;
+            tip = Format(L"专注守护中：白名单 %d 条 · 宽限 %u 秒", static_cast<int>(guard.rules.size()), guard.graceSeconds);
+        } else if (tag && app.model.isFree(tag->category)) {
+            ink = x.p.text2;
+            tip = L"「" + CategoryName(tag->category) + L"」是畅玩电脑：不检查应用";
+        } else {
+            ink = x.p.text2;
+            tip = L"专注守护已开启 · 计时白名单大类时生效";
+        }
+    }
+    if (hot) c.Round(r, Sf(8), app.pressed == id ? x.p.pressed : x.p.hover);
+    PaintIcon(c, icon, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, Sf(16), ink);
+    Hot(x, r, id, tip + L"\n单击打开专注守护设置");
+}
+
 void PaintFreeTimer(Ctx& x, const RECT& r, int top, int statusRight) {
     auto& c = x.c;
     const auto& model = app.model;
@@ -1127,8 +1269,10 @@ void PaintFreeTimer(Ctx& x, const RECT& r, int top, int statusRight) {
         const auto found = app.today.byTag.find(active->id);
         meta = HM(model.activeSince) + L" 开始 · 今日累计 " +
                DurationText(found == app.today.byTag.end() ? 0 : found->second);
+        const auto counts = CountGuard(model.activeSince, x.now + 1);
+        if (counts.distractions) meta += Format(L" · 分心 %d 次", counts.distractions);
     } else meta = L"单击下方标签开始计时，或按数字键 1–9";
-    c.Text(meta, RECT{left, y, right, y + S(20)}, x.f.label, x.p.text2);
+    if (!PaintReleasePill(x, left, right, y)) c.Text(meta, RECT{left, y, right, y + S(20)}, x.f.label, x.p.text2);
     const RECT button{left, r.bottom - S(18) - S(40), right, r.bottom - S(18)};
     if (active) {
         Button(x, button, L"停止计时", static_cast<int>(Icon::Stop), Btn::Secondary, Hid(HK_STOP), !app.readOnly,
@@ -1159,6 +1303,7 @@ void PaintPomodoroTimer(Ctx& x, const RECT& r, int top, int statusRight) {
     if (focus) status = p.paused ? L"专注已暂停" : Format(L"专注中 · 第 %d 个", done + 1);
     else if (rest) status = p.paused ? L"休息已暂停" : (p.longBreak ? L"长休息中" : L"休息中");
     else status = L"准备专注";
+    if (focus && !p.paused && c.Measure(status, x.f.labelBold).cx > statusRight - left - S(16)) status = L"专注中";
     if (p.running()) {
         c.Circle(left + Sf(4), y + Sf(12), Sf(7), color, 50);
         c.Circle(left + Sf(4), y + Sf(12), Sf(4), color);
@@ -1198,9 +1343,12 @@ void PaintPomodoroTimer(Ctx& x, const RECT& r, int top, int statusRight) {
     else if (focus) {
         const bool longNext = p.cycle + 1 >= config.longEvery;
         meta = std::wstring(L"完成后") + (longNext ? L"长休息 " : L"休息 ") +
-               DurationText(longNext ? config.longBreak : config.shortBreak) + L" · 单击标签可切换";
+               DurationText(longNext ? config.longBreak : config.shortBreak);
+        const auto counts = model.activeTagId ? CountGuard(model.activeSince, x.now + 1) : GuardCounts{};
+        if (counts.distractions) meta = Format(L"本次专注分心 %d 次 · ", counts.distractions) + meta;
+        else meta += L" · 单击标签可切换";
     } else meta = Format(L"休息结束后开始第 %d 个番茄", done + 1);
-    c.Text(meta, RECT{left, y, right, y + S(20)}, x.f.label, x.p.text2);
+    if (!PaintReleasePill(x, left, right, y)) c.Text(meta, RECT{left, y, right, y + S(20)}, x.f.label, x.p.text2);
     const RECT row{left, r.bottom - S(18) - S(40), right, r.bottom - S(18)};
     const bool writable = !app.readOnly;
     if (p.phase == PomodoroPhase::Ready) {
@@ -1264,8 +1412,14 @@ void PaintTimer(Ctx& x, const RECT& r) {
     if (app.pomodoroMode) {
         const RECT gear{mode.left - S(4) - S(26), top, mode.left - S(4), top + S(26)};
         IconButton(x, gear, Icon::Sliders, Hid(HK_POMO_SETTINGS), L"番茄钟设置", true, 16);
-        statusRight = gear.left - S(4);
+        const bool shown = app.pomoWin.hwnd && IsWindowVisible(app.pomoWin.hwnd);
+        const RECT window{gear.left - S(2) - S(26), top, gear.left - S(2), top + S(26)};
+        IconButton(x, window, Icon::Window, Hid(HK_POMODORO_WINDOW), shown ? L"隐藏番茄窗" : L"显示番茄窗", true, 16);
+        statusRight = window.left - S(4);
     }
+    const RECT shield{statusRight - S(26), top, statusRight, top + S(26)};
+    PaintGuardButton(x, shield);
+    statusRight = shield.left - S(4);
     if (pomodoro) PaintPomodoroTimer(x, r, top, statusRight);
     else PaintFreeTimer(x, r, top, statusRight);
 }
@@ -1341,8 +1495,20 @@ void PaintCategoryHeader(Ctx& x, const RECT& row, int index) {
     const long long seconds = app.today.ofCategory(category.id);
     const std::wstring total = seconds > 0 ? DurationText(seconds) : L"—";
     const int totalW = c.Measure(total, x.f.labelBold).cx;
-    c.Text(category.name, RECT{line.left + S(30), line.top, right - totalW - S(10), line.bottom}, x.f.labelBold,
-           x.p.text2);
+    const int nameRight = right - totalW - S(10);
+    c.Text(category.name, RECT{line.left + S(30), line.top, nameRight, line.bottom}, x.f.labelBold, x.p.text2);
+    if (app.model.guard.enabled && (category.flags & tracker::CategoryFree)) {
+        const int nameW = c.Measure(category.name, x.f.labelBold).cx;
+        const std::wstring badge = L"畅玩";
+        const int badgeW = c.Measure(badge, x.f.caption).cx + S(12);
+        const int bx = line.left + S(30) + nameW + S(6);
+        if (bx + badgeW <= nameRight) {
+            const RECT pill{bx, static_cast<int>(cy) - S(9), bx + badgeW, static_cast<int>(cy) + S(9)};
+            c.Round(pill, Sf(9), x.p.track);
+            c.Text(badge, pill, x.f.caption, x.p.text2, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            Hot(x, pill, Hid(HK_FREE_BADGE, index), L"畅玩电脑：计时这个大类时不检查应用");
+        }
+    }
     c.Text(total, RECT{right - totalW - S(2), line.top, right, line.bottom}, x.f.labelBold,
            seconds > 0 ? x.p.text2 : x.p.text3, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     if (buttons) {
@@ -2446,15 +2612,96 @@ void PaintBreakdown(Ctx& x, const RECT& r) {
     PaintScrollbar(x, list, app.breakdownContent, app.breakdownScroll, HK_BREAKDOWN_SCROLL);
 }
 
+// The focus guard over the period: distractions, temporary releases (count and time spent on the
+// released pages), and where they came from.
+struct GuardSource { std::wstring label; int distractions = 0, releases = 0; long long seconds = 0; };
+
+std::vector<GuardSource> GuardSources(long long from, long long to) {
+    std::vector<GuardSource> sources;
+    auto add = [&](const std::wstring& exe, const std::wstring& keyword, bool release, long long seconds) {
+        const std::wstring label = keyword.empty() ? (exe.empty() ? std::wstring(L"未知程序") : exe) : keyword;
+        auto it = std::find_if(sources.begin(), sources.end(), [&](const GuardSource& s) { return s.label == label; });
+        if (it == sources.end()) { sources.push_back({label}); it = sources.end() - 1; }
+        if (release) ++it->releases;
+        else ++it->distractions;
+        it->seconds += std::max(0LL, seconds);
+    };
+    for (const auto& r : app.guardLog)
+        if (r.start >= from && r.start < to) add(r.exe, r.keyword, r.type == L'R', r.seconds);
+    const auto& g = app.guard;
+    if (g.state == tracker::GuardState::Alerting && g.since >= from && g.since < to)
+        add(g.exe, g.reason == tracker::GuardReason::Keyword ? g.keyword : std::wstring(), false, Now() - g.since);
+    for (const auto& release : g.releases)
+        if (release.start >= from && release.start < to) add(release.exe, release.keyword, true, release.dwell);
+    std::stable_sort(sources.begin(), sources.end(), [](const GuardSource& a, const GuardSource& b) {
+        return a.seconds > b.seconds;
+    });
+    return sources;
+}
+
+void PaintGuardCard(Ctx& x, const RECT& r) {
+    auto& c = x.c;
+    Card(x, r);
+    const auto& p = app.period;
+    const auto counts = CountGuard(p.start, p.end);
+    CardTitle(x, r, L"专注守护", app.model.guard.enabled ? std::wstring() : std::wstring(L"未开启"));
+    const int top = r.top + S(48), mid = (r.left + r.right) / 2;
+    struct Tile { const wchar_t* label; int count; const wchar_t* unit; long long seconds; const wchar_t* note; COLORREF dot; };
+    const Tile tiles[] = {{L"分心", counts.distractions, L"次", counts.distracted, L"共 ", x.p.danger},
+                          {L"临时放行", counts.releases, L"次", counts.released, L"停留 ", RGB(0xed, 0xa1, 0x00)}};
+    for (int i = 0; i < 2; ++i) {
+        const int left = i ? mid + S(8) : r.left + S(20), right = i ? r.right - S(16) : mid - S(8);
+        c.Circle(left + Sf(4), top + Sf(9), Sf(4), tiles[i].dot);
+        c.Text(tiles[i].label, RECT{left + S(14), top, right, top + S(18)}, x.f.label, x.p.text2);
+        const int w = c.TextAt(std::to_wstring(tiles[i].count), left, top + S(46), x.f.numM, x.p.text);
+        c.TextAt(tiles[i].unit, left + w + S(3), top + S(46), x.f.unit, x.p.text2);
+        c.Text(tiles[i].note + DurationText(tiles[i].seconds), RECT{left, top + S(50), right, top + S(68)}, x.f.label,
+               x.p.text3);
+    }
+    const auto sources = GuardSources(p.start, p.end);
+    const int listTop = top + S(80), lineH = S(22);
+    const int rows = std::max<int>(0, (r.bottom - S(12) - listTop) / lineH);
+    if (sources.empty()) {
+        c.Text(app.model.guard.enabled ? L"这段时间没有分心，也没有临时放行" : L"开启后，计时白名单大类时会记录分心和临时放行",
+               RECT{r.left + S(20), listTop, r.right - S(16), listTop + lineH}, x.f.label, x.p.text3);
+        return;
+    }
+    for (int i = 0; i < std::min<int>(rows, static_cast<int>(sources.size())); ++i) {
+        const auto& source = sources[static_cast<std::size_t>(i)];
+        const int y = listTop + i * lineH;
+        const std::wstring time = DurationText(source.seconds);
+        const int timeW = c.Measure(time, x.f.label).cx;
+        std::wstring detail;
+        if (source.distractions) detail += Format(L"分心 %d", source.distractions);
+        if (source.releases) detail += (detail.empty() ? L"" : L" · ") + Format(L"放行 %d", source.releases);
+        const int detailW = c.Measure(detail, x.f.caption).cx;
+        const int right = r.right - S(16);
+        c.Text(source.label, RECT{r.left + S(20), y, right - timeW - detailW - S(16), y + lineH}, x.f.label, x.p.text2);
+        c.Text(detail, RECT{right - timeW - detailW - S(10), y, right - timeW - S(8), y + lineH}, x.f.caption, x.p.text3,
+               DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        c.Text(time, RECT{right - timeW - S(2), y, right, y + lineH}, x.f.label, x.p.text2,
+               DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        Hot(x, RECT{r.left + S(12), y, right, y + lineH}, Hid(HK_GUARD_SOURCE, i),
+            source.label + Format(L"\n分心 %d 次 · 临时放行 %d 次\n合计 ", source.distractions, source.releases) +
+            DurationText(source.seconds));
+    }
+}
+
 void PaintStatsPage(Ctx& x, const RECT& area, int gap, bool compact) {
     const RECT kpi{area.left, area.top, area.right, area.top + S(compact ? 96 : 104)};
     PaintKpis(x, kpi);
     const int top = kpi.bottom + gap, bottom = std::max<int>(area.bottom, top + S(320));
     const int sideW = std::clamp(Wd(area) * 38 / 100, S(210), S(400));
-    const RECT breakdown{area.right - sideW, top, area.right, bottom};
+    RECT breakdown{area.right - sideW, top, area.right, bottom};
     const int trendH = (bottom - top - gap) * 56 / 100;
     PaintTrend(x, RECT{area.left, top, breakdown.left - gap, top + trendH});
     PaintHours(x, RECT{area.left, top + trendH + gap, breakdown.left - gap, bottom});
+    const auto guard = CountGuard(app.period.start, app.period.end);
+    if (app.model.guard.enabled || guard.distractions || guard.releases) {
+        const RECT card{breakdown.left, bottom - S(compact ? 190 : 206), area.right, bottom};
+        breakdown.bottom = card.top - gap;
+        PaintGuardCard(x, card);
+    }
     PaintBreakdown(x, breakdown);
 }
 
@@ -2598,7 +2845,9 @@ public:
         fonts_.Release();
         if (fieldBrush_) DeleteObject(fieldBrush_);
     }
-    int Run(const wchar_t* windowClass, const std::wstring& title);
+    // Modal over `owner` (the main window, or another dialog for a nested one).
+    int Run(const wchar_t* windowClass, const std::wstring& title, HWND owner = nullptr);
+    HWND Window() const { return hwnd_; }
     static LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wp, LPARAM lp);
 
 protected:
@@ -2609,16 +2858,17 @@ protected:
     virtual void Draw(Canvas& c) = 0;             // paint and register hits
     virtual void Click(int id) = 0;
     virtual void Changed(int) {}
+    virtual void Wheel(POINT, int) {}             // mouse wheel over the client (client coordinates)
     virtual void Accept() = 0;
 
     int S(int v) const { return MulDiv(v, static_cast<int>(dpi_), 96); }
     float Sf(float v) const { return v * static_cast<float>(dpi_) / 96.0f; }
     void Finish(int code) { result_ = code; done_ = true; }
     void Redraw() { if (hwnd_) InvalidateRect(hwnd_, nullptr, FALSE); }
-    HWND MakeEdit(int id, const std::wstring& text, const wchar_t* cue, int limit, bool centre) {
+    HWND MakeEdit(int id, const std::wstring& text, const wchar_t* cue, int limit, bool centre, DWORD extra = 0) {
         HWND edit = CreateWindowExW(0, L"EDIT", text.c_str(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL |
-            (centre ? ES_CENTER : ES_LEFT), 0, 0, 10, 10, hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-            app.instance, nullptr);
+            (centre ? ES_CENTER : ES_LEFT) | extra, 0, 0, 10, 10, hwnd_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), app.instance, nullptr);
         SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(fonts_.field), FALSE);
         SendMessageW(edit, EM_SETLIMITTEXT, static_cast<WPARAM>(limit), 0);
         if (cue) SendMessageW(edit, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(cue));
@@ -2758,8 +3008,9 @@ void Dialog::PaintTip(Canvas& c) {
     }
 }
 
-int Dialog::Run(const wchar_t* windowClass, const std::wstring& title) {
+int Dialog::Run(const wchar_t* windowClass, const std::wstring& title, HWND ownerWindow) {
     ModalScope modal;
+    HWND const parent = ownerWindow ? ownerWindow : app.hwnd;
     dpi_ = app.dpi;
     fonts_.Create(dpi_, app.numberFace);
     fieldBrush_ = CreateSolidBrush(app.pal.field);
@@ -2771,26 +3022,28 @@ int Dialog::Run(const wchar_t* windowClass, const std::wstring& title) {
     if (adjust) adjust(&rect, style, FALSE, exStyle, dpi_);
     else AdjustWindowRectEx(&rect, style, FALSE, exStyle);
     RECT owner{};
-    GetWindowRect(app.hwnd, &owner);
+    GetWindowRect(parent, &owner);
     const int w = Wd(rect), h = Ht(rect);
     int x = owner.left + (Wd(owner) - w) / 2, y = owner.top + (Ht(owner) - h) / 2;
     MONITORINFO monitor{};
     monitor.cbSize = sizeof(monitor);
-    if (GetMonitorInfoW(MonitorFromWindow(app.hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+    if (GetMonitorInfoW(MonitorFromWindow(parent, MONITOR_DEFAULTTONEAREST), &monitor)) {
         x = std::clamp(x, static_cast<int>(monitor.rcWork.left), std::max<int>(monitor.rcWork.left, monitor.rcWork.right - w));
         y = std::clamp(y, static_cast<int>(monitor.rcWork.top), std::max<int>(monitor.rcWork.top, monitor.rcWork.bottom - h));
     }
-    hwnd_ = CreateWindowExW(exStyle, windowClass, title.c_str(), style, x, y, w, h, app.hwnd, nullptr,
+    hwnd_ = CreateWindowExW(exStyle, windowClass, title.c_str(), style, x, y, w, h, parent, nullptr,
                             app.instance, this);
     if (!hwnd_) return IDCANCEL;
     ApplyFrame(hwnd_, app.pal.surface);
     Build();
     Place();
-    EnableWindow(app.hwnd, FALSE);
+    EnableWindow(parent, FALSE);
     ShowWindow(hwnd_, SW_SHOW);
-    if (!edits_.empty()) {
-        SetFocus(edits_.front());
-        SendMessageW(edits_.front(), EM_SETSEL, 0, -1);
+    for (HWND edit : edits_) {               // the first field that is shown
+        if (!(GetWindowLongPtrW(edit, GWL_STYLE) & WS_VISIBLE) || !IsWindowEnabled(edit)) continue;
+        SetFocus(edit);
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+        break;
     }
     MSG msg{};
     while (!done_) {
@@ -2801,12 +3054,16 @@ int Dialog::Run(const wchar_t* windowClass, const std::wstring& title) {
         }
         if (msg.message == WM_KEYDOWN && (msg.hwnd == hwnd_ || IsChild(hwnd_, msg.hwnd))) {
             if (msg.wParam == VK_ESCAPE) { Finish(IDCANCEL); continue; }
-            if (msg.wParam == VK_RETURN) { Accept(); continue; }
-            if (msg.wParam == VK_TAB && !edits_.empty()) {
+            const bool multiline = (GetWindowLongPtrW(GetFocus(), GWL_STYLE) & ES_MULTILINE) != 0;
+            if (msg.wParam == VK_RETURN && !multiline) { Accept(); continue; }
+            if (msg.wParam == VK_TAB && !edits_.empty()) {   // the next field that is shown and enabled
                 auto it = std::find(edits_.begin(), edits_.end(), GetFocus());
                 const bool back = GetKeyState(VK_SHIFT) < 0;
                 std::size_t index = it == edits_.end() ? 0 : static_cast<std::size_t>(it - edits_.begin());
-                index = back ? (index + edits_.size() - 1) % edits_.size() : (index + 1) % edits_.size();
+                for (std::size_t step = 0; step < edits_.size(); ++step) {
+                    index = back ? (index + edits_.size() - 1) % edits_.size() : (index + 1) % edits_.size();
+                    if ((GetWindowLongPtrW(edits_[index], GWL_STYLE) & WS_VISIBLE) && IsWindowEnabled(edits_[index])) break;
+                }
                 SetFocus(edits_[index]);
                 SendMessageW(edits_[index], EM_SETSEL, 0, -1);
                 continue;
@@ -2815,10 +3072,10 @@ int Dialog::Run(const wchar_t* windowClass, const std::wstring& title) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
-    EnableWindow(app.hwnd, TRUE);          // re-enable before destroying so activation returns here
+    EnableWindow(parent, TRUE);            // re-enable before destroying so activation returns here
     if (IsWindow(hwnd_)) DestroyWindow(hwnd_);
     hwnd_ = nullptr;
-    SetActiveWindow(app.hwnd);
+    SetActiveWindow(parent);
     return result_;
 }
 
@@ -2931,6 +3188,13 @@ LRESULT Dialog::Handle(UINT message, WPARAM wp, LPARAM lp) {
         const auto* r = reinterpret_cast<RECT*>(lp);
         SetWindowPos(hwnd_, nullptr, r->left, r->top, Wd(*r), Ht(*r), SWP_NOZORDER | SWP_NOACTIVATE);
         Place();
+        Redraw();
+        return 0;
+    }
+    case WM_MOUSEWHEEL: {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(hwnd_, &pt);
+        Wheel(pt, GET_WHEEL_DELTA_WPARAM(wp));
         Redraw();
         return 0;
     }
@@ -3098,6 +3362,7 @@ public:
             editingId_ = category->id;
             name = category->name;
             color = category->color;
+            free = (category->flags & tracker::CategoryFree) != 0;
             tags_ = model.tagsIn(category->id);
         } else {
             // The first preset colour that no category is close to yet.
@@ -3116,10 +3381,12 @@ public:
     std::wstring name;
     unsigned color = 0;
     bool recolor = false;         // give the category's tags shades of the (new) colour
+    bool free = false;            // 畅玩电脑: the focus guard leaves it alone
 
 protected:
     bool HasToggle() const { return editing_ && tags_ > 0; }
-    int Height() override { return (HasToggle() ? 334 : 296) + 94; }
+    int FreeTop() const { return HasToggle() ? 336 : 298; }
+    int Height() override { return FreeTop() + 48 + 94; }
     void Build() override { edit_ = MakeEdit(CD_NAME, name, L"例如：工作、学习、运动、生活", 20, false); }
     void Place() override { PlaceEdit(edit_, Field()); }
     RECT Field() { return RECT{S(24), S(48), S(Width() - 24), S(48 + 42)}; }
@@ -3156,6 +3423,17 @@ protected:
                         hot);
             AddHit(hits_, c, row, CD_RECOLOR, L"每个标签取一个不同深浅，第一个用大类本色");
         }
+        {
+            const RECT row{S(16), S(FreeTop()), S(Width() - 16), S(FreeTop() + 46)};
+            const bool hot = hot_ == CD_FREE;
+            if (hot) c.Round(row, Sf(8), p.hover);
+            c.Text(L"畅玩电脑", RECT{row.left + S(8), row.top + S(4), row.right - S(64), row.top + S(24)}, fonts_.body, p.text);
+            c.Text(L"计时这个大类时不检查正在用的应用（适合娱乐、休息）",
+                   RECT{row.left + S(8), row.top + S(24), row.right - S(64), row.bottom - S(4)}, fonts_.label, p.text3);
+            const int cy = (row.top + row.bottom) / 2;
+            PaintSwitch(c, RECT{row.right - S(8) - S(42), cy - S(11), row.right - S(8), cy + S(11)}, free, hot);
+            AddHit(hits_, c, row, CD_FREE);
+        }
         const int footer = Footer(c);
         if (editing_) {
             const bool last = app.model.categories.size() <= 1;
@@ -3173,6 +3451,8 @@ protected:
         else if (id == CD_CUSTOM_COLOR) {
             unsigned picked = color;
             if (PickColor(picked)) SetColor(picked);
+        } else if (id == CD_FREE) {
+            free = !free;
         } else if (id == CD_RECOLOR && HasToggle()) {
             recolor = !recolor;
             recolorTouched_ = true;
@@ -3543,6 +3823,551 @@ private:
     int errorField_ = -1;
 };
 
+// ---- focus guard: rules and settings
+
+struct RunningApp { std::wstring exe, title; };
+
+BOOL CALLBACK CollectRunningApp(HWND window, LPARAM lp) {
+    if (!IsWindowVisible(window) || GetWindow(window, GW_OWNER) ||
+        (GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
+    wchar_t title[256]{}, cls[128]{};
+    if (!GetWindowTextW(window, title, 256)) return TRUE;
+    GetClassNameW(window, cls, 128);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (!pid || pid == GetCurrentProcessId()) return TRUE;
+    std::wstring exe = ProcessExe(pid);
+    if (exe.empty() || tracker::IsShellWindow(exe, cls)) return TRUE;
+    auto* list = reinterpret_cast<std::vector<RunningApp>*>(lp);
+    for (const auto& item : *list) if (item.exe == exe) return TRUE;
+    if (list->size() < 64) list->push_back({exe, title});
+    return TRUE;
+}
+
+// Programs with a visible window now, one entry each (for picking a rule's program).
+std::vector<RunningApp> RunningApps() {
+    std::vector<RunningApp> list;
+    EnumWindows(CollectRunningApp, reinterpret_cast<LPARAM>(&list));
+    std::sort(list.begin(), list.end(), [](const RunningApp& a, const RunningApp& b) { return a.exe < b.exe; });
+    return list;
+}
+
+std::wstring JoinWords(const std::vector<std::wstring>& words, const wchar_t* separator = L"、") {
+    std::wstring text;
+    for (const auto& word : words) text += (text.empty() ? L"" : separator) + word;
+    return text;
+}
+std::wstring RuleModeText(const tracker::GuardRule& rule) {
+    switch (rule.mode) {
+    case tracker::GuardMode::AllowAll: return L"全部窗口";
+    case tracker::GuardMode::CheckTitle: return L"检查标题：含分心关键词时提醒";
+    default: return L"只允许标题含：" + JoinWords(rule.keywords);
+    }
+}
+std::wstring RuleScopeText(const tracker::GuardRule& rule) {
+    if (rule.scope.empty()) return L"所有白名单大类";
+    std::vector<std::wstring> names;
+    for (int id : rule.scope) names.push_back(CategoryName(id));
+    return JoinWords(names);
+}
+
+// Draws a slim scroll thumb for a list that scrolls with the wheel.
+void PaintListThumb(Canvas& c, const RECT& view, int content, int scroll, float scale) {
+    const int viewH = Ht(view);
+    if (content <= viewH || viewH <= 0) return;
+    const int thumbH = std::max(static_cast<int>(28 * scale), static_cast<int>(static_cast<long long>(viewH) * viewH / content));
+    const int y = view.top + static_cast<int>(static_cast<long long>(scroll) * (viewH - thumbH) / std::max(1, content - viewH));
+    c.Round(float(view.right - 6 * scale), float(y + 2 * scale), 4 * scale, float(thumbH - 4 * scale), 2 * scale,
+            app.pal.text3, 110);
+}
+
+class GuardRuleDialog : public Dialog {
+public:
+    GuardRuleDialog(const tracker::GuardConfig& config, int editing, bool pickRunning)
+        : config_(config), editing_(editing), pickRunning_(pickRunning) {
+        if (editing >= 0 && editing < static_cast<int>(config.rules.size())) rule = config.rules[static_cast<std::size_t>(editing)];
+        running_ = RunningApps();
+    }
+    tracker::GuardRule rule;
+
+protected:
+    int Width() override { return 520; }
+    int Height() override { return ScopeBottom() + 94; }
+    const std::vector<RECT>& ModeChips() {
+        if (modeChips_.empty()) modeChips_ = FlowChips({L"全部窗口", L"检查标题", L"只允许含关键词的标题"}, 24, 354, Width() - 48);
+        return modeChips_;
+    }
+    const std::vector<RECT>& ScopeChips() {
+        if (scopeChips_.empty()) {
+            std::vector<std::wstring> labels{L"所有白名单大类"};
+            for (const auto& c : app.model.categories) labels.push_back(c.name);
+            scopeChips_ = FlowChips(labels, 24, 522, Width() - 48);
+        }
+        return scopeChips_;
+    }
+    int ScopeBottom() { return ScopeChips().empty() ? 522 + 32 : static_cast<int>(ScopeChips().back().bottom); }
+    RECT ExeField() { return RECT{S(24), S(46), S(Width() - 24), S(88)}; }
+    RECT KeywordField() { return RECT{S(24), S(444), S(Width() - 24), S(486)}; }
+    RECT RunningView() { return RECT{S(24), S(146), S(Width() - 24), S(146 + 5 * 34)}; }
+
+    void Build() override {
+        exe_ = MakeEdit(RG_EXE, rule.exe, L"例如 msedge.exe；* 表示任意程序", 64, false);
+        keywords_ = MakeEdit(RG_KEYWORDS, JoinWords(rule.keywords, L" "), L"用空格或逗号分隔，如：飞书 GitHub 语雀", 400, false);
+        EnableWindow(keywords_, rule.mode == tracker::GuardMode::AllowOnly);
+    }
+    void Place() override {
+        PlaceEdit(exe_, ExeField());
+        PlaceEdit(keywords_, KeywordField());
+        if (pickRunning_) { SetFocus(nullptr); pickRunning_ = false; }
+    }
+    void Draw(Canvas& c) override {
+        const Palette& p = app.pal;
+        Label(c, 24, 22, L"程序");
+        PaintField(c, ExeField(), exe_, !error_.empty() && errorField_ == 0);
+        if (!error_.empty()) {
+            PaintIcon(c, Icon::Alert, Sf(31), Sf(105), Sf(13), p.danger);
+            c.Text(error_, RECT{S(42), S(96), S(Width() - 24), S(114)}, fonts_.label, p.danger);
+        }
+        Label(c, 24, 122, L"正在运行的程序");
+        c.Text(L"单击填入", RECT{S(200), S(122), S(Width() - 24), S(142)}, fonts_.label, p.text3,
+               DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        const RECT view = RunningView();
+        c.Bordered(view, Sf(8), p.field, p.border);
+        const int rowH = S(34);
+        runningContent_ = static_cast<int>(running_.size()) * rowH;
+        runningScroll_ = std::clamp(runningScroll_, 0, std::max(0, runningContent_ - Ht(view)));
+        c.PushClip(RECT{view.left + 1, view.top + 1, view.right - 1, view.bottom - 1});
+        for (std::size_t i = 0; i < running_.size(); ++i) {
+            const RECT row{view.left + S(4), view.top + static_cast<int>(i) * rowH - runningScroll_, view.right - S(4),
+                           view.top + static_cast<int>(i + 1) * rowH - runningScroll_};
+            if (row.bottom < view.top || row.top > view.bottom) continue;
+            const int id = RG_RUNNING_FIRST + static_cast<int>(i);
+            if (hot_ == id) c.Round(RECT{row.left, row.top + S(2), row.right, row.bottom - S(2)}, Sf(6), p.hover);
+            const int exeW = c.Measure(running_[i].exe, fonts_.bodyBold).cx;
+            c.Text(running_[i].exe, RECT{row.left + S(10), row.top, row.left + S(10) + exeW + 2, row.bottom},
+                   fonts_.bodyBold, running_[i].exe == Trim(WindowText(exe_)) ? p.accentText : p.text);
+            c.Text(running_[i].title, RECT{row.left + S(18) + exeW, row.top, row.right - S(10), row.bottom},
+                   fonts_.label, p.text3);
+            AddHit(hits_, c, row, id);
+        }
+        if (running_.empty())
+            c.Text(L"没有找到其他程序的窗口", view, fonts_.label, p.text3, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        c.PopClip();
+        PaintListThumb(c, view, runningContent_, runningScroll_, Sf(1));
+        Label(c, 24, 330, L"方式");
+        static const wchar_t* modes[] = {L"全部窗口", L"检查标题", L"只允许含关键词的标题"};
+        static const wchar_t* notes[] = {L"这个程序的所有窗口都算在工作。",
+                                         L"允许，但窗口标题含「分心关键词」时提醒，适合浏览器。",
+                                         L"只有标题含下面任一关键词的窗口才算在工作。"};
+        const auto& chips = ModeChips();
+        for (int i = 0; i < 3; ++i) {
+            const RECT box{S(chips[static_cast<std::size_t>(i)].left), S(chips[static_cast<std::size_t>(i)].top),
+                           S(chips[static_cast<std::size_t>(i)].right), S(chips[static_cast<std::size_t>(i)].bottom)};
+            const int id = RG_MODE_FIRST + i;
+            const bool selected = static_cast<int>(rule.mode) == i;
+            if (selected) c.Bordered(box, Sf(16), p.accentSoft, p.accent, Sf(1.5f));
+            else c.Bordered(box, Sf(16), hot_ == id ? p.hover : p.surface, p.border);
+            c.Text(modes[i], box, selected ? fonts_.bodyBold : fonts_.body, selected ? p.accentText : p.text2,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            AddHit(hits_, c, box, id);
+        }
+        c.Text(notes[static_cast<int>(rule.mode)], RECT{S(24), S(392), S(Width() - 24), S(412)}, fonts_.label, p.text3);
+        Label(c, 24, 420, L"关键词");
+        const bool keywordsOn = rule.mode == tracker::GuardMode::AllowOnly;
+        if (keywordsOn) PaintField(c, KeywordField(), keywords_, !error_.empty() && errorField_ == 1);
+        else {
+            c.Round(KeywordField(), Sf(8), p.track);
+            c.Text(L"只有「只允许含关键词的标题」需要填写", KeywordField(), fonts_.label, p.text3,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        Label(c, 24, 498, L"适用大类");
+        c.Text(L"畅玩大类本来就不检查", RECT{S(200), S(498), S(Width() - 24), S(518)}, fonts_.label, p.text3,
+               DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        const auto& scope = ScopeChips();
+        for (std::size_t i = 0; i < scope.size(); ++i) {
+            const RECT box{S(scope[i].left), S(scope[i].top), S(scope[i].right), S(scope[i].bottom)};
+            const int id = i == 0 ? RG_SCOPE_ALL : RG_SCOPE_FIRST + static_cast<int>(i - 1);
+            bool selected = rule.scope.empty();
+            COLORREF dot = p.accent;
+            bool free = false;
+            std::wstring name = L"所有白名单大类";
+            if (i > 0) {
+                const auto& category = app.model.categories[i - 1];
+                selected = std::find(rule.scope.begin(), rule.scope.end(), category.id) != rule.scope.end();
+                dot = category.color;
+                free = app.model.isFree(category.id);
+                name = category.name;
+            }
+            if (selected) c.Bordered(box, Sf(16), Mix(p.surface, dot, p.dark ? 0.26 : 0.13), dot, Sf(1.5f));
+            else c.Bordered(box, Sf(16), hot_ == id ? p.hover : p.surface, p.border);
+            if (i > 0) c.Circle(box.left + Sf(16), (box.top + box.bottom) / 2.0f, Sf(5), dot, free ? 110 : 255);
+            c.Text(name, RECT{box.left + S(i > 0 ? 27 : 14), box.top, box.right - S(10), box.bottom},
+                   selected ? fonts_.bodyBold : fonts_.body, free ? p.text3 : selected ? p.text : p.text2);
+            AddHit(hits_, c, box, id);
+        }
+        const int footer = Footer(c);
+        if (editing_ >= 0)
+            DialogButton(c, RECT{S(16), footer, S(16 + 112), footer + S(38)}, L"删除规则", static_cast<int>(Icon::Trash),
+                         Btn::Danger, RG_DELETE);
+    }
+    void Wheel(POINT pt, int delta) override {
+        const RECT view = RunningView();
+        if (PtInRect(&view, pt)) runningScroll_ -= delta * S(34) / WHEEL_DELTA;
+    }
+    void Click(int id) override {
+        if (id >= RG_RUNNING_FIRST && id < RG_RUNNING_FIRST + static_cast<int>(running_.size())) {
+            SetWindowTextW(exe_, running_[static_cast<std::size_t>(id - RG_RUNNING_FIRST)].exe.c_str());
+            error_.clear();
+        } else if (id >= RG_MODE_FIRST && id < RG_MODE_FIRST + 3) {
+            rule.mode = static_cast<tracker::GuardMode>(id - RG_MODE_FIRST);
+            EnableWindow(keywords_, rule.mode == tracker::GuardMode::AllowOnly);
+            if (rule.mode == tracker::GuardMode::AllowOnly) SetFocus(keywords_);
+        } else if (id == RG_SCOPE_ALL) {
+            rule.scope.clear();
+        } else if (id >= RG_SCOPE_FIRST && id < RG_SCOPE_FIRST + static_cast<int>(app.model.categories.size())) {
+            const int category = app.model.categories[static_cast<std::size_t>(id - RG_SCOPE_FIRST)].id;
+            auto& scope = rule.scope;
+            const auto found = std::find(scope.begin(), scope.end(), category);
+            if (found == scope.end()) scope.push_back(category);
+            else scope.erase(found);
+        } else if (id == RG_DELETE && editing_ >= 0) Finish(RG_DELETE);
+        else if (id == IDOK) Accept();
+        else if (id == IDCANCEL) Finish(IDCANCEL);
+        Redraw();
+    }
+    void Changed(int) override {
+        if (!error_.empty()) { error_.clear(); Redraw(); }
+    }
+    void Accept() override {
+        error_.clear();
+        const std::wstring exe = tracker::NormalizeExe(Trim(WindowText(exe_)));
+        std::vector<std::wstring> words;
+        if (exe.empty()) error_ = L"请填写程序名，例如 msedge.exe";
+        else if (!tracker::Model::validGuardExe(exe)) error_ = L"程序名不能含路径或 \\ / : * ? \" < > | 等字符";
+        else if (rule.mode == tracker::GuardMode::AllowOnly) {
+            words = tracker::SplitKeywords(WindowText(keywords_), tracker::kMaxRuleKeywords);
+            if (words.empty()) { error_ = L"请至少填写一个关键词"; errorField_ = 1; }
+            for (const auto& word : words)
+                if (!tracker::Model::validGuardText(word)) { error_ = L"关键词太长：" + word.substr(0, 12); errorField_ = 1; }
+        }
+        if (error_.empty()) {
+            tracker::GuardRule candidate = rule;
+            candidate.exe = exe;
+            candidate.keywords = rule.mode == tracker::GuardMode::AllowOnly ? words : std::vector<std::wstring>{};
+            for (std::size_t i = 0; i < config_.rules.size(); ++i)
+                if (static_cast<int>(i) != editing_ && config_.rules[i] == candidate) error_ = L"已经有一条一样的规则了";
+            if (error_.empty()) {
+                rule = candidate;
+                Finish(IDOK);
+                return;
+            }
+        }
+        if (errorField_ != 1) errorField_ = 0;
+        SetFocus(errorField_ == 1 ? keywords_ : exe_);
+        Redraw();
+    }
+
+private:
+    tracker::GuardConfig config_;
+    int editing_;
+    bool pickRunning_;
+    std::vector<RunningApp> running_;
+    std::vector<RECT> modeChips_, scopeChips_;
+    HWND exe_ = nullptr, keywords_ = nullptr;
+    int runningScroll_ = 0, runningContent_ = 0, errorField_ = 0;
+    std::wstring error_;
+};
+
+class GuardSettingsDialog : public Dialog {
+public:
+    GuardSettingsDialog() : config(app.model.guard) {
+        for (const auto& category : app.model.categories) free.push_back(app.model.isFree(category.id));
+    }
+    tracker::GuardConfig config;
+    std::vector<bool> free;            // per category, in model order
+
+protected:
+    static constexpr int kTabs = 4;
+    int Width() override { return 560; }
+    int Height() override { return 600; }
+    RECT NumberField(int i) {
+        const int x = 24 + (i % 2) * 264, y = 100 + (i / 2) * 78;
+        return RECT{S(x), S(y), S(x + 248), S(y + 42)};
+    }
+    RECT KeywordsBox() { return RECT{S(24), S(126), S(Width() - 24), S(470)}; }
+    RECT RulesView() { return RECT{S(16), S(122), S(Width() - 16), S(Height() - 98)}; }
+    RECT CategoriesView() { return RECT{S(16), S(166), S(Width() - 16), S(Height() - 98)}; }
+
+    void Build() override {
+        const unsigned values[] = {config.graceSeconds, config.repeatSeconds, config.releaseMinutes, config.idleSeconds};
+        for (int i = 0; i < 4; ++i) {
+            numbers_[i] = MakeEdit(GS_GRACE + i, std::to_wstring(values[i]), nullptr, 4, false, ES_NUMBER);
+        }
+        keywords_ = MakeEdit(GS_KEYWORDS, JoinWords(config.keywords, L"\r\n"), nullptr, 8000, false,
+                             ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL);
+        ShowTab();
+    }
+    void ShowTab() {
+        for (HWND edit : numbers_) ShowWindow(edit, tab_ == 3 ? SW_SHOW : SW_HIDE);
+        ShowWindow(keywords_, tab_ == 2 ? SW_SHOW : SW_HIDE);
+    }
+    void Place() override {
+        for (int i = 0; i < 4; ++i) {
+            RECT r = NumberField(i);
+            r.right -= S(56);
+            PlaceEdit(numbers_[i], r);
+        }
+        const RECT box = KeywordsBox();
+        MoveWindow(keywords_, box.left + S(10), box.top + S(8), Wd(box) - S(14), Ht(box) - S(16), TRUE);
+    }
+    void Toggle(Canvas& c, const RECT& row, const std::wstring& title, const std::wstring& note, bool on, int id) {
+        const Palette& p = app.pal;
+        const bool hot = hot_ == id;
+        if (hot) c.Round(row, Sf(8), p.hover);
+        if (note.empty()) c.Text(title, RECT{row.left + S(8), row.top, row.right - S(64), row.bottom}, fonts_.body, p.text);
+        else {
+            c.Text(title, RECT{row.left + S(8), row.top + S(6), row.right - S(64), row.top + S(28)}, fonts_.bodyBold, p.text);
+            c.Text(note, RECT{row.left + S(8), row.top + S(28), row.right - S(64), row.bottom - S(6)}, fonts_.label, p.text3);
+        }
+        const int cy = (row.top + row.bottom) / 2;
+        PaintSwitch(c, RECT{row.right - S(8) - S(42), cy - S(11), row.right - S(8), cy + S(11)}, on, hot);
+        AddHit(hits_, c, row, id);
+    }
+    void Draw(Canvas& c) override {
+        const Palette& p = app.pal;
+        static const wchar_t* tabs[] = {L"常规", L"白名单", L"分心关键词", L"提醒"};
+        const RECT bar{S(24), S(18), S(24) + kTabs * S(104) + S(4), S(18) + S(34)};
+        c.Round(bar, Sf(9), p.track);
+        for (int i = 0; i < kTabs; ++i) {
+            const int id = GS_TAB_FIRST + i;
+            const RECT part{bar.left + S(2) + i * S(104), bar.top + S(2), bar.left + S(2) + (i + 1) * S(104), bar.bottom - S(2)};
+            if (i == tab_) c.Round(part, Sf(7), p.dark ? p.pressed : p.surface);
+            else if (hot_ == id) c.Round(part, Sf(7), p.hover);
+            c.Text(tabs[i], part, i == tab_ ? fonts_.labelBold : fonts_.label, i == tab_ ? p.text : p.text2,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            if (i != tab_) AddHit(hits_, c, part, id);
+        }
+        switch (tab_) {
+        case 0: DrawGeneral(c); break;
+        case 1: DrawRules(c); break;
+        case 2: DrawKeywords(c); break;
+        default: DrawReminder(c); break;
+        }
+        if (!error_.empty()) {
+            const int y = Height() - 98 + 4;
+            PaintIcon(c, Icon::Alert, Sf(31), Sf(y + 9.0f), Sf(13), p.danger);
+            c.Text(error_, RECT{S(42), S(y), S(Width() - 24), S(y + 18)}, fonts_.label, p.danger);
+        }
+        Footer(c);
+    }
+    void DrawGeneral(Canvas& c) {
+        const Palette& p = app.pal;
+        Toggle(c, RECT{S(16), S(66), S(Width() - 16), S(118)}, L"开启专注守护",
+               L"计时白名单大类时，切到白名单之外的应用会弹窗提醒", config.enabled, GS_ENABLED);
+        Label(c, 24, 134, L"各大类");
+        c.Text(L"畅玩电脑：计时时不检查应用", RECT{S(200), S(134), S(Width() - 24), S(154)}, fonts_.label, p.text3,
+               DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        const RECT view = CategoriesView();
+        const int rowH = S(42);
+        const auto& categories = app.model.categories;
+        categoriesContent_ = static_cast<int>(categories.size()) * rowH;
+        categoriesScroll_ = std::clamp(categoriesScroll_, 0, std::max(0, categoriesContent_ - Ht(view)));
+        c.PushClip(view);
+        for (std::size_t i = 0; i < categories.size() && i < free.size(); ++i) {
+            const RECT row{view.left, view.top + static_cast<int>(i) * rowH - categoriesScroll_, view.right,
+                           view.top + static_cast<int>(i + 1) * rowH - categoriesScroll_};
+            if (row.bottom < view.top || row.top > view.bottom) continue;
+            const int cy = (row.top + row.bottom) / 2;
+            c.Round(float(row.left + S(10)), cy - Sf(5), Sf(10), Sf(10), Sf(3), categories[i].color);
+            c.Text(categories[i].name, RECT{row.left + S(30), row.top, row.right - S(190), row.bottom}, fonts_.body, p.text);
+            const RECT seg{row.right - S(8) - S(164), cy - S(15), row.right - S(8), cy + S(15)};
+            c.Round(seg, Sf(9), p.track);
+            static const wchar_t* modes[] = {L"白名单", L"畅玩电脑"};
+            for (int k = 0; k < 2; ++k) {
+                const int id = GS_CATEGORY_FIRST + 2 * static_cast<int>(i) + k;
+                const bool selected = (k == 1) == free[i];
+                const RECT part{seg.left + S(2) + k * S(80), seg.top + S(2), seg.left + S(2) + (k + 1) * S(80), seg.bottom - S(2)};
+                if (selected) c.Round(part, Sf(7), p.dark ? p.pressed : p.surface);
+                else if (hot_ == id) c.Round(part, Sf(7), p.hover);
+                c.Text(modes[k], part, selected ? fonts_.labelBold : fonts_.label, selected ? p.text : p.text2,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                if (!selected) AddHit(hits_, c, part, id);
+            }
+            if (i + 1 < categories.size()) c.Fill(float(row.left + S(10)), float(row.bottom - 1), float(Wd(row) - S(20)), 1, p.grid);
+        }
+        c.PopClip();
+        PaintListThumb(c, view, categoriesContent_, categoriesScroll_, Sf(1));
+    }
+    void DrawRules(Canvas& c) {
+        const Palette& p = app.pal;
+        DialogButton(c, RECT{S(24), S(70), S(24 + 118), S(70 + 36)}, L"添加规则", static_cast<int>(Icon::Plus),
+                     Btn::Secondary, GS_ADD_RULE);
+        DialogButton(c, RECT{S(24 + 126), S(70), S(24 + 126 + 196), S(70 + 36)}, L"从正在运行的程序添加",
+                     static_cast<int>(Icon::Window), Btn::Secondary, GS_ADD_RUNNING);
+        DialogButton(c, RECT{S(Width() - 24 - 104), S(70), S(Width() - 24), S(70 + 36)}, L"恢复默认",
+                     static_cast<int>(Icon::Undo), Btn::Ghost, GS_DEFAULT_RULES);
+        const RECT view = RulesView();
+        const int rowH = S(48);
+        rulesContent_ = static_cast<int>(config.rules.size()) * rowH;
+        rulesScroll_ = std::clamp(rulesScroll_, 0, std::max(0, rulesContent_ - Ht(view)));
+        c.PushClip(view);
+        for (std::size_t i = 0; i < config.rules.size(); ++i) {
+            const RECT row{view.left, view.top + static_cast<int>(i) * rowH - rulesScroll_, view.right,
+                           view.top + static_cast<int>(i + 1) * rowH - rulesScroll_};
+            if (row.bottom < view.top || row.top > view.bottom) continue;
+            const auto& rule = config.rules[i];
+            const int editId = GS_RULE_EDIT_FIRST + static_cast<int>(i), deleteId = GS_RULE_DELETE_FIRST + static_cast<int>(i);
+            const bool hot = hot_ == editId || hot_ == deleteId;
+            if (hot) c.Round(RECT{row.left, row.top + S(2), row.right, row.bottom - S(2)}, Sf(8), p.hover);
+            AddHit(hits_, c, RECT{row.left, row.top + S(2), row.right, row.bottom - S(2)}, editId);
+            const int right = row.right - (hot ? S(84) : S(12));
+            c.Text(rule.exe == L"*" ? std::wstring(L"* 任意程序") : rule.exe,
+                   RECT{row.left + S(12), row.top + S(5), right, row.top + S(26)}, fonts_.bodyBold, p.text);
+            c.Text(RuleModeText(rule) + L" · " + RuleScopeText(rule),
+                   RECT{row.left + S(12), row.top + S(25), right, row.top + S(44)}, fonts_.label, p.text3);
+            if (hot) {
+                const int cy = (row.top + row.bottom) / 2;
+                const RECT edit{row.right - S(76), cy - S(15), row.right - S(46), cy + S(15)};
+                const RECT remove{row.right - S(40), cy - S(15), row.right - S(10), cy + S(15)};
+                PaintIcon(c, Icon::Pencil, (edit.left + edit.right) / 2.0f, float(cy), Sf(15), p.text2);
+                if (hot_ == deleteId) c.Round(remove, Sf(7), p.dangerSoft);
+                PaintIcon(c, Icon::Trash, (remove.left + remove.right) / 2.0f, float(cy), Sf(15),
+                          hot_ == deleteId ? p.danger : p.text2);
+                AddHit(hits_, c, remove, deleteId);
+            }
+        }
+        if (config.rules.empty())
+            c.Text(L"白名单是空的：计时白名单大类时，任何程序都会提醒", view, fonts_.label, p.text3,
+                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        c.PopClip();
+        PaintListThumb(c, view, rulesContent_, rulesScroll_, Sf(1));
+    }
+    void DrawKeywords(Canvas& c) {
+        const Palette& p = app.pal;
+        c.Text(L"只对「检查标题」方式的程序生效（默认是各个浏览器）。", RECT{S(24), S(68), S(Width() - 24), S(88)},
+               fonts_.label, p.text2);
+        c.Text(L"窗口标题里出现这些词就会提醒；每行一个，也可以用空格或逗号分隔。", RECT{S(24), S(90), S(Width() - 24), S(110)},
+               fonts_.label, p.text3);
+        PaintField(c, KeywordsBox(), keywords_, !error_.empty() && errorTab_ == 2);
+        DialogButton(c, RECT{S(24), S(482), S(24 + 150), S(482 + 36)}, L"恢复默认关键词", static_cast<int>(Icon::Undo),
+                     Btn::Ghost, GS_DEFAULT_KEYWORDS);
+    }
+    void DrawReminder(Canvas& c) {
+        const Palette& p = app.pal;
+        static const wchar_t* labels[] = {L"宽限时间", L"重复提醒间隔", L"临时放行时长", L"判定离开电脑"};
+        static const wchar_t* units[] = {L"秒", L"秒", L"分钟", L"秒"};
+        static const wchar_t* ranges[] = {L"0–120", L"10–3600", L"1–240", L"30–3600"};
+        for (int i = 0; i < 4; ++i) {
+            const RECT field = NumberField(i);
+            c.Text(labels[i], RECT{field.left, field.top - S(24), field.right, field.top - S(4)}, fonts_.labelBold, p.text2);
+            c.Text(ranges[i], RECT{field.left, field.top - S(24), field.right, field.top - S(4)}, fonts_.label, p.text3,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            PaintField(c, field, numbers_[i], !error_.empty() && errorTab_ == 3 && errorField_ == i);
+            c.Text(units[i], RECT{field.right - S(56), field.top, field.right - S(12), field.bottom}, fonts_.body, p.text3,
+                   DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        }
+        Toggle(c, RECT{S(16), S(258), S(Width() - 16), S(294)}, L"回到工作时最小化分心的窗口", L"",
+               (config.options & tracker::GuardMinimize) != 0, GS_MINIMIZE);
+        Toggle(c, RECT{S(16), S(298), S(Width() - 16), S(334)}, L"提醒时播放提示音", L"",
+               (config.options & tracker::GuardSound) != 0, GS_SOUND);
+        Toggle(c, RECT{S(16), S(338), S(Width() - 16), S(374)}, L"记录分心窗口的标题（只保存在本机）", L"",
+               (config.options & tracker::GuardLogTitles) != 0, GS_LOG_TITLES);
+        c.Text(L"临时放行会计入次数，并统计你实际停留在放行页面上的时间；", RECT{S(24), S(392), S(Width() - 24), S(412)},
+               fonts_.label, p.text3);
+        c.Text(L"宽限时间内切回来不算分心；超过「判定离开」没有操作时不会提醒。", RECT{S(24), S(414), S(Width() - 24), S(434)},
+               fonts_.label, p.text3);
+    }
+    void Wheel(POINT pt, int delta) override {
+        if (tab_ == 1) {
+            const RECT view = RulesView();
+            if (PtInRect(&view, pt)) rulesScroll_ -= delta * S(48) / WHEEL_DELTA;
+        } else if (tab_ == 0) {
+            const RECT view = CategoriesView();
+            if (PtInRect(&view, pt)) categoriesScroll_ -= delta * S(42) / WHEEL_DELTA;
+        }
+    }
+    void EditRule(int index, bool running) {
+        GuardRuleDialog dialog(config, index, running);
+        const int result = dialog.Run(L"DayLedgerGuardRule", index >= 0 ? L"编辑规则" : L"添加规则", hwnd_);
+        if (result == RG_DELETE && index >= 0) config.rules.erase(config.rules.begin() + index);
+        else if (result == IDOK && index >= 0) config.rules[static_cast<std::size_t>(index)] = dialog.rule;
+        else if (result == IDOK) {
+            MergeGuardRule(config, dialog.rule);
+            rulesScroll_ = 1 << 30;           // show the new rule at the end
+        }
+    }
+    void Click(int id) override {
+        if (id >= GS_TAB_FIRST && id < GS_TAB_FIRST + kTabs) {
+            tab_ = id - GS_TAB_FIRST;
+            ShowTab();
+        } else if (id == GS_ENABLED) config.enabled = !config.enabled;
+        else if (id >= GS_CATEGORY_FIRST && id < GS_CATEGORY_FIRST + 2 * static_cast<int>(free.size())) {
+            free[static_cast<std::size_t>((id - GS_CATEGORY_FIRST) / 2)] = (id - GS_CATEGORY_FIRST) % 2 == 1;
+        } else if (id == GS_MINIMIZE) config.options ^= tracker::GuardMinimize;
+        else if (id == GS_SOUND) config.options ^= tracker::GuardSound;
+        else if (id == GS_LOG_TITLES) config.options ^= tracker::GuardLogTitles;
+        else if (id == GS_ADD_RULE) EditRule(-1, false);
+        else if (id == GS_ADD_RUNNING) EditRule(-1, true);
+        else if (id == GS_DEFAULT_RULES) {
+            if (MessageBoxW(hwnd_, L"把白名单恢复成默认的办公、开发和浏览器规则？你加的规则会被替换。", L"恢复默认白名单",
+                            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES)
+                config.rules = tracker::DefaultGuardRules();
+        } else if (id == GS_DEFAULT_KEYWORDS) {
+            SetWindowTextW(keywords_, JoinWords(tracker::DefaultGuardKeywords(), L"\r\n").c_str());
+        } else if (id >= GS_RULE_DELETE_FIRST && id < GS_RULE_DELETE_FIRST + static_cast<int>(config.rules.size())) {
+            config.rules.erase(config.rules.begin() + (id - GS_RULE_DELETE_FIRST));
+        } else if (id >= GS_RULE_EDIT_FIRST && id < GS_RULE_EDIT_FIRST + static_cast<int>(config.rules.size())) {
+            EditRule(id - GS_RULE_EDIT_FIRST, false);
+        } else if (id == IDOK) Accept();
+        else if (id == IDCANCEL) Finish(IDCANCEL);
+        Redraw();
+    }
+    void Changed(int) override {
+        if (!error_.empty()) { error_.clear(); Redraw(); }
+    }
+    void Fail(int tab, int field, const std::wstring& message, HWND focus) {
+        error_ = message;
+        errorTab_ = tab;
+        errorField_ = field;
+        tab_ = tab;
+        ShowTab();
+        if (focus) { SetFocus(focus); SendMessageW(focus, EM_SETSEL, 0, -1); }
+        Redraw();
+    }
+    void Accept() override {
+        static const unsigned low[] = {0, 10, 1, 30}, high[] = {120, 3600, 240, 3600};
+        static const wchar_t* names[] = {L"宽限时间", L"重复提醒间隔", L"临时放行时长", L"判定离开电脑"};
+        unsigned parsed[4]{};
+        for (int i = 0; i < 4; ++i) {
+            const std::wstring text = Trim(WindowText(numbers_[i]));
+            const bool digits = !text.empty() && text.size() <= 4 &&
+                std::all_of(text.begin(), text.end(), [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; });
+            const unsigned value = digits ? static_cast<unsigned>(std::stoul(text)) : 0xFFFFFFFFu;
+            if (value < low[i] || value > high[i]) {
+                Fail(3, i, Format(L"%ls需在 %u–%u 之间", names[i], low[i], high[i]), numbers_[i]);
+                return;
+            }
+            parsed[i] = value;
+        }
+        const auto words = tracker::SplitKeywords(WindowText(keywords_));
+        for (const auto& word : words)
+            if (!tracker::Model::validGuardText(word)) { Fail(2, 0, L"关键词太长：" + word.substr(0, 12), keywords_); return; }
+        config.graceSeconds = parsed[0];
+        config.repeatSeconds = parsed[1];
+        config.releaseMinutes = parsed[2];
+        config.idleSeconds = parsed[3];
+        config.keywords = words;
+        if (!app.model.validGuard(config)) { Fail(1, 0, L"有规则无效，请检查白名单", nullptr); return; }
+        Finish(IDOK);
+    }
+
+private:
+    HWND numbers_[4]{}, keywords_ = nullptr;
+    int tab_ = 0, errorTab_ = 0, errorField_ = 0;
+    int rulesScroll_ = 0, rulesContent_ = 0, categoriesScroll_ = 0, categoriesContent_ = 0;
+    std::wstring error_;
+};
+
 // ---------------------------------------------------------------- actions
 
 void ToggleTag(int id) {
@@ -3779,6 +4604,9 @@ bool PomodoroCard() {     // the timer card shows the pomodoro rhythm (not a fre
 void AfterPomodoro(const tracker::PomodoroEvents& events) {
     const auto& p = app.pomodoro;
     if (events.restTagCreated) SaveSetting(L"pomodoro", L"restTag", p.restTag);
+    if (events.focusCompleted || events.breakEnded) app.pomoPulseUntil = Now() + 3;   // the window flashes
+    if (app.pomodoroMode && app.pomoAutoShow && (events.focusStarted || events.focusCompleted || events.breakEnded))
+        ShowPomodoroWindow(true);
     if (events.focusCompleted) {
         Chime(true);
         const std::wstring note = events.breakEnded ? std::wstring(L"完成一个番茄，休息也已结束") :
@@ -3872,6 +4700,7 @@ void SetPomodoroMode(bool on) {
     ShowToast(on ? L"番茄钟：专注 " + DurationText(p.config.focus) + L"，休息 " + DurationText(p.config.shortBreak)
                  : std::wstring(L"已切回自由计时"));
     AfterPomodoro(events);
+    ShowPomodoroWindow(on && app.pomoAutoShow);
 }
 
 // Space: pause / resume the pomodoro, or stop / resume an ordinary timer.
@@ -4101,6 +4930,7 @@ void NewCategory() {
         ShowToast(L"无法添加大类：名称无效");
         return;
     }
+    app.model.setCategoryFree(id, dialog.free);
     Persist(true);
     Refresh();
     EnsureSideVisible(SIDE_HEADER, app.model.categoryIndex(id));
@@ -4183,6 +5013,7 @@ void EditCategory(int id) {
         return;
     }
     if (dialog.recolor) app.model.recolorCategory(id);
+    app.model.setCategoryFree(id, dialog.free);
     Persist(true);
     Refresh();
 }
@@ -4525,7 +5356,13 @@ void ShowMainMenu(POINT screen) {
     AppendMenuW(menu, MF_STRING | gray, CMD_ADD_RECORD, L"补录一段时间…\tCtrl+B");
     AppendMenuW(menu, MF_STRING | (app.view ? MF_CHECKED : 0), CMD_VIEW_TOGGLE, L"统计页\tV");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | gray | (app.model.guard.enabled ? MF_CHECKED : 0), CMD_GUARD_TOGGLE, L"开启专注守护");
+    AppendMenuW(menu, MF_STRING | gray, CMD_GUARD_SETTINGS, L"专注守护设置…");
+    if (!app.guard.releases.empty()) AppendMenuW(menu, MF_STRING, CMD_RELEASE_END, L"结束临时放行");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (app.pomodoroMode ? MF_CHECKED : 0), CMD_POMODORO_TOGGLE, L"番茄钟模式\tP");
+    AppendMenuW(menu, MF_STRING | (app.pomoWin.hwnd && IsWindowVisible(app.pomoWin.hwnd) ? MF_CHECKED : 0),
+                CMD_POMODORO_WINDOW, L"番茄窗");
     AppendMenuW(menu, MF_STRING, CMD_POMODORO_SETTINGS, L"番茄钟设置…");
     AppendMenuW(menu, MF_STRING | (app.soundOn ? MF_CHECKED : 0), CMD_SOUND, L"提示音");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -4596,6 +5433,10 @@ void ShowTrayMenu(POINT at) {
     AppendMenuW(menu, MF_POPUP | (shown ? 0 : MF_GRAYED), reinterpret_cast<UINT_PTR>(tags),
                 app.pomodoroMode ? L"专注于标签" : L"切换到标签");
     AppendMenuW(menu, MF_STRING | (app.pomodoroMode ? MF_CHECKED : 0), CMD_POMODORO_TOGGLE, L"番茄钟模式");
+    if (app.pomodoroMode)
+        AppendMenuW(menu, MF_STRING | (app.pomoWin.hwnd && IsWindowVisible(app.pomoWin.hwnd) ? MF_CHECKED : 0),
+                    CMD_POMODORO_WINDOW, L"番茄窗");
+    AppendMenuW(menu, MF_STRING | gray | (app.model.guard.enabled ? MF_CHECKED : 0), CMD_GUARD_TOGGLE, L"专注守护");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, CMD_EXIT, L"退出时光账本");
     SetForegroundWindow(app.hwnd);           // so the menu closes when the user clicks elsewhere
@@ -4673,6 +5514,7 @@ void ShowCategoryMenu(int index, POINT screen) {
                 4, L"下移");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (model.tagsIn(id) && writable ? 0 : MF_GRAYED), 5, L"标签统一换成这个色系…");
+    AppendMenuW(menu, MF_STRING | gray | (model.isFree(id) ? MF_CHECKED : 0), 8, L"畅玩电脑（计时时不检查应用）");
     AppendMenuW(menu, MF_STRING | gray, 7, L"新建大类…");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING | (model.categories.size() > 1 && writable ? 0 : MF_GRAYED), 6, L"删除大类…");
@@ -4685,6 +5527,7 @@ void ShowCategoryMenu(int index, POINT screen) {
         case 5: RecolorCategory(id); break;
         case 6: DeleteCategory(id); break;
         case 7: NewCategory(); break;
+        case 8: SetCategoryFree(id, !app.model.isFree(id)); break;
         }
     });
 }
@@ -4739,6 +5582,677 @@ void PromptAway(long long from, long long now) {
         Persist(true);
     }
     Refresh();
+}
+
+// ---------------------------------------------------------------- focus guard
+
+UINT WindowDpi(HWND window) {
+    using GetDpi = UINT(WINAPI*)(HWND);
+    static GetDpi get = LoadProc<GetDpi>(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow");
+    const UINT dpi = get && window ? get(window) : 0;
+    return dpi ? dpi : app.dpi;
+}
+
+void RoundCorners(HWND window) {
+    using SetAttribute = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+    static SetAttribute set = LoadProc<SetAttribute>(SystemLibrary(L"dwmapi.dll"), "DwmSetWindowAttribute");
+    if (!set) return;
+    const DWORD round = 2;                 // DWMWCP_ROUND
+    set(window, 33, &round, sizeof(round));
+}
+
+// Mouse handling shared by the floating windows. Returns the id of a completed click, else 0.
+int FloaterMouse(Floater& f, HWND window, UINT message, LPARAM lp) {
+    const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+    switch (message) {
+    case WM_MOUSEMOVE: {
+        if (!f.tracking) {
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, window, 0};
+            TrackMouseEvent(&track);
+            f.tracking = true;
+        }
+        const int hit = f.HitAt(pt);
+        if (hit != f.hot) { f.hot = hit; InvalidateRect(window, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        f.tracking = false;
+        f.hot = 0;
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONDOWN:
+        f.pressed = f.HitAt(pt);
+        if (f.pressed) SetCapture(window);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_LBUTTONUP: {
+        const int pressed = f.pressed;
+        f.pressed = 0;
+        if (GetCapture() == window) ReleaseCapture();
+        const int hit = f.HitAt(pt);
+        InvalidateRect(window, nullptr, FALSE);
+        return pressed && pressed == hit ? hit : 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (reinterpret_cast<HWND>(lp) != window && f.pressed) { f.pressed = 0; InvalidateRect(window, nullptr, FALSE); }
+        return 0;
+    }
+    return 0;
+}
+
+void FloaterButton(Floater& f, Canvas& c, const RECT& r, const std::wstring& label, int icon, Btn kind, int id,
+                   bool enabled = true, COLORREF tint = 0) {
+    const bool hot = enabled && f.hot == id, down = hot && f.pressed == id;
+    PaintButton(c, f.fonts, f.Sf(1), r, label, icon, kind, hot, down, enabled, tint);
+    if (enabled) AddHit(f.hits, c, r, id);
+}
+
+void FloaterIcon(Floater& f, Canvas& c, const RECT& r, Icon icon, int id, float size = 16) {
+    const Palette& p = app.pal;
+    const bool hot = f.hot == id, down = hot && f.pressed == id;
+    if (down) c.Round(r, f.Sf(7), p.pressed);
+    else if (hot) c.Round(r, f.Sf(7), p.hover);
+    PaintIcon(c, icon, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, f.Sf(size), hot ? p.text : p.text2);
+    AddHit(f.hits, c, r, id);
+}
+
+// ---- the window in front
+
+struct Foreground {
+    HWND hwnd = nullptr;
+    std::wstring exe, title, cls;
+    bool neutral = true;                // DayLedger itself, the shell, nothing
+};
+
+std::wstring ProcessExe(DWORD pid) {
+    const DWORD tick = GetTickCount();
+    const auto found = app.exeCache.find(pid);
+    if (found != app.exeCache.end() && tick - found->second.second < 30000) return found->second.first;
+    std::wstring exe;
+    if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+        std::vector<wchar_t> path(32768);
+        DWORD size = static_cast<DWORD>(path.size());
+        if (QueryFullProcessImageNameW(process, 0, path.data(), &size))
+            exe = tracker::NormalizeExe(std::wstring(path.data(), size));
+        CloseHandle(process);
+    }
+    if (app.exeCache.size() > 256) app.exeCache.clear();
+    app.exeCache[pid] = {exe, tick};
+    return exe;
+}
+
+struct ChildSearch { DWORD frame; DWORD found; };
+BOOL CALLBACK FindAppChild(HWND child, LPARAM lp) {
+    auto* search = reinterpret_cast<ChildSearch*>(lp);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(child, &pid);
+    if (pid && pid != search->frame) {
+        search->found = pid;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+Foreground ReadForeground() {
+    Foreground fg;
+    if (app.guardSimulated) {
+        fg.exe = app.guardSimExe;
+        fg.title = app.guardSimTitle;
+        fg.neutral = fg.exe.empty() && fg.title.empty();
+        return fg;
+    }
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) return fg;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    fg.hwnd = hwnd;
+    if (!pid || pid == GetCurrentProcessId()) return fg;
+    wchar_t text[512]{};
+    GetClassNameW(hwnd, text, 512);
+    fg.cls = text;
+    text[0] = 0;
+    GetWindowTextW(hwnd, text, 512);
+    fg.title = text;
+    fg.exe = ProcessExe(pid);
+    if (fg.exe == L"applicationframehost.exe") {        // a Store app draws inside this frame
+        ChildSearch search{pid, 0};
+        EnumChildWindows(hwnd, FindAppChild, reinterpret_cast<LPARAM>(&search));
+        if (search.found) fg.exe = ProcessExe(search.found);
+    }
+    fg.neutral = tracker::IsShellWindow(fg.exe, fg.cls) || (fg.exe.empty() && fg.title.empty());
+    return fg;
+}
+
+// The tag being timed when the guard watches: the guard is on, its category is not free time and
+// it is not a pomodoro break.
+const tracker::Tag* GuardedTag() {
+    const auto& model = app.model;
+    if (!model.guard.enabled || !model.activeTagId) return nullptr;
+    if (app.pomodoroMode && app.pomodoro.phase == tracker::PomodoroPhase::Break) return nullptr;
+    const auto* tag = model.findTag(model.activeTagId);
+    return tag && !model.isFree(tag->category) ? tag : nullptr;
+}
+
+// The tag "记为…" switches to: the latest one used in a free category (not the break tag),
+// else the first free tag.
+int LastFreeTag() {
+    const auto& model = app.model;
+    const int rest = app.pomodoro.restTag;
+    for (auto it = model.sessions.rbegin(); it != model.sessions.rend(); ++it) {
+        const auto* tag = model.findTag(it->tagId);
+        if (tag && tag->id != rest && model.isFree(tag->category)) return tag->id;
+    }
+    int fallback = 0;
+    for (int index : DisplayTags()) {
+        const auto& tag = model.tags[static_cast<std::size_t>(index)];
+        if (!model.isFree(tag.category)) continue;
+        if (tag.id != rest) return tag.id;
+        if (!fallback) fallback = tag.id;
+    }
+    return fallback;
+}
+
+// ---- the guard log (guard.tsv next to the ledger): one line per distraction and release
+
+std::wstring GuardLogPath() { return app.dataDir.empty() ? std::wstring() : app.dataDir + L"\\guard.tsv"; }
+
+bool WriteGuardText(const std::wstring& path, const std::string& text, bool append) {
+    HANDLE file = CreateFileW(path.c_str(), append ? FILE_APPEND_DATA : GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                              append ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    GetFileSizeEx(file, &size);
+    const std::string data = (size.QuadPart == 0 ? std::string(tracker::GuardLogHeader()) + "\n" : std::string()) + text;
+    DWORD written = 0;
+    const bool ok = WriteFile(file, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) &&
+                    written == data.size();
+    CloseHandle(file);
+    return ok;
+}
+
+void RewriteGuardLog() {
+    const auto path = GuardLogPath();
+    if (path.empty() || app.readOnly) return;
+    std::string text;
+    for (const auto& record : app.guardLog) text += tracker::FormatGuardRecord(record) + "\n";
+    const std::wstring temporary = path + L".tmp";
+    DeleteFileW(temporary.c_str());
+    if (WriteGuardText(temporary, text, false))
+        MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    DeleteFileW(temporary.c_str());
+}
+
+// Keeps the last 400 days; a log over 4 MB is rewritten with those only.
+void LoadGuardLog() {
+    app.guardLog.clear();
+    const auto path = GuardLogPath();
+    if (path.empty()) return;
+    std::ifstream in(std::filesystem::path(path), std::ios::binary);
+    if (!in) return;
+    const long long keepFrom = Now() - 400LL * 86400;
+    std::string line;
+    while (std::getline(in, line)) {
+        tracker::GuardRecord record;
+        if (tracker::ParseGuardRecord(line, record) && record.end >= keepFrom) app.guardLog.push_back(std::move(record));
+    }
+    in.close();
+    std::error_code error;
+    const auto size = std::filesystem::file_size(std::filesystem::path(path), error);
+    if (!error && size > 4u * 1024 * 1024) RewriteGuardLog();
+}
+
+void AppendGuardRecord(tracker::GuardRecord record) {
+    if (!(app.model.guard.options & tracker::GuardLogTitles)) record.title.clear();
+    app.guardLog.push_back(record);
+    const auto path = GuardLogPath();
+    if (!path.empty() && !app.readOnly) WriteGuardText(path, tracker::FormatGuardRecord(record) + "\n", true);
+}
+
+GuardCounts CountGuard(long long from, long long to) {
+    GuardCounts n;
+    for (const auto& record : app.guardLog) {
+        if (record.start < from || record.start >= to) continue;
+        if (record.type == L'R') { ++n.releases; n.released += record.seconds; }
+        else { ++n.distractions; n.distracted += record.seconds; }
+    }
+    const long long now = Now();
+    const auto& g = app.guard;
+    if (g.state == tracker::GuardState::Alerting && g.since >= from && g.since < to) {
+        ++n.distractions;
+        n.distracted += std::max(0LL, now - g.since);
+    }
+    for (const auto& release : g.releases)
+        if (release.start >= from && release.start < to) { ++n.releases; n.released += release.dwell; }
+    return n;
+}
+
+// ---- the reminder
+
+constexpr int kGuardPopupW = 480, kGuardPopupH = 214;
+
+DWORD WINAPI GuardChimeThread(void*) {
+    Beep(880, 120);
+    Beep(660, 180);
+    return 0;
+}
+
+bool GuardPopupVisible() { return app.guardWin.hwnd && IsWindowVisible(app.guardWin.hwnd); }
+
+void GuardPopupHide() {
+    auto& f = app.guardWin;
+    if (!f.hwnd) return;
+    KillTimer(f.hwnd, 1);
+    ShowWindow(f.hwnd, SW_HIDE);
+    f.hot = f.pressed = 0;
+}
+
+// Topmost, on the monitor of the distracting window, without taking the keyboard focus.
+void GuardPopupShow() {
+    auto& f = app.guardWin;
+    if (!f.hwnd) {
+        f.hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"DayLedgerGuardPopup", L"专注守护", WS_POPUP,
+                                 0, 0, 10, 10, nullptr, nullptr, app.instance, nullptr);
+        if (!f.hwnd) return;
+        RoundCorners(f.hwnd);
+    }
+    HWND anchor = !app.guardSimulated && app.guardTarget && IsWindow(app.guardTarget) ? app.guardTarget : app.hwnd;
+    MONITORINFO monitor{};
+    monitor.cbSize = sizeof(monitor);
+    GetMonitorInfoW(MonitorFromWindow(anchor, MONITOR_DEFAULTTONEAREST), &monitor);
+    const RECT work = monitor.rcWork;
+    // A first placement on that monitor gives the window its DPI.
+    SetWindowPos(f.hwnd, HWND_TOPMOST, work.left + Wd(work) / 2, work.top + Ht(work) / 4, 10, 10, SWP_NOACTIVATE);
+    const UINT dpi = WindowDpi(f.hwnd);
+    if (dpi != f.dpi || !f.fonts.body) {
+        f.dpi = dpi;
+        f.fonts.Create(dpi, app.numberFace);
+    }
+    const int w = f.S(kGuardPopupW), h = f.S(kGuardPopupH);
+    SetWindowPos(f.hwnd, HWND_TOPMOST, work.left + (Wd(work) - w) / 2, work.top + Ht(work) * 16 / 100, w, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetTimer(f.hwnd, 1, 1000, nullptr);
+    InvalidateRect(f.hwnd, nullptr, FALSE);
+}
+
+// Records, sound and reminder visibility after a guard step.
+void ApplyGuard(const tracker::GuardOutput& out) {
+    for (const auto& record : out.records) AppendGuardRecord(record);
+    if (out.hide) GuardPopupHide();
+    if (out.show) GuardPopupShow();
+    if (out.sound && (app.model.guard.options & tracker::GuardSound)) {
+        HANDLE thread = CreateThread(nullptr, 0, GuardChimeThread, nullptr, 0, nullptr);
+        if (thread) CloseHandle(thread);
+    }
+    if (out.refresh && app.guardWin.hwnd) InvalidateRect(app.guardWin.hwnd, nullptr, FALSE);
+    if (!out.records.empty() || out.show || out.hide) {
+        InvalidateRect(app.hwnd, nullptr, FALSE);
+        if (app.pomoWin.hwnd) InvalidateRect(app.pomoWin.hwnd, nullptr, FALSE);
+    }
+}
+
+void GuardEvaluate() {
+    const long long now = Now();
+    tracker::GuardInput in;
+    Foreground fg;
+    if (const auto* tag = GuardedTag()) {
+        in.applies = true;
+        in.category = tag->category;
+        in.tag = tag->id;
+        fg = ReadForeground();
+        in.neutral = fg.neutral;
+        in.exe = fg.exe;
+        in.title = fg.title;
+        if (!app.guardSimulated) {
+            LASTINPUTINFO input{};
+            input.cbSize = sizeof(input);
+            if (GetLastInputInfo(&input)) {
+                const DWORD idle = GetTickCount() - input.dwTime;
+                if (idle >= app.model.guard.idleSeconds * 1000u) {
+                    in.idle = true;
+                    in.lastInput = now - static_cast<long long>(idle / 1000);
+                }
+            }
+        }
+    }
+    const auto out = app.guard.update(app.model.guard, in, now);
+    if (in.applies && !fg.neutral && fg.hwnd) {
+        if (out.result.verdict == tracker::GuardVerdict::Allowed) app.guardLastAllowed = fg.hwnd;
+        else if (out.result.verdict == tracker::GuardVerdict::Violation) app.guardTarget = fg.hwnd;
+    }
+    ApplyGuard(out);
+}
+
+void CALLBACK GuardForegroundEvent(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    if (app.hwnd) PostMessageW(app.hwnd, WM_DL_GUARD, 0, 0);
+}
+
+// The guard stops watching for good (exit, shutdown, sleep): finish what is open.
+void GuardStop(const wchar_t* action) {
+    ApplyGuard(app.guard.stop(Now(), action));
+}
+
+// ---- the reminder's actions
+
+void GuardBackToWork() {
+    if (!app.guardSimulated) {
+        if ((app.model.guard.options & tracker::GuardMinimize) && app.guardTarget && IsWindow(app.guardTarget))
+            ShowWindowAsync(app.guardTarget, SW_MINIMIZE);
+        HWND back = app.guardLastAllowed;
+        if (back && IsWindow(back) && IsWindowVisible(back)) {
+            if (IsIconic(back)) ShowWindowAsync(back, SW_RESTORE);
+            SetForegroundWindow(back);
+        }
+    }
+    ApplyGuard(app.guard.dismiss(Now()));
+    GuardEvaluate();
+}
+
+std::wstring GuardSourceLabel() {
+    const auto& g = app.guard;
+    if (g.reason == tracker::GuardReason::Keyword && !g.keyword.empty()) return L"「" + g.keyword + L"」";
+    return L"「" + (g.exe.empty() ? std::wstring(L"这个窗口") : g.exe) + L"」";
+}
+
+void GuardRelease(unsigned minutes) {
+    if (app.guard.state != tracker::GuardState::Alerting && app.guard.state != tracker::GuardState::Pending) return;
+    minutes = std::clamp(minutes, 1u, 240u);
+    const std::wstring what = GuardSourceLabel();
+    ApplyGuard(app.guard.release(Now(), minutes * 60LL));
+    const auto counts = CountGuard(TodayStart(), ShiftDay(TodayStart(), 1));
+    ShowToast(L"已临时放行" + what + Format(L" %u 分钟 · 今天第 %d 次", minutes, counts.releases), TOAST_PLAIN, 6);
+    InvalidateRect(app.hwnd, nullptr, FALSE);
+}
+
+void EndReleases() {
+    const long long now = Now();
+    while (!app.guard.releases.empty()) ApplyGuard(app.guard.endRelease(0, now, L"ended"));
+    GuardEvaluate();
+    ShowToast(L"已结束临时放行");
+}
+
+// A rule for the program (or keyword) in the reminder; the same program, way and scope merge.
+void MergeGuardRule(tracker::GuardConfig& config, const tracker::GuardRule& rule) {
+    for (auto& existing : config.rules) {
+        if (existing.exe != rule.exe || existing.mode != rule.mode || existing.scope != rule.scope) continue;
+        for (const auto& keyword : rule.keywords)
+            if (existing.keywords.size() < tracker::kMaxRuleKeywords &&
+                std::find(existing.keywords.begin(), existing.keywords.end(), keyword) == existing.keywords.end())
+                existing.keywords.push_back(keyword);
+        return;
+    }
+    if (config.rules.size() < tracker::kMaxGuardRules) config.rules.push_back(rule);
+}
+
+void GuardAllow(int how) {
+    if (!GuardWritable()) return;
+    const auto& g = app.guard;
+    auto config = app.model.guard;
+    const std::wstring program = g.exe.empty() ? std::wstring(L"*") : g.exe;
+    std::wstring note;
+    if (how == GP_DROP_KEYWORD) {
+        auto& words = config.keywords;
+        words.erase(std::remove(words.begin(), words.end(), g.keyword), words.end());
+        note = L"「" + g.keyword + L"」不再算分心关键词";
+    } else {
+        tracker::GuardRule rule;
+        rule.exe = program;
+        rule.mode = how == GP_ALLOW_APP ? tracker::GuardMode::AllowAll :
+                    how == GP_ALLOW_APP_CHECK ? tracker::GuardMode::CheckTitle : tracker::GuardMode::AllowOnly;
+        if (rule.mode == tracker::GuardMode::AllowOnly) {
+            if (g.keyword.empty()) return;
+            rule.keywords = {g.keyword};
+        }
+        MergeGuardRule(config, rule);
+        note = how == GP_ALLOW_KEYWORD ? L"已加入白名单：「" + program + L"」里标题含「" + g.keyword + L"」的窗口" :
+               how == GP_ALLOW_APP ? L"已加入白名单：「" + program + L"」的所有窗口" :
+                                     L"已加入白名单：「" + program + L"」（检查标题）";
+    }
+    if (!app.model.setGuard(config)) {
+        ShowToast(L"无法修改白名单");
+        return;
+    }
+    Persist(true);
+    ApplyGuard(app.guard.finish(Now(), L"allowed"));
+    ShowToast(note + L" · 可在「专注守护」设置里修改", TOAST_PLAIN, 6);
+    Refresh();
+}
+
+// "记为…": from the moment the distraction began the time goes to a free tag (a running pomodoro
+// is given up, uncounted).
+void GuardSwitchToFree(int tagId) {
+    if (!GuardWritable()) return;
+    auto& model = app.model;
+    const auto* tag = model.findTag(tagId);
+    if (!tag || !model.isFree(tag->category) || !model.activeTagId || model.activeTagId == tagId) return;
+    const long long now = Now();
+    const long long from = std::clamp(app.guard.since ? app.guard.since : now, model.activeSince, now);
+    const std::wstring name = tag->name;
+    ApplyGuard(app.guard.finish(now, L"switched"));
+    if (app.pomodoroMode && app.pomodoro.phase == tracker::PomodoroPhase::Focus) app.pomodoro.leave();
+    model.stop(from);
+    model.start(tagId, from);
+    app.selectedTagId = tagId;
+    Persist(true);
+    Refresh();
+    ShowToast(L"已从 " + HM(from) + L" 起记为「" + name + L"」", TOAST_PLAIN, 6);
+}
+
+void GuardPopupCommand(int id);
+
+void GuardMenu(int which, const RECT& anchor) {
+    auto& f = app.guardWin;
+    const auto& g = app.guard;
+    HMENU menu = CreatePopupMenu();
+    const UINT gray = app.readOnly ? MF_GRAYED : 0;
+    const std::wstring program = g.exe.empty() ? std::wstring(L"*") : g.exe;
+    if (which == GP_RELEASE_MENU) {
+        for (unsigned minutes : {5u, 10u, 15u, 30u, 60u})
+            AppendMenuW(menu, MF_STRING, GP_RELEASE_MINUTES_FIRST + minutes, Format(L"临时放行 %u 分钟", minutes).c_str());
+    } else if (which == GP_FREE_MENU) {
+        int count = 0;
+        for (int index : DisplayTags()) {
+            const auto& tag = app.model.tags[static_cast<std::size_t>(index)];
+            if (!app.model.isFree(tag.category) || count++ >= 12) continue;
+            AppendMenuW(menu, MF_STRING | gray, static_cast<UINT_PTR>(GP_FREE_TAG_FIRST + index),
+                        (L"记为「" + tag.name + L"」 · " + CategoryName(tag.category)).c_str());
+        }
+    } else {
+        if (g.reason == tracker::GuardReason::Keyword) {
+            AppendMenuW(menu, MF_STRING | gray, GP_ALLOW_KEYWORD,
+                        (L"允许「" + program + L"」里标题含「" + g.keyword + L"」的窗口").c_str());
+            AppendMenuW(menu, MF_STRING | gray, GP_DROP_KEYWORD, (L"「" + g.keyword + L"」不再算分心关键词").c_str());
+        } else {
+            AppendMenuW(menu, MF_STRING | gray, GP_ALLOW_APP, (L"允许「" + program + L"」的所有窗口").c_str());
+            AppendMenuW(menu, MF_STRING | gray, GP_ALLOW_APP_CHECK, (L"允许「" + program + L"」，但检查标题").c_str());
+        }
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, GP_SETTINGS, L"打开专注守护设置…");
+    }
+    POINT at{anchor.left, anchor.bottom + f.S(4)};
+    ClientToScreen(f.hwnd, &at);
+    int command = 0;
+    {
+        ModalScope modal;
+        command = static_cast<int>(TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, at.x, at.y,
+                                                    f.hwnd, nullptr));
+    }
+    DestroyMenu(menu);
+    if (command) GuardPopupCommand(command);
+}
+
+void GuardPopupCommand(int id) {
+    auto& f = app.guardWin;
+    const long long now = Now();
+    RECT anchor{};
+    for (const auto& h : f.hits) if (h.id == id) anchor = h.rect;
+    switch (id) {
+    case GP_BACK: GuardBackToWork(); break;
+    case GP_RELEASE: GuardRelease(app.model.guard.releaseMinutes); break;
+    case GP_SWITCH_FREE: GuardSwitchToFree(LastFreeTag()); break;
+    case GP_ALLOW_APP: case GP_ALLOW_APP_CHECK: case GP_ALLOW_KEYWORD: case GP_DROP_KEYWORD: GuardAllow(id); break;
+    case GP_RELEASE_MENU: case GP_FREE_MENU: case GP_ALLOW_MENU: GuardMenu(id, anchor); break;
+    case GP_SETTINGS:
+        ApplyGuard(app.guard.dismiss(now));
+        PostMessageW(app.hwnd, WM_COMMAND, CMD_GUARD_SETTINGS, 0);
+        break;
+    case GP_DISMISS: ApplyGuard(app.guard.dismiss(now)); break;
+    default:
+        if (id >= GP_FREE_TAG_FIRST && id < GP_FREE_TAG_FIRST + static_cast<int>(app.model.tags.size()))
+            GuardSwitchToFree(app.model.tags[static_cast<std::size_t>(id - GP_FREE_TAG_FIRST)].id);
+        else if (id > GP_RELEASE_MINUTES_FIRST && id <= GP_RELEASE_MINUTES_FIRST + 240)
+            GuardRelease(static_cast<unsigned>(id - GP_RELEASE_MINUTES_FIRST));
+        break;
+    }
+    if (f.hwnd) InvalidateRect(f.hwnd, nullptr, FALSE);
+}
+
+void PaintGuardPopup(Canvas& c, int w, int h) {
+    auto& f = app.guardWin;
+    f.hits.clear();
+    const Palette& p = app.pal;
+    const auto& g = app.guard;
+    const long long now = Now();
+    c.Fill(0, 0, float(w), float(h), p.surface);
+    c.Fill(0, 0, float(w), f.Sf(3), p.danger);
+    if (WindowsBuild() < 22000) {            // Windows 11 draws the border itself
+        c.Fill(0, float(h - 1), float(w), 1, p.borderStrong);
+        c.Fill(0, 0, 1, float(h), p.borderStrong);
+        c.Fill(float(w - 1), 0, 1, float(h), p.borderStrong);
+    }
+    const int pad = f.S(20);
+    const auto* tag = app.model.findTag(g.tag);
+    const auto* category = tag ? app.model.findCategory(tag->category) : nullptr;
+    PaintIcon(c, Icon::Shield, pad + f.Sf(8), f.Sf(26), f.Sf(17), p.danger);
+    c.Text(L"专注守护" + (category ? L" · 「" + category->name + L"」专注中" : std::wstring()),
+           RECT{pad + f.S(24), f.S(14), w - f.S(52), f.S(38)}, f.fonts.labelBold, p.text2);
+    FloaterIcon(f, c, RECT{w - f.S(10) - f.S(30), f.S(10), w - f.S(10), f.S(40)}, Icon::Close, GP_DISMISS, 15);
+    const std::wstring program = g.exe.empty() ? std::wstring(L"这个窗口") : g.exe;
+    const std::wstring heading = g.reason == tracker::GuardReason::Keyword ? L"标题里有「" + g.keyword + L"」"
+                                                                           : L"「" + program + L"」不在白名单里";
+    c.Text(heading, RECT{pad, f.S(42), w - pad, f.S(70)}, f.fonts.name, p.text);
+    c.Text(program + (g.title.empty() ? std::wstring() : L" · " + g.title), RECT{pad, f.S(72), w - pad, f.S(92)},
+           f.fonts.label, p.text2);
+    c.Text(L"已持续 " + CountdownText(std::max(0LL, now - g.since)) +
+           (tag ? L" · 这段时间仍计入「" + tag->name + L"」" : std::wstring()),
+           RECT{pad, f.S(94), w - pad, f.S(112)}, f.fonts.label, p.text3);
+    const int top = f.S(124), bottom = top + f.S(38), gap = f.S(8);
+    const RECT back{pad, top, pad + f.S(104), bottom};
+    FloaterButton(f, c, back, L"回到工作", -1, Btn::Primary, GP_BACK);
+    const RECT release{back.right + gap, top, back.right + gap + f.S(136), bottom};
+    FloaterButton(f, c, release, Format(L"临时放行 %u 分钟", app.model.guard.releaseMinutes), -1, Btn::Secondary,
+                  GP_RELEASE);
+    const RECT minutes{release.right + f.S(2), top, release.right + f.S(2) + f.S(26), bottom};
+    FloaterIcon(f, c, minutes, Icon::ChevronDown, GP_RELEASE_MENU, 14);
+    if (const auto* free = app.model.findTag(LastFreeTag())) {
+        const RECT body{minutes.right + gap, top, w - pad - f.S(24), bottom};
+        const RECT more{body.right, top, w - pad, bottom};
+        FloaterButton(f, c, body, L"记为「" + free->name + L"」", -1, Btn::Tinted, GP_SWITCH_FREE, !app.readOnly,
+                      free->color);
+        const bool hot = f.hot == GP_FREE_MENU;
+        c.Round(more, f.Sf(8), hot ? Mix(free->color, RGB(0, 0, 0), 0.12) : Mix(free->color, p.surface, 0.25));
+        PaintIcon(c, Icon::ChevronDown, (more.left + more.right) / 2.0f, (top + bottom) / 2.0f, f.Sf(13),
+                  InkOn(free->color));
+        if (!app.readOnly) AddHit(f.hits, c, more, GP_FREE_MENU);
+    }
+    const int linkTop = bottom + f.S(10), linkBottom = linkTop + f.S(30);
+    const RECT allow{pad - f.S(8), linkTop, pad - f.S(8) + f.S(138), linkBottom};
+    FloaterButton(f, c, allow, L"加入白名单…", static_cast<int>(Icon::Plus), Btn::Ghost, GP_ALLOW_MENU, !app.readOnly);
+    const RECT settings{allow.right, linkTop, allow.right + f.S(76), linkBottom};
+    FloaterButton(f, c, settings, L"设置", static_cast<int>(Icon::Sliders), Btn::Ghost, GP_SETTINGS);
+    const auto counts = CountGuard(TodayStart(), ShiftDay(TodayStart(), 1));
+    c.Text(Format(L"今天临时放行 %d 次 · 停留 ", counts.releases) + DurationText(counts.released),
+           RECT{settings.right + f.S(6), linkTop, w - pad, linkBottom}, f.fonts.caption, p.text3,
+           DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+LRESULT CALLBACK GuardPopupProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto& f = app.guardWin;
+    switch (message) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC target = BeginPaint(window, &ps);
+        RECT client{};
+        GetClientRect(window, &client);
+        if (client.right > 0 && client.bottom > 0 && f.surface.Ensure(client.right, client.bottom)) {
+            {
+                Canvas canvas(f.surface);
+                PaintGuardPopup(canvas, client.right, client.bottom);
+            }
+            BitBlt(target, 0, 0, client.right, client.bottom, f.surface.Dc(), 0, 0, SRCCOPY);
+        }
+        EndPaint(window, &ps);
+        return 0;
+    }
+    case WM_NCHITTEST: {             // drag it by any empty part
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(window, &pt);
+        return f.HitAt(pt) ? HTCLIENT : HTCAPTION;
+    }
+    case WM_MOUSEMOVE: case WM_MOUSELEAVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_CAPTURECHANGED: {
+        const int clicked = FloaterMouse(f, window, message, lp);
+        if (clicked) GuardPopupCommand(clicked);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_RETURN) GuardPopupCommand(GP_BACK);
+        else if (wp == VK_ESCAPE) GuardPopupCommand(GP_DISMISS);
+        return 0;
+    case WM_COMMAND:                 // automation: the same ids as the buttons
+        GuardPopupCommand(LOWORD(wp));
+        return 0;
+    case WM_TIMER:
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_DPICHANGED:
+        f.dpi = HIWORD(wp);
+        f.fonts.Create(f.dpi, app.numberFace);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_CLOSE:
+        GuardPopupCommand(GP_DISMISS);
+        return 0;
+    case WM_NCDESTROY:
+        f.surface.Release();
+        f.fonts.Release();
+        f.hwnd = nullptr;
+        break;
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+
+void EditGuardSettings() {
+    if (!GuardWritable()) return;
+    if (app.guardWin.hwnd && GuardPopupVisible()) ApplyGuard(app.guard.dismiss(Now()));
+    GuardSettingsDialog dialog;
+    if (dialog.Run(L"DayLedgerGuardSettings", L"专注守护") != IDOK) return;
+    if (!app.model.setGuard(dialog.config)) {
+        ShowToast(L"设置未保存：请检查输入");
+        return;
+    }
+    for (std::size_t i = 0; i < dialog.free.size() && i < app.model.categories.size(); ++i)
+        app.model.setCategoryFree(app.model.categories[i].id, dialog.free[i]);
+    Persist(true);
+    Refresh();
+    ShowToast(app.model.guard.enabled ? L"专注守护设置已保存" : L"设置已保存 · 专注守护目前是关闭的");
+}
+
+void SetGuardEnabled(bool on) {
+    if (on == app.model.guard.enabled || !GuardWritable()) return;
+    auto config = app.model.guard;
+    config.enabled = on;
+    if (!app.model.setGuard(config)) return;
+    Persist(true);
+    Refresh();
+    ShowToast(on ? L"专注守护已开启：计时白名单大类时，切到白名单外的应用会提醒" : L"专注守护已关闭");
+}
+
+void SetCategoryFree(int categoryId, bool free) {
+    if (!GuardWritable() || !app.model.setCategoryFree(categoryId, free)) return;
+    Persist(true);
+    Refresh();
+    ShowToast(L"「" + CategoryName(categoryId) + (free ? L"」改为畅玩电脑：计时时不检查应用" : L"」改为白名单：计时时检查应用"));
 }
 
 // ---------------------------------------------------------------- mini window
@@ -5238,6 +6752,425 @@ LRESULT CALLBACK CalendarProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(window, message, wp, lp);
 }
 
+// ---------------------------------------------------------------- pomodoro window
+
+// The pomodoro as its own small window, in the look of the standalone timer DayLedger grew out of:
+// dark, a big countdown, a progress bar, one large start / pause button, give up / skip, a pin to
+// keep it on top and a strip form. On top of that it shows what is being focused on (click it to
+// switch), and the focus guard's state.
+constexpr int kPomoW = 260, kPomoH = 340, kPomoMinW = 220, kPomoMinH = 290, kPomoStripW = 236, kPomoStripH = 50;
+
+struct PomoColors { COLORREF bg, accent, accentHot, accentDown, button, buttonHot, buttonDown, track; };
+// [0] focus / ready (tomato), [1] break (mint).
+const PomoColors kPomoColors[2] = {
+    {RGB(0x1C, 0x1E, 0x26), RGB(0xFF, 0x6B, 0x57), RGB(0xFF, 0x7E, 0x6C), RGB(0xD9, 0x57, 0x4C),
+     RGB(0x2A, 0x2D, 0x38), RGB(0x34, 0x38, 0x46), RGB(0x3E, 0x43, 0x53), RGB(0x2E, 0x31, 0x40)},
+    {RGB(0x18, 0x22, 0x20), RGB(0x4F, 0xD1, 0xA5), RGB(0x63, 0xDD, 0xB3), RGB(0x3E, 0xB8, 0x8F),
+     RGB(0x24, 0x31, 0x2B), RGB(0x2D, 0x3C, 0x35), RGB(0x36, 0x48, 0x40), RGB(0x28, 0x36, 0x32)}};
+constexpr COLORREF kPomoText = RGB(0xF2, 0xF3, 0xF5), kPomoDim = RGB(0x8A, 0x8F, 0x9C), kPomoOnAccent = RGB(0x14, 0x16, 0x1C);
+
+HFONT g_pomoDigits = nullptr;
+int g_pomoDigitsPx = 0;
+HFONT PomoDigits(int px) {
+    if (px != g_pomoDigitsPx || !g_pomoDigits) {
+        if (g_pomoDigits) DeleteObject(g_pomoDigits);
+        g_pomoDigits = CreateFontW(-px, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                   CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, app.numberFace.c_str());
+        g_pomoDigitsPx = px;
+    }
+    return g_pomoDigits;
+}
+
+bool PomoShown() { return app.pomoWin.hwnd && IsWindowVisible(app.pomoWin.hwnd); }
+
+void SavePomoPlacement() {
+    RECT r{};
+    if (!app.pomoWin.hwnd || !GetWindowRect(app.pomoWin.hwnd, &r)) return;
+    SaveSetting(L"pomodoroWindow", L"x", r.left);
+    SaveSetting(L"pomodoroWindow", L"y", r.top);
+    if (!app.pomoMini) {
+        SaveSetting(L"pomodoroWindow", L"w", MulDiv(Wd(r), 96, static_cast<int>(app.pomoWin.dpi)));
+        SaveSetting(L"pomodoroWindow", L"h", MulDiv(Ht(r), 96, static_cast<int>(app.pomoWin.dpi)));
+    }
+    SaveSetting(L"pomodoroWindow", L"saved", 1);
+}
+
+// Size for the current form at the window's DPI, keeping the top-left corner.
+void PlacePomo(bool restore) {
+    auto& f = app.pomoWin;
+    RECT r{};
+    GetWindowRect(f.hwnd, &r);
+    int x = r.left, y = r.top;
+    if (restore) {
+        x = ReadSetting(L"pomodoroWindow", L"x", 0);
+        y = ReadSetting(L"pomodoroWindow", L"y", 0);
+    }
+    const int w = app.pomoMini ? f.S(kPomoStripW) : f.S(std::max(kPomoMinW, ReadSetting(L"pomodoroWindow", L"w", kPomoW)));
+    const int h = app.pomoMini ? f.S(kPomoStripH) : f.S(std::max(kPomoMinH, ReadSetting(L"pomodoroWindow", L"h", kPomoH)));
+    const RECT wanted{x, y, x + w, y + h};
+    if (restore && (!ReadSetting(L"pomodoroWindow", L"saved", 0) || !MonitorFromRect(&wanted, MONITOR_DEFAULTTONULL))) {
+        MONITORINFO monitor{};
+        monitor.cbSize = sizeof(monitor);
+        GetMonitorInfoW(MonitorFromWindow(app.hwnd, MONITOR_DEFAULTTOPRIMARY), &monitor);
+        x = monitor.rcWork.right - w - f.S(24);
+        y = monitor.rcWork.top + f.S(24);
+    }
+    SetWindowPos(f.hwnd, app.pomoPinned ? HWND_TOPMOST : HWND_NOTOPMOST, x, y, w, h, SWP_NOACTIVATE);
+}
+
+void ShowPomodoroWindow(bool show) {
+    auto& f = app.pomoWin;
+    if (!show) {
+        if (PomoShown()) {
+            SavePomoPlacement();
+            KillTimer(f.hwnd, 1);
+            ShowWindow(f.hwnd, SW_HIDE);
+            InvalidateRect(app.hwnd, nullptr, FALSE);
+        }
+        return;
+    }
+    if (!f.hwnd) {
+        app.pomoPinned = ReadSetting(L"pomodoroWindow", L"pinned", 1) != 0;
+        app.pomoMini = ReadSetting(L"pomodoroWindow", L"mini", 0) != 0;
+        f.hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | (app.pomoPinned ? WS_EX_TOPMOST : 0), L"DayLedgerPomodoro",
+                                 L"番茄钟 · 时光账本", WS_POPUP | WS_THICKFRAME, 0, 0, 10, 10, nullptr, nullptr,
+                                 app.instance, nullptr);
+        if (!f.hwnd) return;
+        RoundCorners(f.hwnd);
+        f.dpi = app.dpi;
+        PlacePomo(true);                       // lands on its monitor: take that DPI, then size again
+        f.dpi = WindowDpi(f.hwnd);
+        f.fonts.Create(f.dpi, app.numberFace);
+        PlacePomo(false);
+    }
+    if (!PomoShown()) {
+        ShowWindow(f.hwnd, SW_SHOWNOACTIVATE);
+        SetWindowPos(f.hwnd, app.pomoPinned ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    SetTimer(f.hwnd, 1, 250, nullptr);
+    InvalidateRect(f.hwnd, nullptr, FALSE);
+    InvalidateRect(app.hwnd, nullptr, FALSE);
+}
+
+// Which colour set: mint during a break, tomato otherwise.
+int PomoPhaseIndex() { return app.pomodoro.phase == tracker::PomodoroPhase::Break ? 1 : 0; }
+
+void PomoButton(Canvas& c, Floater& f, const RECT& r, const std::wstring& label, int id, bool primary, bool enabled,
+                float radius) {
+    const auto& k = kPomoColors[PomoPhaseIndex()];
+    const bool hot = enabled && f.hot == id, down = hot && f.pressed == id;
+    COLORREF fill = primary ? (down ? k.accentDown : hot ? k.accentHot : k.accent) : (down ? k.buttonDown : hot ? k.buttonHot : k.button);
+    if (!enabled) fill = k.button;
+    c.Round(r, radius, fill);
+    c.Text(label, r, primary ? f.fonts.bodyBold : f.fonts.body,
+           !enabled ? Mix(kPomoDim, k.bg, 0.4) : primary ? kPomoOnAccent : kPomoText, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (enabled) AddHit(f.hits, c, r, id);
+}
+
+void PomoIcon(Canvas& c, Floater& f, const RECT& r, Icon icon, int id, bool on, float scale) {
+    const auto& k = kPomoColors[PomoPhaseIndex()];
+    const bool hot = f.hot == id, down = hot && f.pressed == id;
+    if (id == PW_CLOSE && hot) c.Round(r, 6 * scale, down ? RGB(0xA5, 0x26, 0x19) : RGB(0xC4, 0x2B, 0x1C));
+    else if (hot) c.Round(r, 6 * scale, down ? k.buttonDown : k.buttonHot);
+    PaintIcon(c, icon, (r.left + r.right) / 2.0f, (r.top + r.bottom) / 2.0f, 14 * scale,
+              on ? k.accent : hot ? kPomoText : kPomoDim);
+    AddHit(f.hits, c, r, id);
+}
+
+void PaintPomodoroWindow(Canvas& c, int w, int h) {
+    using tracker::PomodoroPhase;
+    auto& f = app.pomoWin;
+    f.hits.clear();
+    const auto& model = app.model;
+    const auto& p = app.pomodoro;
+    const long long now = Now();
+    const int phase = PomoPhaseIndex();
+    const auto& k = kPomoColors[phase];
+    const bool pulse = now < app.pomoPulseUntil && (GetTickCount() / 350) % 2 == 0;
+    c.Fill(0, 0, float(w), float(h), pulse ? Mix(k.bg, k.accent, 0.35) : k.bg);
+    const bool focus = p.phase == PomodoroPhase::Focus, rest = p.phase == PomodoroPhase::Break;
+    const int tagId = focus ? (p.running() ? model.activeTagId : p.focusTag) : NextFocusTag();
+    const auto* tag = model.findTag(tagId);
+    const long long length = std::max(1LL, p.length()), remaining = p.remainingAt(now);
+    const double progress = p.phase == PomodoroPhase::Ready ? 0.0 : 1.0 - static_cast<double>(remaining) / static_cast<double>(length);
+    const std::wstring time = CountdownText(remaining);
+    const COLORREF timeInk = p.paused || p.phase == PomodoroPhase::Ready ? kPomoDim : kPomoText;
+    // a distraction the guard is reminding about right now
+    const bool distracted = focus && !p.paused && app.guard.state == tracker::GuardState::Alerting && GuardedTag();
+    const COLORREF alertInk = RGB(0xFF, 0x5F, 0x57);
+    if (app.pomoMini) {                      // the strip: time, what, expand, bar
+        const float scale = f.Sf(1);
+        c.Text(time, RECT{f.S(12), 0, f.S(104), h - f.S(3)}, PomoDigits(f.S(26)), timeInk, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        AddHit(f.hits, c, RECT{f.S(8), f.S(4), f.S(104), h - f.S(6)}, PW_START);
+        if (tag && !rest) c.Circle(f.Sf(112), h / 2.0f - f.Sf(1), f.Sf(4), distracted ? alertInk : tag->color);
+        c.Text(rest ? std::wstring(p.longBreak ? L"长休息" : L"休息") : distracted ? std::wstring(L"正在分心")
+                                                                                     : tag ? tag->name : std::wstring(L"番茄钟"),
+               RECT{f.S(rest ? 108 : 120), 0, w - f.S(40), h - f.S(3)}, f.fonts.label,
+               rest ? k.accent : distracted ? alertInk : kPomoText);
+        PomoIcon(c, f, RECT{w - f.S(36), h / 2 - f.S(14), w - f.S(8), h / 2 + f.S(12)}, Icon::Expand, PW_MINI, false, scale);
+        c.Fill(0, h - f.Sf(3), float(w), f.Sf(3), k.track);
+        c.Fill(0, h - f.Sf(3), static_cast<float>(w * std::clamp(progress, 0.0, 1.0)), f.Sf(3), k.accent);
+        return;
+    }
+    // The design grows uniformly with the window (reference 260 x 340 at 96 DPI).
+    const float kx = static_cast<float>(w) / f.S(kPomoW), ky = static_cast<float>(h) / f.S(kPomoH);
+    const float q = std::min(kx, ky) * f.Sf(1);
+    auto K = [&](float v) { return static_cast<int>(v * q + 0.5f); };
+    // header: phase, then main window / strip / pin / close
+    const int bs = K(28), top = K(8), gap = K(4);
+    RECT b{w - gap - bs, top, w - gap, top + bs};
+    PomoIcon(c, f, b, Icon::Close, PW_CLOSE, false, q);
+    OffsetRect(&b, -(bs + gap), 0);
+    PomoIcon(c, f, b, app.pomoPinned ? Icon::PinFilled : Icon::Pin, PW_PIN, app.pomoPinned, q);
+    OffsetRect(&b, -(bs + gap), 0);
+    PomoIcon(c, f, b, Icon::MiniWindow, PW_MINI, false, q);
+    OffsetRect(&b, -(bs + gap), 0);
+    PomoIcon(c, f, b, Icon::Window, PW_MAIN, false, q);
+    std::wstring label;
+    if (rest) label = p.paused ? L"休息 · 已暂停" : (p.longBreak ? L"长休息" : L"休息");
+    else if (focus) label = p.paused ? L"专注 · 已暂停" : Format(L"专注 · 第 %d 个", app.today.pomodoros + 1);
+    else label = app.today.pomodoros ? Format(L"准备专注 · %d", app.today.pomodoros) : std::wstring(L"准备专注");
+    c.Text(label, RECT{K(16), top, b.left - K(6), top + bs}, f.fonts.labelBold, k.accent);
+    // what is focused on (click to switch)
+    const RECT item{K(12), K(42), w - K(12), K(72)};
+    const bool itemHot = f.hot == PW_TAG_MENU;
+    if (itemHot) c.Round(item, K(8), f.pressed == PW_TAG_MENU ? k.buttonDown : k.buttonHot);
+    else c.Round(item, K(8), k.button);
+    const int icy = (item.top + item.bottom) / 2;
+    std::wstring itemText, itemNote;
+    COLORREF dot = kPomoDim;
+    if (rest) {
+        itemText = L"休息一下";
+        itemNote = tag ? L"下一个：" + tag->name : std::wstring();
+        dot = k.accent;
+    } else if (tag) {
+        itemText = tag->name;
+        itemNote = CategoryName(tag->category);
+        dot = tag->color;
+    } else itemText = L"选择要专注的事";
+    c.Circle(item.left + K(14), static_cast<float>(icy), K(5), dot);
+    const int noteW = itemNote.empty() ? 0 : c.Measure(itemNote, f.fonts.label).cx;
+    c.Text(itemText, RECT{item.left + K(26), item.top, item.right - K(30) - noteW - K(6), item.bottom}, f.fonts.bodyBold, kPomoText);
+    if (noteW) c.Text(itemNote, RECT{item.right - K(28) - noteW, item.top, item.right - K(26), item.bottom}, f.fonts.label,
+                      kPomoDim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    PaintIcon(c, Icon::ChevronDown, item.right - K(14), static_cast<float>(icy), K(13), kPomoDim);
+    AddHit(f.hits, c, item, PW_TAG_MENU);
+    // bottom: give up / skip, the big button, the bar
+    const int mx = K(24), rowH = K(32), pillH = K(40), pad = K(12), mid = w / 2;
+    const RECT abandon{mx, h - pad - rowH, mid - gap, h - pad};
+    const RECT skip{mid + gap, h - pad - rowH, w - mx, h - pad};
+    const RECT pill{mx, abandon.top - K(10) - pillH, w - mx, abandon.top - K(10)};
+    const RECT bar{mx, pill.top - K(20) - K(4), w - mx, pill.top - K(20)};
+    const bool ready = p.phase == PomodoroPhase::Ready;
+    const std::wstring start = ready ? L"开始专注" : p.paused ? L"继续" : L"暂停";
+    PomoButton(c, f, pill, start, PW_START, true, !app.readOnly && (!ready || tag), static_cast<float>(pillH) / 2);
+    PomoButton(c, f, abandon, rest ? L"结束休息" : L"放弃", PW_ABANDON, false, !app.readOnly && !ready, static_cast<float>(K(8)));
+    PomoButton(c, f, skip, rest ? L"跳过休息" : L"跳过", PW_SKIP, false, !app.readOnly && !ready, static_cast<float>(K(8)));
+    c.Round(bar, static_cast<float>(Ht(bar)) / 2, k.track);
+    if (progress > 0) {
+        RECT fill = bar;
+        fill.right = fill.left + std::max(Ht(bar), static_cast<int>(Wd(bar) * std::clamp(progress, 0.0, 1.0)));
+        c.Round(fill, static_cast<float>(Ht(bar)) / 2, k.accent);
+    }
+    // the countdown in the space between, with the guard's state under it
+    std::wstring guardLine;
+    COLORREF guardInk = kPomoDim;
+    if (distracted) {
+        guardLine = L"正在分心" + GuardSourceLabel() + L" · " + CountdownText(std::max(0LL, now - app.guard.since));
+        guardInk = alertInk;
+    } else if (focus && !p.paused && GuardedTag()) {
+        if (!app.guard.releases.empty()) {
+            const auto& release = app.guard.releases.back();
+            guardLine = L"临时放行「" + (release.keyword.empty() ? release.exe : release.keyword) + L"」剩 " +
+                        CountdownText(std::max(0LL, release.until - now));
+            guardInk = RGB(0xED, 0xA1, 0x00);
+        } else {
+            const auto counts = CountGuard(model.activeSince, now + 1);
+            guardLine = counts.distractions ? Format(L"专注守护中 · 分心 %d 次", counts.distractions) : std::wstring(L"专注守护中");
+        }
+    }
+    const int timeTop = item.bottom + K(4), timeBottom = bar.top - (guardLine.empty() ? K(6) : K(22));
+    const int digits = std::max(K(28), std::min(K(56), (timeBottom - timeTop) * 9 / 10));
+    c.Text(time, RECT{0, timeTop, w, timeBottom}, PomoDigits(digits), timeInk, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (!guardLine.empty())
+        c.Text(guardLine, RECT{mx, bar.top - K(22), w - mx, bar.top - K(6)}, f.fonts.caption, guardInk,
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (WindowsBuild() < 22000) {
+        c.Fill(0, 0, float(w), 1, RGB(0x34, 0x35, 0x3F));
+        c.Fill(0, float(h - 1), float(w), 1, RGB(0x34, 0x35, 0x3F));
+        c.Fill(0, 0, 1, float(h), RGB(0x34, 0x35, 0x3F));
+        c.Fill(float(w - 1), 0, 1, float(h), RGB(0x34, 0x35, 0x3F));
+    }
+}
+
+void PomoTagMenu() {
+    auto& f = app.pomoWin;
+    RECT anchor{};
+    for (const auto& h : f.hits) if (h.id == PW_TAG_MENU) anchor = h.rect;
+    HMENU menu = CreatePopupMenu();
+    const auto order = DisplayTags();
+    int lastCategory = -1;
+    const int current = app.pomodoro.phase == tracker::PomodoroPhase::Focus && app.pomodoro.running() ?
+                        app.model.activeTagId : NextFocusTag();
+    for (std::size_t i = 0; i < order.size() && i < 40; ++i) {
+        const auto& tag = app.model.tags[static_cast<std::size_t>(order[i])];
+        if (tag.id == app.pomodoro.restTag) continue;
+        if (tag.category != lastCategory) {
+            if (lastCategory != -1) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, CategoryName(tag.category).c_str());
+            lastCategory = tag.category;
+        }
+        AppendMenuW(menu, MF_STRING | (tag.id == current ? MF_CHECKED : 0) | (app.readOnly ? MF_GRAYED : 0),
+                    static_cast<UINT_PTR>(PW_TAG_FIRST + static_cast<int>(i)), (L"    " + tag.name).c_str());
+    }
+    POINT at{anchor.left, anchor.bottom + f.S(4)};
+    ClientToScreen(f.hwnd, &at);
+    int command = 0;
+    {
+        ModalScope modal;
+        command = static_cast<int>(TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, at.x, at.y,
+                                                    f.hwnd, nullptr));
+    }
+    DestroyMenu(menu);
+    if (command) PostMessageW(f.hwnd, WM_COMMAND, static_cast<WPARAM>(command), 0);
+}
+
+// The focus tag: while focusing, the record switches to it; otherwise it is the next focus.
+void PomoChooseTag(int position) {
+    const int index = DisplayTagAt(position);
+    if (index < 0) return;
+    const int id = app.model.tags[static_cast<std::size_t>(index)].id;
+    auto& p = app.pomodoro;
+    if (p.phase == tracker::PomodoroPhase::Focus && p.running()) ClickTag(id);
+    else {
+        p.focusTag = id;
+        app.selectedTagId = id;
+        Refresh();
+    }
+}
+
+void PomoCommand(int id) {
+    auto& f = app.pomoWin;
+    switch (id) {
+    case PW_START:
+        if (app.pomodoro.phase == tracker::PomodoroPhase::Ready) PomodoroStart();
+        else PomodoroPauseResume();
+        break;
+    case PW_ABANDON: PomodoroAbandon(); break;
+    case PW_SKIP: PomodoroSkip(); break;
+    case PW_MINI:
+        SavePomoPlacement();
+        app.pomoMini = !app.pomoMini;
+        SaveSetting(L"pomodoroWindow", L"mini", app.pomoMini ? 1 : 0);
+        PlacePomo(false);
+        break;
+    case PW_PIN:
+        app.pomoPinned = !app.pomoPinned;
+        SaveSetting(L"pomodoroWindow", L"pinned", app.pomoPinned ? 1 : 0);
+        SetWindowPos(f.hwnd, app.pomoPinned ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        break;
+    case PW_CLOSE:
+        ShowPomodoroWindow(false);
+        ShowToast(L"番茄窗已隐藏，番茄钟照常运行 · 计时卡片上的窗口按钮可以再打开", TOAST_PLAIN, 6);
+        break;
+    case PW_MAIN: ShowMain(); break;
+    case PW_TAG_MENU: PomoTagMenu(); break;
+    default:
+        if (id >= PW_TAG_FIRST && id < PW_TAG_FIRST + CMD_RANGE) PomoChooseTag(id - PW_TAG_FIRST);
+        break;
+    }
+    if (f.hwnd) InvalidateRect(f.hwnd, nullptr, FALSE);
+}
+
+LRESULT CALLBACK PomodoroWindowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto& f = app.pomoWin;
+    switch (message) {
+    case WM_NCCALCSIZE: return 0;            // no frame: the client is the whole window
+    case WM_NCACTIVATE: return DefWindowProcW(window, message, wp, -1);
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC target = BeginPaint(window, &ps);
+        RECT client{};
+        GetClientRect(window, &client);
+        if (client.right > 0 && client.bottom > 0 && f.surface.Ensure(client.right, client.bottom)) {
+            {
+                Canvas canvas(f.surface);
+                PaintPomodoroWindow(canvas, client.right, client.bottom);
+            }
+            BitBlt(target, 0, 0, client.right, client.bottom, f.surface.Dc(), 0, 0, SRCCOPY);
+        }
+        EndPaint(window, &ps);
+        return 0;
+    }
+    case WM_NCHITTEST: {                     // resize along the edges (not the strip), drag anywhere empty
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ScreenToClient(window, &pt);
+        RECT client{};
+        GetClientRect(window, &client);
+        if (!app.pomoMini) {
+            const int band = f.S(6);
+            const bool l = pt.x < band, r = pt.x >= client.right - band, t = pt.y < band, b = pt.y >= client.bottom - band;
+            if (t) return l ? HTTOPLEFT : r ? HTTOPRIGHT : HTTOP;
+            if (b) return l ? HTBOTTOMLEFT : r ? HTBOTTOMRIGHT : HTBOTTOM;
+            if (l) return HTLEFT;
+            if (r) return HTRIGHT;
+        }
+        return f.HitAt(pt) ? HTCLIENT : HTCAPTION;
+    }
+    case WM_NCLBUTTONDBLCLK: return 0;       // no maximise
+    case WM_NCRBUTTONUP: return 0;
+    case WM_GETMINMAXINFO: {
+        auto* info = reinterpret_cast<MINMAXINFO*>(lp);
+        if (app.pomoMini) {
+            info->ptMinTrackSize = info->ptMaxTrackSize = POINT{f.S(kPomoStripW), f.S(kPomoStripH)};
+        } else info->ptMinTrackSize = POINT{f.S(kPomoMinW), f.S(kPomoMinH)};
+        return 0;
+    }
+    case WM_SIZE:
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_EXITSIZEMOVE:
+        SavePomoPlacement();
+        return 0;
+    case WM_MOUSEMOVE: case WM_MOUSELEAVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_CAPTURECHANGED: {
+        const int clicked = FloaterMouse(f, window, message, lp);
+        if (clicked) PomoCommand(clicked);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_SPACE) PomoCommand(PW_START);
+        return 0;
+    case WM_COMMAND:
+        PomoCommand(LOWORD(wp));
+        return 0;
+    case WM_TIMER:
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    case WM_DPICHANGED: {
+        f.dpi = HIWORD(wp);
+        f.fonts.Create(f.dpi, app.numberFace);
+        const auto* r = reinterpret_cast<RECT*>(lp);
+        SetWindowPos(window, nullptr, r->left, r->top, Wd(*r), Ht(*r), SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    case WM_CLOSE:
+        PomoCommand(PW_CLOSE);
+        return 0;
+    case WM_NCDESTROY:
+        f.surface.Release();
+        f.fonts.Release();
+        f.hwnd = nullptr;
+        break;
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+
+
 // ---------------------------------------------------------------- main window
 
 int HitAt(POINT pt) {
@@ -5289,6 +7222,9 @@ void Activate(int id) {
             EditCategory(app.model.categories[static_cast<std::size_t>(index)].id);
         break;
     case HK_NEW_CATEGORY: NewCategory(); break;
+    case HK_GUARD: PostMessageW(app.hwnd, WM_COMMAND, CMD_GUARD_SETTINGS, 0); break;
+    case HK_RELEASE_END: EndReleases(); break;
+    case HK_POMODORO_WINDOW: PostMessageW(app.hwnd, WM_COMMAND, CMD_POMODORO_WINDOW, 0); break;
     case HK_VIEW_DAY: SetView(index); break;
     case HK_RANGE: SetRange(index); break;
     case HK_PERIOD_PREV: ShiftPeriodBy(-1); break;
@@ -5302,6 +7238,7 @@ void Activate(int id) {
     case HK_TOAST_ACTION:
         if (app.toastKind == TOAST_UNDO) UndoDelete();
         else if (app.toastKind == TOAST_START_FOCUS) PomodoroStart();
+        else if (app.toastKind == TOAST_GUARD_SETUP) PostMessageW(app.hwnd, WM_COMMAND, CMD_GUARD_SETTINGS, 0);
         app.toast.clear();
         break;
     case HK_RETRY: Persist(true); break;
@@ -5341,6 +7278,13 @@ void Command(int id) {
             NewTag(model.categories[static_cast<std::size_t>(id - CMD_NEW_TAG_IN_FIRST)].id);
         return;
     }
+    if (id >= CMD_CATEGORY_FREE_FIRST && id < CMD_CATEGORY_FREE_FIRST + CMD_RANGE) {
+        if (id - CMD_CATEGORY_FREE_FIRST < categoryCount) {
+            const int category = model.categories[static_cast<std::size_t>(id - CMD_CATEGORY_FREE_FIRST)].id;
+            SetCategoryFree(category, !model.isFree(category));
+        }
+        return;
+    }
     if (id >= CMD_EDIT_RECORD_FIRST && id < CMD_EDIT_RECORD_FIRST + CMD_RANGE) { EditRow(id - CMD_EDIT_RECORD_FIRST); return; }
     if (id >= CMD_DELETE_RECORD_FIRST && id < CMD_DELETE_RECORD_FIRST + CMD_RANGE) {
         DeleteRow(id - CMD_DELETE_RECORD_FIRST);
@@ -5350,6 +7294,12 @@ void Command(int id) {
     case CMD_PREV_DAY: if (app.view) ShiftPeriodBy(-1); else Navigate(-1); break;
     case CMD_NEXT_DAY: if (app.view) ShiftPeriodBy(1); else Navigate(1); break;
     case CMD_TODAY: if (app.view) CurrentPeriod(); else GoToDay(Now()); break;
+    case CMD_GUARD_SETTINGS: EditGuardSettings(); break;
+    case CMD_GUARD_TOGGLE: SetGuardEnabled(!app.model.guard.enabled); break;
+    case CMD_GUARD_ON: SetGuardEnabled(true); break;
+    case CMD_GUARD_OFF: SetGuardEnabled(false); break;
+    case CMD_RELEASE_END: EndReleases(); break;
+    case CMD_POMODORO_WINDOW: ShowPomodoroWindow(!(app.pomoWin.hwnd && IsWindowVisible(app.pomoWin.hwnd))); break;
     case CMD_VIEW_DAY: SetView(0); break;
     case CMD_VIEW_STATS: SetView(1); break;
     case CMD_VIEW_TOGGLE: SetView(app.view ? 0 : 1); break;
@@ -5454,6 +7404,7 @@ void ScrollList(int kind, int delta) {
 void ExitApp(HWND window) {
     if (app.closing || app.modal) return;
     app.closing = true;
+    GuardStop(L"stopped");
     if (!app.readOnly) {
         if (app.model.activeTagId) app.model.stop(Now());
         while (!Persist(false)) {
@@ -5485,17 +7436,39 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DL_LOAD:
         LoadData();
+        LoadGuardLog();
         app.loaded = true;
         app.selectedTagId = app.model.lastUsedTag();
         app.lastTick = Now();
+        app.guardHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, GuardForegroundEvent,
+                                        0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
         Refresh();
+        if (app.pomodoroMode && app.pomoAutoShow) ShowPomodoroWindow(true);
         if (app.upgraded && !app.readOnly)
             ShowToast(L"标签现在按大类分组：右键大类可以改名、换色，或把标签统一成同色系", TOAST_PLAIN, 15);
+        else if (!app.readOnly && !app.model.guard.enabled && !ReadSetting(L"guard", L"hintShown", 0)) {
+            SaveSetting(L"guard", L"hintShown", 1);
+            ShowToast(L"新功能「专注守护」：工作时切到白名单外的应用会提醒", TOAST_GUARD_SETUP, 15);
+        }
         SetTimer(window, TID_TICK, 1000, nullptr);
         return 0;
     case WM_DL_ACTIVATE:
         ShowMain();
         return 0;
+    case WM_DL_GUARD:
+        GuardEvaluate();
+        return 0;
+    case WM_COPYDATA: {               // test hook: a stand-in for the window in front
+        const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lp);
+        if (!app.guardTest || !data || data->dwData != kGuardTestData) break;
+        const std::wstring text(static_cast<const wchar_t*>(data->lpData), data->cbData / sizeof(wchar_t));
+        const auto tab = text.find(L'\t');
+        app.guardSimulated = !text.empty();
+        app.guardSimExe = tracker::NormalizeExe(text.substr(0, tab));
+        app.guardSimTitle = tab == std::wstring::npos ? std::wstring() : text.substr(tab + 1);
+        GuardEvaluate();
+        return TRUE;
+    }
     case WM_DL_TRAY: {
         const UINT event = LOWORD(lp);
         POINT at{GET_X_LPARAM(wp), GET_Y_LPARAM(wp)};
@@ -5536,6 +7509,18 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         case Q_RANGE: return app.range;
         case Q_PERIOD_TOTAL: return app.view ? static_cast<LRESULT>(app.period.total.total) : -1;
         case Q_PERIOD_START: return app.view ? static_cast<LRESULT>(app.period.start) : -1;
+        case Q_GUARD_ENABLED: return app.model.guard.enabled;
+        case Q_GUARD_STATE: return static_cast<LRESULT>(app.guard.state);
+        case Q_GUARD_POPUP: return GuardPopupVisible();
+        case Q_GUARD_RULES: return static_cast<LRESULT>(app.model.guard.rules.size());
+        case Q_GUARD_DISTRACTIONS_TODAY: return CountGuard(TodayStart(), ShiftDay(TodayStart(), 1)).distractions;
+        case Q_GUARD_SIMULATED: return app.guardSimulated;
+        case Q_GUARD_RELEASES_TODAY: return CountGuard(TodayStart(), ShiftDay(TodayStart(), 1)).releases;
+        case Q_GUARD_RELEASED_SECONDS_TODAY:
+            return static_cast<LRESULT>(CountGuard(TodayStart(), ShiftDay(TodayStart(), 1)).released);
+        case Q_GUARD_RELEASES_RUNNING: return static_cast<LRESULT>(app.guard.releases.size());
+        case Q_POMODORO_WINDOW: return app.pomoWin.hwnd && IsWindowVisible(app.pomoWin.hwnd);
+        case Q_POMODORO_WINDOW_MINI: return app.pomoMini;
         default: return -1;
         }
     case WM_SIZE:
@@ -5687,6 +7672,7 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_POWERBROADCAST:
+        if (wp == PBT_APMSUSPEND) GuardStop(L"away");
         if (wp == PBT_APMSUSPEND && app.model.activeTagId && !app.readOnly) {
             app.lastTick = Now();
             Persist(false);
@@ -5811,6 +7797,7 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
+        if (wp) GuardStop(L"stopped");
         if (wp && !app.readOnly) {       // Windows is shutting down: end the timer at this moment
             if (app.model.activeTagId) app.model.stop(Now());
             Persist(false);
@@ -5824,8 +7811,12 @@ LRESULT CALLBACK MainProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         KillTimer(window, TID_TICK);
         KillTimer(window, TID_TIP);
+        if (app.guardHook) UnhookWinEvent(app.guardHook);
+        app.guardHook = nullptr;
         if (app.mini) DestroyWindow(app.mini);
         if (app.calendar) DestroyWindow(app.calendar);
+        if (app.guardWin.hwnd) DestroyWindow(app.guardWin.hwnd);
+        if (app.pomoWin.hwnd) DestroyWindow(app.pomoWin.hwnd);
         TrayRemove();
         RemovePropW(window, L"DayLedgerKey");
         PostQuitMessage(0);
@@ -5959,7 +7950,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     if (!app.iconSmall) app.iconSmall = app.iconBig;
 
     for (const wchar_t* name : {L"DayLedgerTagEditor", L"DayLedgerCategoryEditor", L"DayLedgerRecordEditor",
-                                L"DayLedgerPomodoroSettings"}) {
+                                L"DayLedgerPomodoroSettings", L"DayLedgerGuardSettings", L"DayLedgerGuardRule"}) {
         WNDCLASSEXW dialog{};
         dialog.cbSize = sizeof(dialog);
         dialog.style = CS_DBLCLKS;
@@ -5977,6 +7968,19 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     calendarClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     calendarClass.lpszClassName = L"DayLedgerCalendar";
     if (!RegisterClassExW(&calendarClass)) return 12;
+    for (auto [name, proc] : {std::pair<const wchar_t*, WNDPROC>{L"DayLedgerGuardPopup", GuardPopupProc},
+                              std::pair<const wchar_t*, WNDPROC>{L"DayLedgerPomodoro", PomodoroWindowProc}}) {
+        WNDCLASSEXW floating{};
+        floating.cbSize = sizeof(floating);
+        floating.style = CS_DBLCLKS | CS_DROPSHADOW;
+        floating.lpfnWndProc = proc;
+        floating.hInstance = instance;
+        floating.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        floating.hIcon = app.iconBig;
+        floating.hIconSm = app.iconSmall;
+        floating.lpszClassName = name;
+        if (!RegisterClassExW(&floating)) return 12;
+    }
     WNDCLASSEXW miniClass{};
     miniClass.cbSize = sizeof(miniClass);
     miniClass.style = CS_DBLCLKS;
@@ -5997,6 +8001,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int show) {
     if (!RegisterClassExW(&wc)) return 13;
 
     wchar_t scale[16]{};
+    wchar_t guardTest[4]{};
+    app.guardTest = GetEnvironmentVariableW(L"DAYLEDGER_TEST_GUARD", guardTest, 4) && std::wcscmp(guardTest, L"1") == 0;
     if (GetEnvironmentVariableW(L"DAYLEDGER_TEST_SECONDS_PER_MINUTE", scale, 16))
         app.secondsPerMinute = std::clamp(_wtoi(scale), 1, 60);
     LoadSettings();

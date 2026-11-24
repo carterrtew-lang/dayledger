@@ -44,14 +44,24 @@ std::uint64_t number(const std::vector<unsigned char>& bytes, std::size_t offset
 void put(std::vector<unsigned char>& bytes, std::size_t offset, std::uint64_t value, unsigned size) {
     for (unsigned i = 0; i < size; ++i) bytes.at(offset + i) = (value >> (8 * i)) & 255;
 }
-// Rewrites a TRACKER4 file in an older layout: TRACKER3 has no category table (the default
-// categories are implied), TRACKER2 no session flags either, TRACKER1 also no checkpoint.
+// Rewrites a TRACKER5 file in an older layout: TRACKER4 has no category flags and no guard block,
+// TRACKER3 no category table either (the default categories are implied), TRACKER2 no session
+// flags, TRACKER1 also no checkpoint.
 std::vector<unsigned char> downgrade(const std::vector<unsigned char>& bytes, char version) {
     std::vector<unsigned char> out(bytes.begin(), bytes.begin() + 8);
     out[7] = static_cast<unsigned char>(version);
     std::size_t cursor = 12;
-    for (std::uint64_t i = 0; i < number(bytes, 8, 4); ++i)
-        cursor += 12 + static_cast<std::size_t>(number(bytes, cursor + 8, 4));
+    if (version == '4') out.insert(out.end(), bytes.begin() + 8, bytes.begin() + 12);
+    for (std::uint64_t i = 0; i < number(bytes, 8, 4); ++i) {
+        const auto length = static_cast<std::size_t>(number(bytes, cursor + 12, 4));
+        if (version == '4') {        // id, colour, name length, name: everything but the flags
+            out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
+                       bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 8));
+            out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 12),
+                       bytes.begin() + static_cast<std::ptrdiff_t>(cursor + 16 + length));
+        }
+        cursor += 16 + length;
+    }
     const std::size_t tagsStart = cursor;
     cursor += 4;
     for (std::uint64_t i = 0; i < number(bytes, tagsStart, 4); ++i)
@@ -65,7 +75,7 @@ std::vector<unsigned char> downgrade(const std::vector<unsigned char>& bytes, ch
                    bytes.begin() + static_cast<std::ptrdiff_t>(cursor + (version >= '3' ? 24 : 20)));
     out.insert(out.end(), bytes.begin() + static_cast<std::ptrdiff_t>(cursor),
                bytes.begin() + static_cast<std::ptrdiff_t>(cursor + (version == '1' ? 12 : 20)));
-    return out;
+    return out;            // the guard block after the checkpoint is left out
 }
 
 void timingTests() {
@@ -467,6 +477,61 @@ void rangeTests() {
     check(running.hoursByCategory({0}, 9000).empty(), "no days, no hours");
 }
 
+// Category free flags and the guard settings: defaults, validation, persistence, pruning.
+void guardModelTests(const std::filesystem::path& directory) {
+    tracker::Model m;
+    check(m.isFree(1) && !m.isFree(0) && !m.isFree(2), "play is free time by default");
+    check(!m.guard.enabled && m.guard == tracker::DefaultGuardConfig() && !m.guard.rules.empty() &&
+          !m.guard.keywords.empty(), "guard defaults");
+    const int study = m.addCategory(L"\u5b66\u4e60", 0x00D65062u);
+    check(study >= 0 && !m.isFree(study), "new categories follow the whitelist");
+    check(m.setCategoryFree(study, true) && m.isFree(study) && m.setCategoryFree(study, false) && !m.isFree(study),
+          "toggle free time");
+    check(!m.setCategoryFree(99, true), "unknown category has no flag");
+    auto config = m.guard;
+    config.enabled = true;
+    config.graceSeconds = 0;
+    config.repeatSeconds = 10;
+    config.releaseMinutes = 240;
+    config.idleSeconds = 30;
+    config.options = tracker::GuardMinimize;
+    config.rules.push_back({L"*", tracker::GuardMode::AllowOnly, {L"\u98de\u4e66", L"GitHub"}, {0, study}});
+    config.rules.push_back({L"wechat.exe", tracker::GuardMode::CheckTitle, {}, {study}});
+    config.keywords.push_back(L"\u76f4\u64ad");
+    check(m.setGuard(config) && m.guard == config, "valid guard settings accepted");
+    const auto rejected = [&](tracker::GuardConfig bad, const char* what) { check(!m.setGuard(bad), what); };
+    auto bad = config; bad.graceSeconds = 121; rejected(bad, "grace range");
+    bad = config; bad.repeatSeconds = 9; rejected(bad, "repeat range");
+    bad = config; bad.releaseMinutes = 0; rejected(bad, "release range");
+    bad = config; bad.idleSeconds = 3601; rejected(bad, "idle range");
+    bad = config; bad.options = 8; rejected(bad, "unknown option");
+    bad = config; bad.rules.back().exe = L"WeChat.exe"; rejected(bad, "program names are stored lowercase");
+    bad = config; bad.rules.back().exe = L"c:\\apps\\wechat.exe"; rejected(bad, "no paths");
+    bad = config; bad.rules.back().exe = L""; rejected(bad, "program name required");
+    bad = config; bad.rules.back().keywords = {L"x"}; rejected(bad, "only AllowOnly rules have keywords");
+    bad = config; bad.rules[bad.rules.size() - 2].keywords.clear(); rejected(bad, "AllowOnly needs keywords");
+    bad = config; bad.rules.back().scope = {42}; rejected(bad, "unknown scope category");
+    bad = config; bad.rules.back().scope = {study, study}; rejected(bad, "duplicate scope category");
+    bad = config; bad.keywords.push_back(L"a\tb"); rejected(bad, "control characters");
+    bad = config; bad.keywords.push_back(std::wstring(300, L'x')); rejected(bad, "keyword length");
+    bad = config; bad.rules.resize(257, bad.rules.front()); rejected(bad, "rule count");
+    check(m.guard == config, "rejected settings leave the guard unchanged");
+    const auto path = directory / L"guard.dat";
+    check(m.save(path.wstring()), "save guard settings");
+    tracker::Model loaded;
+    check(loaded.load(path.wstring()) && loaded.guard == config && loaded.isFree(1) && !loaded.isFree(study),
+          "guard settings and free flags roundtrip");
+    check(loaded.setCategoryFree(study, true) && loaded.save(path.wstring()) && m.load(path.wstring()) &&
+          m.isFree(study), "free flag roundtrip");
+    check(loaded.removeCategory(study, 0), "remove a scoped category");
+    const auto& rules = loaded.guard.rules;
+    check(std::none_of(rules.begin(), rules.end(), [](const tracker::GuardRule& r) { return r.exe == L"wechat.exe"; }),
+          "a rule for a removed category alone goes");
+    const auto any = std::find_if(rules.begin(), rules.end(), [](const tracker::GuardRule& r) { return r.exe == L"*"; });
+    check(any != rules.end() && any->scope == std::vector<int>{0}, "other scopes are pruned");
+    check(loaded.save(path.wstring()) && m.load(path.wstring()) && m.guard == loaded.guard, "pruned settings save");
+}
+
 void persistenceTests(const std::filesystem::path& directory) {
     const auto path = directory / L"\u65f6\u95f4-\u8bb0\u5f55.bin";
     const auto corruptPath = directory / L"corrupt.bin";
@@ -492,12 +557,12 @@ void persistenceTests(const std::filesystem::path& directory) {
           "stopped state roundtrip");
     check(original.save(path.wstring()), "restore fixture");
     const auto valid = readBytes(path);
-    check(valid.size() > 8 && valid[0] == 'T' && valid[7] == '4', "versioned persistence");
+    check(valid.size() > 8 && valid[0] == 'T' && valid[7] == '5', "versioned persistence");
     std::vector<std::size_t> categoryOffsets, tagOffsets;
     std::size_t cursor = 12;
     for (std::uint64_t i = 0; i < number(valid, 8, 4); ++i) {
         categoryOffsets.push_back(cursor);
-        cursor += 12 + static_cast<std::size_t>(number(valid, cursor + 8, 4));
+        cursor += 16 + static_cast<std::size_t>(number(valid, cursor + 12, 4));
     }
     const auto tagCountOffset = cursor;
     cursor += 4;
@@ -508,13 +573,14 @@ void persistenceTests(const std::filesystem::path& directory) {
     const auto countOffset = cursor;
     const auto sessionOffset = cursor + 4;
     const auto activeOffset = sessionOffset + 24 * number(valid, countOffset, 4);
+    const auto guardOffset = activeOffset + 20;     // enabled, five numbers, rules, keywords
     const auto rejects = [&](std::vector<unsigned char> bytes) {
         writeBytes(corruptPath, bytes);
         check(!loaded.load(corruptPath.wstring()), "corrupt load rejected");
         check(loaded.activeTagId == 0 && loaded.sessions.size() == 3 && loaded.findTag(id)->name == unicode,
               "failed load leaves model unchanged");
     };
-    auto bad = valid; bad[7] = '5'; rejects(bad);
+    auto bad = valid; bad[7] = '6'; rejects(bad);
     bad = valid; put(bad, activeOffset + 12, ~std::uint64_t(0), 8); rejects(bad);
     bad = valid; put(bad, activeOffset + 12, 253402300800ULL, 8); rejects(bad);
     bad = valid; bad.push_back(0); rejects(bad);
@@ -525,7 +591,17 @@ void persistenceTests(const std::filesystem::path& directory) {
     bad = valid; put(bad, 8, 65, 4); rejects(bad);
     bad = valid; put(bad, categoryOffsets[1], 0, 4); rejects(bad);
     bad = valid; put(bad, categoryOffsets[0] + 4, 0xFFFFFFFFu, 4); rejects(bad);
-    bad = valid; put(bad, categoryOffsets[0] + 8, 0, 4); rejects(bad);
+    bad = valid; put(bad, categoryOffsets[0] + 8, 2, 4); rejects(bad);         // unknown category flag
+    bad = valid; put(bad, categoryOffsets[0] + 12, 0, 4); rejects(bad);
+    bad = valid; put(bad, guardOffset, 2, 4); rejects(bad);                    // enabled is 0 or 1
+    bad = valid; put(bad, guardOffset + 4, 121, 4); rejects(bad);              // grace
+    bad = valid; put(bad, guardOffset + 8, 9, 4); rejects(bad);                // repeat
+    bad = valid; put(bad, guardOffset + 12, 0, 4); rejects(bad);               // release minutes
+    bad = valid; put(bad, guardOffset + 16, 29, 4); rejects(bad);              // idle
+    bad = valid; put(bad, guardOffset + 20, 8, 4); rejects(bad);               // unknown option
+    bad = valid; put(bad, guardOffset + 24, 257, 4); rejects(bad);             // rule count
+    bad = valid; put(bad, guardOffset + 28, 0, 4); rejects(bad);               // empty program name
+    bad = valid; put(bad, guardOffset + 32 + number(valid, guardOffset + 28, 4), 3, 4); rejects(bad);   // mode
     bad = valid; put(bad, tagCountOffset, 4097, 4); rejects(bad);
     bad = valid; put(bad, countOffset, 1000001, 4); rejects(bad);
     bad = valid; put(bad, tagOffsets[0], 0, 4); rejects(bad);
@@ -549,12 +625,14 @@ void persistenceTests(const std::filesystem::path& directory) {
     bad = valid; put(bad, activeOffset, 0, 4); rejects(bad);
     bad = valid; put(bad, activeOffset + 4, ~std::uint64_t(0), 8); rejects(bad);
 
-    for (const char version : {'3', '2', '1'}) {
+    for (const char version : {'4', '3', '2', '1'}) {
         writeBytes(corruptPath, downgrade(valid, version));
         tracker::Model old;
         check(old.load(corruptPath.wstring()) && old.sessions.size() == 2 && old.activeTagId == 2 &&
-              old.sessions[1].tagId == id && old.sessions[1].flags == 0 && old.categories.size() == 3 &&
-              old.findTag(id)->category == 2, "older formats with records load");
+              old.sessions[1].tagId == id && (version == '4' || old.sessions[1].flags == 0) &&
+              old.categories.size() == 3 && old.findTag(id)->category == 2, "older formats with records load");
+        check(old.isFree(1) && !old.isFree(0) && !old.isFree(2) && old.guard == tracker::DefaultGuardConfig() &&
+              !old.guard.enabled, "older formats get the guard defaults");
         check(old.lastSaved == (version >= '2' ? static_cast<long long>(number(valid, activeOffset + 12, 8)) : 0),
               "older format checkpoint");
     }
@@ -591,6 +669,7 @@ int main() {
         persistenceTests(files.directory);
         flagTests(files.directory);
         categoryTests(files.directory);
+        guardModelTests(files.directory);
         rangeTests();
         tracker::Model recovery;
         recovery.start(1, 100);
