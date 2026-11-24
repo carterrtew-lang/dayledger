@@ -27,7 +27,9 @@ namespace tracker {
 // Categories (大类) are user-editable; tags (小类) belong to one. Colours are COLORREF (0x00BBGGRR).
 // Ids 0, 1 and 2 are the default work / play / other categories, which is also how files written
 // before categories became editable (TRACKER1-3) referred to them.
-struct Category { int id; std::wstring name; unsigned color; };
+constexpr unsigned CategoryFree = 1u;            // 畅玩电脑: the focus guard leaves this category alone
+constexpr unsigned CategoryKnownFlags = CategoryFree;
+struct Category { int id; std::wstring name; unsigned color; unsigned flags = 0; };
 struct Tag { int id; std::wstring name; unsigned color; int category; };
 // Session flags. A completed pomodoro is the record that ran until its focus countdown ended.
 constexpr unsigned SessionPomodoro = 1u;
@@ -146,6 +148,82 @@ enum class Recovery { EndAtLastSaved, Continue, Discard };
 enum class EditStatus { Ok, UnknownTag, InvalidRange, InFuture, Overlap, NotFound, NotRunning };
 
 constexpr std::size_t kMaxCategories = 64;
+
+// ---- focus guard (专注守护): while a whitelist category is timed, which programs may be in front.
+// A rule names a program (lowercase file name, or "*" for any) and how its windows are judged.
+enum class GuardMode : unsigned {
+    AllowAll = 0,       // every window of the program
+    CheckTitle = 1,     // allowed unless the title has a distraction keyword (browsers)
+    AllowOnly = 2,      // only windows whose title has one of the rule's keywords
+};
+struct GuardRule {
+    std::wstring exe;
+    GuardMode mode = GuardMode::AllowAll;
+    std::vector<std::wstring> keywords;     // AllowOnly: 1..32
+    std::vector<int> scope;                 // category ids; empty = every whitelist category
+    bool operator==(const GuardRule& o) const {
+        return exe == o.exe && mode == o.mode && keywords == o.keywords && scope == o.scope;
+    }
+};
+constexpr unsigned GuardMinimize = 1u;      // "back to work" minimises the distracting window
+constexpr unsigned GuardSound = 2u;         // a chime when the reminder appears
+constexpr unsigned GuardLogTitles = 4u;     // the guard log keeps window titles
+constexpr unsigned GuardKnownOptions = GuardMinimize | GuardSound | GuardLogTitles;
+constexpr std::size_t kMaxGuardRules = 256, kMaxRuleKeywords = 32, kMaxGuardKeywords = 256,
+                      kMaxGuardTextBytes = 256;
+struct GuardConfig {
+    bool enabled = false;
+    unsigned graceSeconds = 3;      // 0..120: how long a violation may last before the reminder
+    unsigned repeatSeconds = 60;    // 10..3600: a dismissed reminder comes back after this long
+    unsigned releaseMinutes = 10;   // 1..240: how long a temporary release (临时放行) lasts
+    unsigned idleSeconds = 120;     // 30..3600: no input for this long = away from the computer
+    unsigned options = GuardSound | GuardLogTitles;
+    std::vector<GuardRule> rules;
+    std::vector<std::wstring> keywords;     // distraction keywords; only CheckTitle rules use them
+    bool operator==(const GuardConfig& o) const {
+        return enabled == o.enabled && graceSeconds == o.graceSeconds && repeatSeconds == o.repeatSeconds &&
+               releaseMinutes == o.releaseMinutes && idleSeconds == o.idleSeconds && options == o.options &&
+               rules == o.rules && keywords == o.keywords;
+    }
+    bool operator!=(const GuardConfig& o) const { return !(*this == o); }
+};
+
+// Office, WPS, PDF readers, development tools, terminals, Explorer and work chat apps are allowed;
+// browsers are allowed unless the page title names a site on the distraction list.
+inline std::vector<GuardRule> DefaultGuardRules() {
+    static const wchar_t* const allowed[] = {
+        L"winword.exe", L"excel.exe", L"powerpnt.exe", L"outlook.exe", L"olk.exe", L"onenote.exe",
+        L"msaccess.exe", L"visio.exe", L"wps.exe", L"et.exe", L"wpp.exe", L"wpspdf.exe", L"acrobat.exe",
+        L"acrord32.exe", L"sumatrapdf.exe", L"foxitpdfreader.exe", L"foxitphantom.exe", L"code.exe",
+        L"cursor.exe", L"devenv.exe", L"idea64.exe", L"pycharm64.exe", L"clion64.exe", L"webstorm64.exe",
+        L"rider64.exe", L"goland64.exe", L"studio64.exe", L"sublime_text.exe", L"notepad++.exe",
+        L"windowsterminal.exe", L"openconsole.exe", L"cmd.exe", L"powershell.exe", L"pwsh.exe",
+        L"mintty.exe", L"explorer.exe", L"notepad.exe", L"taskmgr.exe", L"calculatorapp.exe",
+        L"snippingtool.exe", L"feishu.exe", L"lark.exe", L"dingtalk.exe", L"wxwork.exe", L"wemeetapp.exe",
+        L"zoom.exe", L"ms-teams.exe", L"teams.exe", L"slack.exe", L"obsidian.exe", L"notion.exe",
+        L"typora.exe", L"xmind.exe"};
+    static const wchar_t* const browsers[] = {
+        L"chrome.exe", L"msedge.exe", L"firefox.exe", L"brave.exe", L"opera.exe", L"vivaldi.exe",
+        L"360se.exe", L"360chrome.exe", L"qqbrowser.exe", L"sogouexplorer.exe", L"2345explorer.exe"};
+    std::vector<GuardRule> rules;
+    for (const auto* exe : allowed) rules.push_back({exe, GuardMode::AllowAll, {}, {}});
+    for (const auto* exe : browsers) rules.push_back({exe, GuardMode::CheckTitle, {}, {}});
+    return rules;
+}
+inline std::vector<std::wstring> DefaultGuardKeywords() {
+    return {L"\u77e5\u4e4e", L"\u54d4\u54e9\u54d4\u54e9", L"bilibili", L"\u5fae\u535a", L"\u6296\u97f3",
+            L"\u5feb\u624b", L"\u5c0f\u7ea2\u4e66", L"\u8c46\u74e3", L"\u864e\u6251", L"\u8d34\u5427",
+            L"\u6597\u9c7c", L"\u864e\u7259", L"\u7231\u5947\u827a", L"\u4f18\u9177",
+            L"\u817e\u8baf\u89c6\u9891", L"\u8292\u679cTV", L"\u897f\u74dc\u89c6\u9891", L"youtube",
+            L"netflix", L"twitch", L"reddit", L"\u6dd8\u5b9d", L"\u5929\u732b", L"\u62fc\u591a\u591a",
+            L"\u95f2\u9c7c"};
+}
+inline GuardConfig DefaultGuardConfig() {
+    GuardConfig config;
+    config.rules = DefaultGuardRules();
+    config.keywords = DefaultGuardKeywords();
+    return config;
+}
 struct EditResult {
     EditStatus status = EditStatus::Ok;
     int conflict = -1;
@@ -161,8 +239,11 @@ public:
     long long activeSince = 0;
     long long lastSaved = 0;
 
-    // The default work / play / other categories (blue, orange, aqua) and one tag in each.
-    Model() : categories{{0, L"\u5de5\u4f5c", 0x00D6782Au}, {1, L"\u5a31\u4e50", 0x003468EBu},
+    GuardConfig guard = DefaultGuardConfig();
+
+    // The default work / play / other categories (blue, orange, aqua) and one tag in each; play
+    // (娱乐) is free time for the focus guard.
+    Model() : categories{{0, L"\u5de5\u4f5c", 0x00D6782Au}, {1, L"\u5a31\u4e50", 0x003468EBu, CategoryFree},
                          {2, L"\u5176\u4ed6", 0x007AAF1Bu}},
               tags{{1, L"\u5de5\u4f5c", 0x00D6782Au, 0}, {2, L"\u5a31\u4e50", 0x003468EBu, 1},
                    {3, L"\u5176\u4ed6", 0x007AAF1Bu, 2}} {}
@@ -205,12 +286,68 @@ public:
         return false;
     }
 
-    // Removes a category after moving its tags to `moveTo`; the last category cannot go.
+    // Removes a category after moving its tags to `moveTo`; the last category cannot go. Guard
+    // rules forget it; a rule that applied to it alone goes too.
     bool removeCategory(int id, int moveTo) {
         const int index = categoryIndex(id);
         if (index < 0 || categories.size() <= 1 || moveTo == id || !findCategory(moveTo)) return false;
         for (auto& tag : tags) if (tag.category == id) tag.category = moveTo;
         categories.erase(categories.begin() + index);
+        auto& rules = guard.rules;
+        for (auto it = rules.begin(); it != rules.end();) {
+            auto& scope = it->scope;
+            const bool scoped = !scope.empty();
+            scope.erase(std::remove(scope.begin(), scope.end(), id), scope.end());
+            if (scoped && scope.empty()) it = rules.erase(it);
+            else ++it;
+        }
+        return true;
+    }
+
+    bool isFree(int categoryId) const {
+        const auto* category = findCategory(categoryId);
+        return category && (category->flags & CategoryFree);
+    }
+    bool setCategoryFree(int id, bool free) {
+        for (auto& category : categories) if (category.id == id) {
+            category.flags = free ? (category.flags | CategoryFree) : (category.flags & ~CategoryFree);
+            return true;
+        }
+        return false;
+    }
+
+    // Replaces the guard settings when they are valid (texts, ranges, known categories).
+    bool setGuard(const GuardConfig& config) {
+        if (!validGuard(config)) return false;
+        guard = config;
+        return true;
+    }
+    static bool validGuardText(const std::wstring& text) {
+        std::string bytes;
+        if (!encode(text, bytes) || bytes.size() > kMaxGuardTextBytes) return false;
+        for (wchar_t ch : text) if (ch < 0x20 || ch == 0x7F) return false;
+        return true;
+    }
+    static bool validGuardExe(const std::wstring& exe) {
+        if (exe == L"*") return true;
+        if (!validGuardText(exe) || exe.find_first_of(L"\\/:*?\"<>|") != std::wstring::npos) return false;
+        for (wchar_t ch : exe) if (ch >= L'A' && ch <= L'Z') return false;     // stored lowercase
+        return exe.front() != L' ' && exe.back() != L' ';
+    }
+    bool validGuard(const GuardConfig& config) const {
+        if (config.graceSeconds > 120 || config.repeatSeconds < 10 || config.repeatSeconds > 3600 ||
+            config.releaseMinutes < 1 || config.releaseMinutes > 240 || config.idleSeconds < 30 ||
+            config.idleSeconds > 3600 || (config.options & ~GuardKnownOptions) ||
+            config.rules.size() > kMaxGuardRules || config.keywords.size() > kMaxGuardKeywords) return false;
+        for (const auto& keyword : config.keywords) if (!validGuardText(keyword)) return false;
+        for (const auto& rule : config.rules) {
+            if (!validGuardExe(rule.exe) || static_cast<unsigned>(rule.mode) > 2 ||
+                rule.keywords.size() > kMaxRuleKeywords || rule.scope.size() > kMaxCategories) return false;
+            if (rule.mode == GuardMode::AllowOnly ? rule.keywords.empty() : !rule.keywords.empty()) return false;
+            for (const auto& keyword : rule.keywords) if (!validGuardText(keyword)) return false;
+            std::unordered_set<int> seen;
+            for (int id : rule.scope) if (!findCategory(id) || !seen.insert(id).second) return false;
+        }
         return true;
     }
 
@@ -511,9 +648,11 @@ public:
             in.seekg(0);
             std::array<char, 8> magic{};
             if (!in.read(magic.data(), magic.size())) return false;
-            // TRACKER4 adds the category table; TRACKER3 per-session flags; TRACKER2 the checkpoint.
+            // TRACKER5 adds category flags and the focus guard settings; TRACKER4 the category table;
+            // TRACKER3 per-session flags; TRACKER2 the checkpoint.
             int version = 0;
-            if (magic == fileMagic) version = 4;
+            if (magic == fileMagic) version = 5;
+            else if (magic == version4Magic) version = 4;
             else if (magic == version3Magic) version = 3;
             else if (magic == version2Magic) version = 2;
             else if (magic == legacyMagic) version = 1;
@@ -530,6 +669,10 @@ public:
                     category.id = static_cast<int>(value);
                     if (!readNumber(in, value, 4) || value > 0xFFFFFFu) return false;
                     category.color = static_cast<unsigned>(value);
+                    if (version >= 5) {
+                        if (!readNumber(in, value, 4) || (value & ~std::uint64_t(CategoryKnownFlags))) return false;
+                        category.flags = static_cast<unsigned>(value);
+                    }
                     if (!readNumber(in, value, 4) || value == 0 || value > maxNameBytes) return false;
                     std::string bytes(static_cast<std::size_t>(value), '\0');
                     if (!in.read(bytes.data(), static_cast<std::streamsize>(bytes.size())) ||
@@ -578,6 +721,13 @@ public:
                 if (!readNumber(in, value, 8) || value > static_cast<std::uint64_t>(maxTime)) return false;
                 candidate.lastSaved = static_cast<long long>(value);
             }
+            if (version >= 5) {
+                if (!readGuard(in, candidate.guard)) return false;
+            } else {
+                // Written before the focus guard: play (id 1) is free time, the guard starts switched off.
+                for (auto& category : candidate.categories) category.flags = category.id == 1 ? CategoryFree : 0u;
+                candidate.guard = DefaultGuardConfig();
+            }
             if (in.peek() != std::char_traits<char>::eof() || in.bad() || !candidate.validate()) return false;
             *this = std::move(candidate);
             return true;
@@ -608,6 +758,7 @@ public:
                 if (!encode(category.name, bytes)) { out.close(); cleanup(temporary); return false; }
                 writeNumber(out, static_cast<std::uint64_t>(category.id), 4);
                 writeNumber(out, category.color, 4);
+                writeNumber(out, category.flags, 4);
                 writeNumber(out, bytes.size(), 4);
                 out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
             }
@@ -631,6 +782,7 @@ public:
             writeNumber(out, candidate.activeTagId, 4);
             writeNumber(out, candidate.activeSince, 8);
             writeNumber(out, candidate.lastSaved, 8);
+            if (!writeGuard(out, candidate.guard)) { out.close(); cleanup(temporary); return false; }
             out.flush();
             const bool written = static_cast<bool>(out);
             out.close();
@@ -655,7 +807,8 @@ private:
     static constexpr long long maxFileBytes = 64 * 1024 * 1024;
     static constexpr long long maxTime = 253402300799LL;
     static constexpr std::uint64_t maxId = (std::numeric_limits<int>::max)();
-    inline static constexpr std::array<char, 8> fileMagic{'T','R','A','C','K','E','R','4'};
+    inline static constexpr std::array<char, 8> fileMagic{'T','R','A','C','K','E','R','5'};
+    inline static constexpr std::array<char, 8> version4Magic{'T','R','A','C','K','E','R','4'};
     inline static constexpr std::array<char, 8> version3Magic{'T','R','A','C','K','E','R','3'};
     inline static constexpr std::array<char, 8> version2Magic{'T','R','A','C','K','E','R','2'};
     inline static constexpr std::array<char, 8> legacyMagic{'T','R','A','C','K','E','R','1'};
@@ -739,7 +892,8 @@ private:
         std::unordered_set<int> categoryIds;
         for (const auto& category : categories)
             if (category.id < 0 || !categoryIds.insert(category.id).second ||
-                !validNameColor(category.name, category.color)) return false;
+                !validNameColor(category.name, category.color) || (category.flags & ~CategoryKnownFlags)) return false;
+        if (!validGuard(guard)) return false;
         std::unordered_set<int> ids;
         for (const auto& tag : tags)
             if (tag.id <= 0 || !ids.insert(tag.id).second ||
@@ -769,6 +923,77 @@ private:
     }
     static void writeNumber(std::ostream& out, std::uint64_t value, unsigned size) {
         for (unsigned i = 0; i < size; ++i) out.put(static_cast<char>((value >> (8 * i)) & 0xFF));
+    }
+    static bool readText(std::istream& in, std::wstring& text) {
+        std::uint64_t length = 0;
+        if (!readNumber(in, length, 4) || length == 0 || length > kMaxGuardTextBytes) return false;
+        std::string bytes(static_cast<std::size_t>(length), '\0');
+        return in.read(bytes.data(), static_cast<std::streamsize>(bytes.size())) && decode(bytes, text);
+    }
+    static bool writeText(std::ostream& out, const std::wstring& text) {
+        std::string bytes;
+        if (!encode(text, bytes) || bytes.size() > kMaxGuardTextBytes) return false;
+        writeNumber(out, bytes.size(), 4);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        return true;
+    }
+    // The guard block of TRACKER5: settings, rules, distraction keywords. Values are range-checked
+    // by validGuard() once the whole file is read.
+    static bool readGuard(std::istream& in, GuardConfig& config) {
+        std::uint64_t value = 0, count = 0;
+        unsigned* const numbers[] = {&config.graceSeconds, &config.repeatSeconds, &config.releaseMinutes,
+                                     &config.idleSeconds, &config.options};
+        if (!readNumber(in, value, 4) || value > 1) return false;
+        config.enabled = value == 1;
+        for (unsigned* number : numbers) {
+            if (!readNumber(in, value, 4) || value > 0xFFFFFFFFu) return false;
+            *number = static_cast<unsigned>(value);
+        }
+        if (!readNumber(in, count, 4) || count > kMaxGuardRules) return false;
+        config.rules.clear();
+        for (std::uint64_t i = 0; i < count; ++i) {
+            GuardRule rule;
+            std::uint64_t items = 0;
+            if (!readText(in, rule.exe) || !readNumber(in, value, 4) || value > 2) return false;
+            rule.mode = static_cast<GuardMode>(value);
+            if (!readNumber(in, items, 4) || items > kMaxRuleKeywords) return false;
+            for (std::uint64_t k = 0; k < items; ++k) {
+                std::wstring keyword;
+                if (!readText(in, keyword)) return false;
+                rule.keywords.push_back(std::move(keyword));
+            }
+            if (!readNumber(in, items, 4) || items > kMaxCategories) return false;
+            for (std::uint64_t k = 0; k < items; ++k) {
+                if (!readNumber(in, value, 4) || value > maxId) return false;
+                rule.scope.push_back(static_cast<int>(value));
+            }
+            config.rules.push_back(std::move(rule));
+        }
+        if (!readNumber(in, count, 4) || count > kMaxGuardKeywords) return false;
+        config.keywords.clear();
+        for (std::uint64_t i = 0; i < count; ++i) {
+            std::wstring keyword;
+            if (!readText(in, keyword)) return false;
+            config.keywords.push_back(std::move(keyword));
+        }
+        return true;
+    }
+    static bool writeGuard(std::ostream& out, const GuardConfig& config) {
+        writeNumber(out, config.enabled ? 1 : 0, 4);
+        for (unsigned number : {config.graceSeconds, config.repeatSeconds, config.releaseMinutes,
+                                config.idleSeconds, config.options}) writeNumber(out, number, 4);
+        writeNumber(out, config.rules.size(), 4);
+        for (const auto& rule : config.rules) {
+            if (!writeText(out, rule.exe)) return false;
+            writeNumber(out, static_cast<unsigned>(rule.mode), 4);
+            writeNumber(out, rule.keywords.size(), 4);
+            for (const auto& keyword : rule.keywords) if (!writeText(out, keyword)) return false;
+            writeNumber(out, rule.scope.size(), 4);
+            for (int id : rule.scope) writeNumber(out, static_cast<std::uint64_t>(id), 4);
+        }
+        writeNumber(out, config.keywords.size(), 4);
+        for (const auto& keyword : config.keywords) if (!writeText(out, keyword)) return false;
+        return true;
     }
 };
 

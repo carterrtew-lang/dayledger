@@ -33,9 +33,29 @@ English | [简体中文](README.md)
   - Time of day: the average time per hour of a recorded day, by category
   - Breakdown: every category and its tags, with time and share
 
+**Focus guard (app whitelist)**
+
+- Each category is either whitelist or 「畅玩电脑」(free time).
+  - While a whitelist category is timed, switching to a program outside the whitelist pops up a reminder.
+  - Free categories (by default 娱乐 / play) and pomodoro breaks are not checked.
+- Whitelist rules name a program (e.g. `wps.exe`) and one of three ways:
+  - allow all its windows;
+  - allow it but check titles: the default for browsers, which reminds when the title contains a distraction keyword such as 知乎 or 哔哩哔哩;
+  - allow only windows whose title contains given keywords.
+  
+  A rule can be limited to some categories, and the program can be picked from the ones running now.
+- The reminder offers: back to work, a **temporary release** (10 minutes by default, or 5–60 from a menu), adding a whitelist rule on the spot, or recording the time as a free-time tag from the moment the distraction began.
+- Temporary releases are counted, together with the time actually spent on the released page. Distractions and releases are summed up on the statistics page.
+- Grace time, repeat interval, release length and the away-from-keyboard threshold are adjustable. Off by default: turn it on in 「⋯ → 专注守护设置」(focus guard settings).
+
 **Pomodoro**
 
 - Two modes, 「计时 / 番茄钟」(Timer / Pomodoro), toggled with `P`
+- The pomodoro window: a small dark window that comes with pomodoro mode, in the look of the original standalone timer
+  - big countdown, progress bar, start / pause button, give up / skip
+  - on top by default, can shrink to a strip
+  - shows what you are focusing on (click to switch) and the focus guard's state
+  - flashes when a phase ends
 - Configurable focus, short-break, and long-break lengths, plus long-break interval
 - Completed pomodoros are counted and flagged in records, the timeline, and weekly stats
 - Chime, taskbar flash, and a system notification when the window is in the tray
@@ -93,9 +113,10 @@ Right-click a category, a tag, or a record for more actions (for example, moving
 ## Data and privacy
 
 - Data directory: `%LOCALAPPDATA%\DayLedger\`
-  - `tracker.dat`: all records (TRACKER4 format with a category table; TRACKER1–3 files still load. Once saved by this version, older builds can no longer open the file)
+  - `tracker.dat`: all records (TRACKER5 format with the category table and focus guard settings; TRACKER1–4 files still load. Once saved by this version, older builds can no longer open the file)
+  - `guard.tsv`: distractions and temporary releases (a UTF-8 table that Excel opens)
   - `settings.ini`: settings
-- Everything stays on your machine; the app makes no network requests and has no telemetry
+- Everything stays on your machine; the app makes no network requests and has no telemetry. The focus guard reads the foreground window's program name and title locally only (title logging can be turned off)
 - Use「⋯ → 打开数据文件夹」(Open data folder) to locate it; delete the folder to erase all data
 
 ## Project layout
@@ -104,6 +125,7 @@ Right-click a category, a tag, or a record for more actions (for example, moving
 src/time_tracker.cpp   Main program: window, custom-drawn UI, tray, Pomodoro screens, automation interface
 src/tracker_model.h    Data model, TRACKER format I/O, record editing API
 src/pomodoro.h         Pomodoro state machine (pure logic, unit-testable)
+src/focus_guard.h      Focus guard: whitelist matching, reminder rhythm, release timing, log format (pure logic, unit-testable)
 src/ui_kit.h           Theme, drawing helpers, icons, Chinese formatting
 src/time_tracker.rc    Icon and version resources
 src/app.manifest       DPI awareness and OS compatibility
@@ -114,12 +136,15 @@ build-msvc.bat         MSVC build script
 
 ## Tests
 
-Model and Pomodoro state machine tests:
+Model, Pomodoro state machine and focus guard tests:
 
 ```sh
 g++ -std=c++17 -O2 -static tests/tracker_model_test.cpp -o build/tracker_model_test.exe
 ./build/tracker_model_test.exe
-# PASS: 294 checks
+# PASS: 360 checks
+g++ -std=c++17 -O2 -static tests/focus_guard_test.cpp -o build/focus_guard_test.exe
+./build/focus_guard_test.exe
+# PASS: 72 checks
 ```
 
 Desktop smoke test (needs Windows Python and an interactive desktop):
@@ -128,13 +153,14 @@ Desktop smoke test (needs Windows Python and an interactive desktop):
 python tests/desktop_smoke.py --exe build/TimeTracker.exe
 ```
 
-The smoke test drives the UI through the app's built-in `WM_COMMAND` / `WM_DL_QUERY` automation interface and redirects `LOCALAPPDATA` to a temporary directory, so it never touches real data.
+The smoke test drives the UI through the app's built-in `WM_COMMAND` / `WM_DL_QUERY` automation interface and redirects `LOCALAPPDATA` to a temporary directory, so it never touches real data. The focus guard scenario stands in for the foreground window through the `DAYLEDGER_TEST_GUARD=1` test switch.
 
 ## Known limitations
 
 - The UI is Simplified Chinese only
 - Windows only
 - The MSVC build script has not been verified
+- The focus guard judges by program name and window title only (it cannot see page contents); exclusive full-screen games may cover the reminder
 
 ## License
 

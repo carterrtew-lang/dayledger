@@ -29,7 +29,9 @@ WM_DL_QUERY = 0x8000 + 0x40
 (Q_TAGS, Q_RECORDS, Q_ACTIVE, Q_READONLY, Q_IS_TODAY, Q_SAVE_FAILED, Q_DARK, Q_SELECTED, Q_LOADED,
  Q_POMODORO_MODE, Q_POMODORO_PHASE, Q_POMODORO_PAUSED, Q_POMODORO_REMAINING, Q_POMODOROS_TODAY,
  Q_MINI, Q_REST_TAG, Q_TOPMOST, Q_TRAY, Q_CALENDAR, Q_CATEGORIES, Q_VIEW, Q_RANGE, Q_PERIOD_TOTAL,
- Q_PERIOD_START) = range(24)
+ Q_PERIOD_START, Q_GUARD_ENABLED, Q_GUARD_STATE, Q_GUARD_POPUP, Q_GUARD_RULES, Q_GUARD_DISTRACTIONS_TODAY,
+ Q_GUARD_SIMULATED, Q_GUARD_RELEASES_TODAY, Q_GUARD_RELEASED_SECONDS_TODAY, Q_GUARD_RELEASES_RUNNING,
+ Q_POMODORO_WINDOW, Q_POMODORO_WINDOW_MINI) = range(35)
 CMD_PREV_DAY, CMD_NEXT_DAY, CMD_TODAY = 101, 102, 103
 CMD_NEW_TAG, CMD_STOP, CMD_ADD_RECORD, CMD_UNDO = 106, 110, 111, 112
 CMD_THEME_LIGHT, CMD_THEME_DARK = 121, 122
@@ -37,6 +39,13 @@ CMD_POMODORO_PAUSE, CMD_POMODORO_ABANDON, CMD_MINI, CMD_POMODORO_START = 127, 12
 CMD_POMODORO_ON, CMD_POMODORO_OFF, CMD_EXIT, CMD_SHOW = 136, 137, 138, 139
 CMD_NEW_CATEGORY = 143
 CMD_VIEW_DAY, CMD_VIEW_STATS, CMD_RANGE_WEEK, CMD_RANGE_MONTH, CMD_RANGE_YEAR = 145, 146, 148, 149, 150
+CMD_GUARD_SETTINGS, CMD_GUARD_OFF, CMD_RELEASE_END = 151, 154, 156
+# Focus guard: the reminder window's buttons, the settings dialog, the test stand-in for the window
+# in front (WM_COPYDATA with UTF-16 "exe<TAB>title"; DAYLEDGER_TEST_GUARD=1 enables it).
+GP_RELEASE, GP_ALLOW_KEYWORD, GP_SWITCH_FREE = 602, 604, 605
+GS_ENABLED, GS_GRACE, GS_REPEAT = 701, 702, 703
+GUARD_TEST_DATA, WM_COPYDATA = 0x44474644, 0x4A
+PW_START, PW_MINI = 901, 904
 PHASE_READY, PHASE_FOCUS, PHASE_BREAK = 0, 1, 2
 # With DAYLEDGER_TEST_SECONDS_PER_MINUTE=1 these "minutes" last one second each.
 POMODORO_SETTINGS = "[pomodoro]\nfocus=5\nshort=2\nlong=2\nevery=4\n"
@@ -50,6 +59,10 @@ CD_NAME, CD_DELETE, CD_COLOR_FIRST = 501, 504, 520
 TDM_CLICK_BUTTON = 0x400 + 102
 RD_START, RD_END, RD_TAG_FIRST = 302, 303, 0x1000
 MIN_CLIENT = (880, 600)
+
+
+class COPYDATASTRUCT(C.Structure):
+    _fields_ = [("dwData", C.c_size_t), ("cbData", W.DWORD), ("lpData", C.c_void_p)]
 
 
 def need(value, message):
@@ -104,6 +117,13 @@ class Desktop:
 
     def query(self, hwnd, what):
         return self.send(hwnd, WM_DL_QUERY, what)
+
+    def simulate(self, hwnd, window):
+        """The window in front, as the focus guard should see it ("" = the real one)."""
+        text = C.create_unicode_buffer(window)
+        data = COPYDATASTRUCT(GUARD_TEST_DATA, len(window.encode("utf-16-le")), C.addressof(text) if window else None)
+        self.buffers += [text, data]
+        need(self.send(hwnd, WM_COPYDATA, 0, C.addressof(data)) == 1, "Guard stand-in refused")
 
     def control(self, hwnd, identifier):
         return need(self.u.GetDlgItem(hwnd, identifier), f"Missing control {identifier}")
@@ -199,7 +219,7 @@ def parse_tracker(path):
     """Read the versioned little-endian ledger with UTF-8 names (TRACKER4 adds the category table,
     TRACKER3 session flags, TRACKER2 the last-saved time)."""
     data, offset = path.read_bytes(), 8
-    need(data[:8] in (b"TRACKER1", b"TRACKER2", b"TRACKER3", b"TRACKER4"), "Invalid tracker header")
+    need(data[:8] in (b"TRACKER1", b"TRACKER2", b"TRACKER3", b"TRACKER4", b"TRACKER5"), "Invalid tracker header")
     version = data[7] - ord("0")
 
     def number(size=4):
@@ -217,15 +237,17 @@ def parse_tracker(path):
         offset += length
         return text
 
-    categories = [dict(id=0, color=BLUE, name="工作"), dict(id=1, color=0x3468EB, name="娱乐"),
-                  dict(id=2, color=0x7AAF1B, name="其他")]
+    categories = [dict(id=0, color=BLUE, flags=0, name="工作"), dict(id=1, color=0x3468EB, flags=1, name="娱乐"),
+                  dict(id=2, color=0x7AAF1B, flags=0, name="其他")]
     if version >= 4:
         count = number()
         need(0 < count <= 64, "Invalid category count")
         categories = []
         for _ in range(count):
             identifier, color = number(), number()
-            categories.append(dict(id=identifier, color=color, name=name()))
+            flags = number() if version >= 5 else int(identifier == 1)   # 1: 畅玩电脑 (free time)
+            need(flags in (0, 1), "Unknown category flags")
+            categories.append(dict(id=identifier, color=color, flags=flags, name=name()))
     category_ids = {c["id"] for c in categories}
     need(len(category_ids) == len(categories) and all(c["color"] <= 0xFFFFFF for c in categories),
          "Invalid categories")
@@ -241,6 +263,22 @@ def parse_tracker(path):
                 for _ in range(count)]
     active, since = number(), number(8)
     last_saved = number(8) if version >= 2 else 0
+    guard = None
+    if version >= 5:            # the focus guard: settings, whitelist rules, distraction keywords
+        enabled, grace, repeat, release, idle, options = (number() for _ in range(6))
+        rules = []
+        for _ in range(number()):
+            exe, mode = name(), number()
+            keywords = [name() for _ in range(number())]
+            scope = [number() for _ in range(number())]
+            rules.append(dict(exe=exe, mode=mode, keywords=keywords, scope=scope))
+        keywords = [name() for _ in range(number())]
+        need(enabled in (0, 1) and grace <= 120 and 10 <= repeat <= 3600 and 1 <= release <= 240 and
+             30 <= idle <= 3600 and options < 8, "Invalid guard settings")
+        need(all(r["mode"] in (0, 1, 2) and all(i in category_ids for i in r["scope"]) and
+                 bool(r["keywords"]) == (r["mode"] == 2) for r in rules), "Invalid guard rules")
+        guard = dict(enabled=enabled, grace=grace, repeat=repeat, release=release, idle=idle, options=options,
+                     rules=rules, keywords=keywords)
     need(offset == len(data), "Unexpected trailing bytes")
     ids = {t["id"] for t in tags}
     need(len(ids) == len(tags) and all(0 < i <= 0x7FFFFFFF for i in ids), "Invalid tag IDs")
@@ -254,7 +292,7 @@ def parse_tracker(path):
         previous = s["end"]
     need((active == 0 and since == 0) or
          (active in ids and previous <= since <= 253402300799), "Invalid active session")
-    return dict(categories=categories, tags=tags, sessions=sessions, active=active, since=since)
+    return dict(categories=categories, tags=tags, sessions=sessions, active=active, since=since, guard=guard)
 
 
 def recorded(ledger, start, end):
@@ -461,8 +499,75 @@ def exercise(d, main, p, timeout, data, check):
          same_family(moved["color"], work), "Deleted category's tag not moved into 工作's colours")
     check("delete_category_moves_its_tags")
 
+    # focus guard: a reminder, a temporary release (counted, with the time spent on the page), a
+    # whitelist entry from the reminder, and "记为…" moving the time to a free category
+    e = editor(CMD_GUARD_SETTINGS, "DayLedgerGuardSettings")
+    d.set_text(d.control(e, GS_GRACE), "1")
+    d.set_text(d.control(e, GS_REPEAT), "10")
+    d.command(e, GS_ENABLED)
+    finish(e)
+    guard = parse_tracker(data)["guard"]
+    need(guard["enabled"] == 1 and guard["grace"] == 1 and guard["repeat"] == 10 and q(Q_GUARD_ENABLED) == 1,
+         "Guard settings not saved")
+    zhihu = "msedge.exe\t知乎 - 有问题，就会有答案 - Microsoft Edge"
+    report = "wps.exe\t知乎2025财报点评.docx - WPS文字"   # an allowed program: its titles are not checked
+    d.simulate(main, report)
+    d.command(main, CMD_TAG_FIRST + 0)
+    until(lambda: q(Q_ACTIVE) == 1 and q(Q_GUARD_STATE) == 1 and q(Q_GUARD_SIMULATED) == 1)
+    d.simulate(main, zhihu)
+    until(lambda: q(Q_GUARD_POPUP) == 1 and q(Q_GUARD_STATE) == 3)
+    d.command(until(lambda: d.top(p.pid, "DayLedgerGuardPopup")), GP_RELEASE)
+    until(lambda: q(Q_GUARD_POPUP) == 0 and q(Q_GUARD_RELEASES_RUNNING) == 1 and q(Q_GUARD_RELEASES_TODAY) == 1)
+    time.sleep(2.5)                     # on the released page
+    d.simulate(main, report)
+    time.sleep(1.5)                     # back at work: not counted
+    need(q(Q_GUARD_STATE) == 1 and q(Q_GUARD_POPUP) == 0, "An allowed program was reminded")
+    dwell = q(Q_GUARD_RELEASED_SECONDS_TODAY)
+    need(2 <= dwell <= 4, f"Time on the released page wrong: {dwell}")
+    d.command(main, CMD_RELEASE_END)
+    until(lambda: q(Q_GUARD_RELEASES_RUNNING) == 0)
+    check("guard_reminder_and_temporary_release_counted")
+
+    d.simulate(main, zhihu)
+    until(lambda: q(Q_GUARD_POPUP) == 1)
+    d.command(until(lambda: d.top(p.pid, "DayLedgerGuardPopup")), GP_ALLOW_KEYWORD)
+    until(lambda: q(Q_GUARD_POPUP) == 0)
+    need(any(r["exe"] == "msedge.exe" and r["mode"] == 2 and "知乎" in r["keywords"]
+             for r in parse_tracker(data)["guard"]["rules"]), "Whitelist entry not saved")
+    time.sleep(2)
+    need(q(Q_GUARD_STATE) == 1 and q(Q_GUARD_POPUP) == 0, "A whitelisted page was reminded")
+    check("guard_whitelist_from_the_reminder")
+
+    d.simulate(main, "steam.exe\tSteam")
+    until(lambda: q(Q_GUARD_POPUP) == 1)
+    d.command(until(lambda: d.top(p.pid, "DayLedgerGuardPopup")), GP_SWITCH_FREE)
+    until(lambda: q(Q_ACTIVE) == 2 and q(Q_GUARD_STATE) == 0)      # 娱乐 (tag 2) is free time
+    ledger = parse_tracker(data)
+    need(ledger["sessions"][-1]["tag"] == 1 and ledger["sessions"][-1]["end"] == ledger["since"],
+         "Free time does not start where the distraction began")
+    time.sleep(1.5)
+    need(q(Q_GUARD_POPUP) == 0, "Free time was reminded")
+    d.command(main, CMD_STOP)
+    until(lambda: q(Q_ACTIVE) == 0)
+    d.simulate(main, "")
+    d.command(main, CMD_GUARD_OFF)
+    until(lambda: q(Q_GUARD_ENABLED) == 0)
+    rows = [line.split("\t") for line in (data.parent / "guard.tsv").read_text(encoding="utf-8").splitlines()[1:]]
+    actions = {(row[0], row[9]) for row in rows}
+    need({("D", "released"), ("R", "ended"), ("D", "allowed"), ("D", "switched")} <= actions,
+         f"Guard log incomplete: {sorted(actions)}")
+    release = next(row for row in rows if row[0] == "R")
+    need(release[6] == "msedge.exe" and release[7] == "知乎" and 2 <= int(release[3]) <= 4, "Release record wrong")
+    check("guard_switch_to_free_time_and_log")
+
     d.command(main, CMD_POMODORO_ON)
     until(lambda: q(Q_POMODORO_MODE) == 1 and q(Q_POMODORO_PHASE) == PHASE_READY)
+    pomodoro = until(lambda: d.top(p.pid, "DayLedgerPomodoro"))   # the pomodoro window comes with the mode
+    d.command(pomodoro, PW_MINI)
+    until(lambda: q(Q_POMODORO_WINDOW) == 1 and q(Q_POMODORO_WINDOW_MINI) == 1)
+    d.command(pomodoro, PW_MINI)
+    until(lambda: q(Q_POMODORO_WINDOW_MINI) == 0)
+    check("pomodoro_window_with_the_mode")
     d.command(main, CMD_TAG_FIRST + 0)  # focus on the first tag
     until(lambda: q(Q_POMODORO_PHASE) == PHASE_FOCUS and q(Q_ACTIVE) == 1)
     until(lambda: q(Q_POMODORO_PHASE) == PHASE_BREAK)
@@ -480,7 +585,7 @@ def exercise(d, main, p, timeout, data, check):
     need(q(Q_POMODOROS_TODAY) == 1, "Pomodoro count wrong")
     check("pomodoro_focus_break_ready_cycle")
 
-    d.command(main, CMD_POMODORO_START)
+    d.command(pomodoro, PW_START)        # the pomodoro window's big button
     until(lambda: q(Q_POMODORO_PHASE) == PHASE_FOCUS and q(Q_ACTIVE) == 1)
     d.command(main, CMD_POMODORO_PAUSE)
     until(lambda: q(Q_POMODORO_PAUSED) == 1 and q(Q_ACTIVE) == 0)
@@ -501,7 +606,7 @@ def exercise(d, main, p, timeout, data, check):
     d.command(main, CMD_MINI)
     until(lambda: q(Q_MINI) == 0 and not d.u.IsWindowVisible(mini) and d.u.IsWindowVisible(main))
     d.command(main, CMD_POMODORO_OFF)
-    until(lambda: q(Q_POMODORO_MODE) == 0)
+    until(lambda: q(Q_POMODORO_MODE) == 0 and q(Q_POMODORO_WINDOW) == 0)
     check("mini_window_and_mode_switch")
 
     d.command(main, CMD_TAG_FIRST + 0)
@@ -549,7 +654,7 @@ def main():
         d = Desktop()
         with tempfile.TemporaryDirectory(prefix="time-tracker-smoke-") as isolated:
             env = dict(os.environ, LOCALAPPDATA=isolated, APPDATA=isolated, TEMP=isolated, TMP=isolated,
-                       DAYLEDGER_TEST_SECONDS_PER_MINUTE="1")
+                       DAYLEDGER_TEST_SECONDS_PER_MINUTE="1", DAYLEDGER_TEST_GUARD="1")
             data = Path(isolated) / "DayLedger" / "tracker.dat"
             data.parent.mkdir()
             (data.parent / "settings.ini").write_text(POMODORO_SETTINGS, encoding="ascii")
@@ -590,6 +695,7 @@ def main():
                     p = launch()
                     window = wait(lambda: d.top(p.pid, "DayLedgerNativeWindow"), args.timeout, p)
                     wait(lambda: d.query(window, Q_LOADED) == 1 and
+                         d.query(window, Q_GUARD_RULES) == len(saved["guard"]["rules"]) and
                          d.query(window, Q_TAGS) == len(saved["tags"]) and
                          d.query(window, Q_CATEGORIES) == len(saved["categories"]) and
                          d.query(window, Q_RECORDS) == rows, args.timeout, p)
