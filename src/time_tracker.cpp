@@ -1303,6 +1303,7 @@ void PaintPomodoroTimer(Ctx& x, const RECT& r, int top, int statusRight) {
     if (focus) status = p.paused ? L"专注已暂停" : Format(L"专注中 · 第 %d 个", done + 1);
     else if (rest) status = p.paused ? L"休息已暂停" : (p.longBreak ? L"长休息中" : L"休息中");
     else status = L"准备专注";
+    if (focus && !p.paused && c.Measure(status, x.f.labelBold).cx > statusRight - left - S(16)) status = L"专注中";
     if (p.running()) {
         c.Circle(left + Sf(4), y + Sf(12), Sf(7), color, 50);
         c.Circle(left + Sf(4), y + Sf(12), Sf(4), color);
@@ -1342,12 +1343,11 @@ void PaintPomodoroTimer(Ctx& x, const RECT& r, int top, int statusRight) {
     else if (focus) {
         const bool longNext = p.cycle + 1 >= config.longEvery;
         meta = std::wstring(L"完成后") + (longNext ? L"长休息 " : L"休息 ") +
-               DurationText(longNext ? config.longBreak : config.shortBreak) + L" · 单击标签可切换";
-    } else meta = Format(L"休息结束后开始第 %d 个番茄", done + 1);
-    if (focus && !p.paused && model.activeTagId) {
-        const auto counts = CountGuard(model.activeSince, x.now + 1);
+               DurationText(longNext ? config.longBreak : config.shortBreak);
+        const auto counts = model.activeTagId ? CountGuard(model.activeSince, x.now + 1) : GuardCounts{};
         if (counts.distractions) meta = Format(L"本次专注分心 %d 次 · ", counts.distractions) + meta;
-    }
+        else meta += L" · 单击标签可切换";
+    } else meta = Format(L"休息结束后开始第 %d 个番茄", done + 1);
     if (!PaintReleasePill(x, left, right, y)) c.Text(meta, RECT{left, y, right, y + S(20)}, x.f.label, x.p.text2);
     const RECT row{left, r.bottom - S(18) - S(40), right, r.bottom - S(18)};
     const bool writable = !app.readOnly;
@@ -6896,13 +6896,18 @@ void PaintPomodoroWindow(Canvas& c, int w, int h) {
     const double progress = p.phase == PomodoroPhase::Ready ? 0.0 : 1.0 - static_cast<double>(remaining) / static_cast<double>(length);
     const std::wstring time = CountdownText(remaining);
     const COLORREF timeInk = p.paused || p.phase == PomodoroPhase::Ready ? kPomoDim : kPomoText;
+    // a distraction the guard is reminding about right now
+    const bool distracted = focus && !p.paused && app.guard.state == tracker::GuardState::Alerting && GuardedTag();
+    const COLORREF alertInk = RGB(0xFF, 0x5F, 0x57);
     if (app.pomoMini) {                      // the strip: time, what, expand, bar
         const float scale = f.Sf(1);
         c.Text(time, RECT{f.S(12), 0, f.S(104), h - f.S(3)}, PomoDigits(f.S(26)), timeInk, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         AddHit(f.hits, c, RECT{f.S(8), f.S(4), f.S(104), h - f.S(6)}, PW_START);
-        if (tag && !rest) c.Circle(f.Sf(112), h / 2.0f - f.Sf(1), f.Sf(4), tag->color);
-        c.Text(rest ? std::wstring(p.longBreak ? L"长休息" : L"休息") : tag ? tag->name : std::wstring(L"番茄钟"),
-               RECT{f.S(rest ? 108 : 120), 0, w - f.S(40), h - f.S(3)}, f.fonts.label, rest ? k.accent : kPomoText);
+        if (tag && !rest) c.Circle(f.Sf(112), h / 2.0f - f.Sf(1), f.Sf(4), distracted ? alertInk : tag->color);
+        c.Text(rest ? std::wstring(p.longBreak ? L"长休息" : L"休息") : distracted ? std::wstring(L"正在分心")
+                                                                                     : tag ? tag->name : std::wstring(L"番茄钟"),
+               RECT{f.S(rest ? 108 : 120), 0, w - f.S(40), h - f.S(3)}, f.fonts.label,
+               rest ? k.accent : distracted ? alertInk : kPomoText);
         PomoIcon(c, f, RECT{w - f.S(36), h / 2 - f.S(14), w - f.S(8), h / 2 + f.S(12)}, Icon::Expand, PW_MINI, false, scale);
         c.Fill(0, h - f.Sf(3), float(w), f.Sf(3), k.track);
         c.Fill(0, h - f.Sf(3), static_cast<float>(w * std::clamp(progress, 0.0, 1.0)), f.Sf(3), k.accent);
@@ -6970,11 +6975,16 @@ void PaintPomodoroWindow(Canvas& c, int w, int h) {
     }
     // the countdown in the space between, with the guard's state under it
     std::wstring guardLine;
-    if (focus && !p.paused && GuardedTag()) {
+    COLORREF guardInk = kPomoDim;
+    if (distracted) {
+        guardLine = L"正在分心" + GuardSourceLabel() + L" · " + CountdownText(std::max(0LL, now - app.guard.since));
+        guardInk = alertInk;
+    } else if (focus && !p.paused && GuardedTag()) {
         if (!app.guard.releases.empty()) {
             const auto& release = app.guard.releases.back();
             guardLine = L"临时放行「" + (release.keyword.empty() ? release.exe : release.keyword) + L"」剩 " +
                         CountdownText(std::max(0LL, release.until - now));
+            guardInk = RGB(0xED, 0xA1, 0x00);
         } else {
             const auto counts = CountGuard(model.activeSince, now + 1);
             guardLine = counts.distractions ? Format(L"专注守护中 · 分心 %d 次", counts.distractions) : std::wstring(L"专注守护中");
@@ -6984,8 +6994,8 @@ void PaintPomodoroWindow(Canvas& c, int w, int h) {
     const int digits = std::max(K(28), std::min(K(56), (timeBottom - timeTop) * 9 / 10));
     c.Text(time, RECT{0, timeTop, w, timeBottom}, PomoDigits(digits), timeInk, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     if (!guardLine.empty())
-        c.Text(guardLine, RECT{mx, bar.top - K(22), w - mx, bar.top - K(6)}, f.fonts.caption,
-               app.guard.releases.empty() ? kPomoDim : RGB(0xED, 0xA1, 0x00), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        c.Text(guardLine, RECT{mx, bar.top - K(22), w - mx, bar.top - K(6)}, f.fonts.caption, guardInk,
+               DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     if (WindowsBuild() < 22000) {
         c.Fill(0, 0, float(w), 1, RGB(0x34, 0x35, 0x3F));
         c.Fill(0, float(h - 1), float(w), 1, RGB(0x34, 0x35, 0x3F));
