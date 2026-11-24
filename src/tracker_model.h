@@ -168,7 +168,8 @@ struct GuardRule {
 constexpr unsigned GuardMinimize = 1u;      // "back to work" minimises the distracting window
 constexpr unsigned GuardSound = 2u;         // a chime when the reminder appears
 constexpr unsigned GuardLogTitles = 4u;     // the guard log keeps window titles
-constexpr unsigned GuardKnownOptions = GuardMinimize | GuardSound | GuardLogTitles;
+constexpr unsigned GuardStrict = 8u;        // 强制模式: an unanswered reminder covers the window, escapes cost
+constexpr unsigned GuardKnownOptions = GuardMinimize | GuardSound | GuardLogTitles | GuardStrict;
 constexpr std::size_t kMaxGuardRules = 256, kMaxRuleKeywords = 32, kMaxGuardKeywords = 256,
                       kMaxGuardTextBytes = 256;
 struct GuardConfig {
@@ -178,12 +179,16 @@ struct GuardConfig {
     unsigned releaseMinutes = 10;   // 1..240: how long a temporary release (临时放行) lasts
     unsigned idleSeconds = 120;     // 30..3600: no input for this long = away from the computer
     unsigned options = GuardSound | GuardLogTitles;
+    unsigned shieldSeconds = 10;    // 0..120, 强制模式: an unanswered reminder covers the window after this
+    unsigned dailyEscapes = 3;      // 0..20, 强制模式: temporary releases, and switches to free time, a day
     std::vector<GuardRule> rules;
     std::vector<std::wstring> keywords;     // distraction keywords; only CheckTitle rules use them
+    bool strict() const { return (options & GuardStrict) != 0; }
     bool operator==(const GuardConfig& o) const {
         return enabled == o.enabled && graceSeconds == o.graceSeconds && repeatSeconds == o.repeatSeconds &&
                releaseMinutes == o.releaseMinutes && idleSeconds == o.idleSeconds && options == o.options &&
-               rules == o.rules && keywords == o.keywords;
+               shieldSeconds == o.shieldSeconds && dailyEscapes == o.dailyEscapes && rules == o.rules &&
+               keywords == o.keywords;
     }
     bool operator!=(const GuardConfig& o) const { return !(*this == o); }
 };
@@ -337,8 +342,9 @@ public:
     bool validGuard(const GuardConfig& config) const {
         if (config.graceSeconds > 120 || config.repeatSeconds < 10 || config.repeatSeconds > 3600 ||
             config.releaseMinutes < 1 || config.releaseMinutes > 240 || config.idleSeconds < 30 ||
-            config.idleSeconds > 3600 || (config.options & ~GuardKnownOptions) ||
-            config.rules.size() > kMaxGuardRules || config.keywords.size() > kMaxGuardKeywords) return false;
+            config.idleSeconds > 3600 || (config.options & ~GuardKnownOptions) || config.shieldSeconds > 120 ||
+            config.dailyEscapes > 20 || config.rules.size() > kMaxGuardRules ||
+            config.keywords.size() > kMaxGuardKeywords) return false;
         for (const auto& keyword : config.keywords) if (!validGuardText(keyword)) return false;
         for (const auto& rule : config.rules) {
             if (!validGuardExe(rule.exe) || static_cast<unsigned>(rule.mode) > 2 ||
@@ -648,10 +654,12 @@ public:
             in.seekg(0);
             std::array<char, 8> magic{};
             if (!in.read(magic.data(), magic.size())) return false;
-            // TRACKER5 adds category flags and the focus guard settings; TRACKER4 the category table;
-            // TRACKER3 per-session flags; TRACKER2 the checkpoint.
+            // TRACKER6 adds the strict mode numbers to the guard block; TRACKER5 category flags and the
+            // focus guard settings; TRACKER4 the category table; TRACKER3 per-session flags; TRACKER2
+            // the checkpoint.
             int version = 0;
-            if (magic == fileMagic) version = 5;
+            if (magic == fileMagic) version = 6;
+            else if (magic == version5Magic) version = 5;
             else if (magic == version4Magic) version = 4;
             else if (magic == version3Magic) version = 3;
             else if (magic == version2Magic) version = 2;
@@ -722,7 +730,7 @@ public:
                 candidate.lastSaved = static_cast<long long>(value);
             }
             if (version >= 5) {
-                if (!readGuard(in, candidate.guard)) return false;
+                if (!readGuard(in, candidate.guard, version >= 6)) return false;
             } else {
                 // Written before the focus guard: play (id 1) is free time, the guard starts switched off.
                 for (auto& category : candidate.categories) category.flags = category.id == 1 ? CategoryFree : 0u;
@@ -807,7 +815,8 @@ private:
     static constexpr long long maxFileBytes = 64 * 1024 * 1024;
     static constexpr long long maxTime = 253402300799LL;
     static constexpr std::uint64_t maxId = (std::numeric_limits<int>::max)();
-    inline static constexpr std::array<char, 8> fileMagic{'T','R','A','C','K','E','R','5'};
+    inline static constexpr std::array<char, 8> fileMagic{'T','R','A','C','K','E','R','6'};
+    inline static constexpr std::array<char, 8> version5Magic{'T','R','A','C','K','E','R','5'};
     inline static constexpr std::array<char, 8> version4Magic{'T','R','A','C','K','E','R','4'};
     inline static constexpr std::array<char, 8> version3Magic{'T','R','A','C','K','E','R','3'};
     inline static constexpr std::array<char, 8> version2Magic{'T','R','A','C','K','E','R','2'};
@@ -937,12 +946,13 @@ private:
         out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
         return true;
     }
-    // The guard block of TRACKER5: settings, rules, distraction keywords. Values are range-checked
-    // by validGuard() once the whole file is read.
-    static bool readGuard(std::istream& in, GuardConfig& config) {
+    // The guard block: settings (TRACKER6 adds the strict mode numbers), rules, distraction keywords.
+    // Values are range-checked by validGuard() once the whole file is read.
+    static bool readGuard(std::istream& in, GuardConfig& config, bool strictNumbers) {
         std::uint64_t value = 0, count = 0;
-        unsigned* const numbers[] = {&config.graceSeconds, &config.repeatSeconds, &config.releaseMinutes,
-                                     &config.idleSeconds, &config.options};
+        std::vector<unsigned*> numbers{&config.graceSeconds, &config.repeatSeconds, &config.releaseMinutes,
+                                       &config.idleSeconds, &config.options};
+        if (strictNumbers) numbers.insert(numbers.end(), {&config.shieldSeconds, &config.dailyEscapes});
         if (!readNumber(in, value, 4) || value > 1) return false;
         config.enabled = value == 1;
         for (unsigned* number : numbers) {
@@ -981,7 +991,8 @@ private:
     static bool writeGuard(std::ostream& out, const GuardConfig& config) {
         writeNumber(out, config.enabled ? 1 : 0, 4);
         for (unsigned number : {config.graceSeconds, config.repeatSeconds, config.releaseMinutes,
-                                config.idleSeconds, config.options}) writeNumber(out, number, 4);
+                                config.idleSeconds, config.options, config.shieldSeconds, config.dailyEscapes})
+            writeNumber(out, number, 4);
         writeNumber(out, config.rules.size(), 4);
         for (const auto& rule : config.rules) {
             if (!writeText(out, rule.exe)) return false;

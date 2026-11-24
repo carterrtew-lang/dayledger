@@ -31,7 +31,8 @@ WM_DL_QUERY = 0x8000 + 0x40
  Q_MINI, Q_REST_TAG, Q_TOPMOST, Q_TRAY, Q_CALENDAR, Q_CATEGORIES, Q_VIEW, Q_RANGE, Q_PERIOD_TOTAL,
  Q_PERIOD_START, Q_GUARD_ENABLED, Q_GUARD_STATE, Q_GUARD_POPUP, Q_GUARD_RULES, Q_GUARD_DISTRACTIONS_TODAY,
  Q_GUARD_SIMULATED, Q_GUARD_RELEASES_TODAY, Q_GUARD_RELEASED_SECONDS_TODAY, Q_GUARD_RELEASES_RUNNING,
- Q_POMODORO_WINDOW, Q_POMODORO_WINDOW_MINI) = range(35)
+ Q_POMODORO_WINDOW, Q_POMODORO_WINDOW_MINI, Q_GUARD_SHIELDED, Q_GUARD_SHIELD_WINDOW, Q_GUARD_STRICT,
+ Q_DETOUR_LEFT, Q_GUARD_SWITCHES_TODAY, Q_COOLDOWN, Q_GUARD_ESCAPE_READY) = range(42)
 CMD_PREV_DAY, CMD_NEXT_DAY, CMD_TODAY = 101, 102, 103
 CMD_NEW_TAG, CMD_STOP, CMD_ADD_RECORD, CMD_UNDO = 106, 110, 111, 112
 CMD_THEME_LIGHT, CMD_THEME_DARK = 121, 122
@@ -40,10 +41,11 @@ CMD_POMODORO_ON, CMD_POMODORO_OFF, CMD_EXIT, CMD_SHOW = 136, 137, 138, 139
 CMD_NEW_CATEGORY = 143
 CMD_VIEW_DAY, CMD_VIEW_STATS, CMD_RANGE_WEEK, CMD_RANGE_MONTH, CMD_RANGE_YEAR = 145, 146, 148, 149, 150
 CMD_GUARD_SETTINGS, CMD_GUARD_OFF, CMD_RELEASE_END = 151, 154, 156
+CMD_GUARD_STRICT_ON, CMD_GUARD_STRICT_OFF = 157, 158
 # Focus guard: the reminder window's buttons, the settings dialog, the test stand-in for the window
 # in front (WM_COPYDATA with UTF-16 "exe<TAB>title"; DAYLEDGER_TEST_GUARD=1 enables it).
-GP_RELEASE, GP_ALLOW_KEYWORD, GP_SWITCH_FREE = 602, 604, 605
-GS_ENABLED, GS_GRACE, GS_REPEAT = 701, 702, 703
+GP_RELEASE, GP_ALLOW_KEYWORD, GP_SWITCH_FREE, GP_CLOSE_TAB = 602, 604, 605, 613
+GS_ENABLED, GS_GRACE, GS_REPEAT, GS_RELEASE, GS_SHIELD, GS_ESCAPES = 701, 702, 703, 704, 793, 794
 GUARD_TEST_DATA, WM_COPYDATA = 0x44474644, 0x4A
 PW_START, PW_MINI = 901, 904
 PHASE_READY, PHASE_FOCUS, PHASE_BREAK = 0, 1, 2
@@ -216,10 +218,11 @@ def same_family(color, base):
 
 
 def parse_tracker(path):
-    """Read the versioned little-endian ledger with UTF-8 names (TRACKER4 adds the category table,
-    TRACKER3 session flags, TRACKER2 the last-saved time)."""
+    """Read the versioned little-endian ledger with UTF-8 names (TRACKER6 adds the strict mode numbers,
+    TRACKER5 category flags and the focus guard, TRACKER4 the category table, TRACKER3 session flags,
+    TRACKER2 the last-saved time)."""
     data, offset = path.read_bytes(), 8
-    need(data[:8] in (b"TRACKER1", b"TRACKER2", b"TRACKER3", b"TRACKER4", b"TRACKER5"), "Invalid tracker header")
+    need(data[:7] == b"TRACKER" and data[7:8] in (b"1", b"2", b"3", b"4", b"5", b"6"), "Invalid tracker header")
     version = data[7] - ord("0")
 
     def number(size=4):
@@ -266,6 +269,7 @@ def parse_tracker(path):
     guard = None
     if version >= 5:            # the focus guard: settings, whitelist rules, distraction keywords
         enabled, grace, repeat, release, idle, options = (number() for _ in range(6))
+        shield, escapes = (number(), number()) if version >= 6 else (10, 3)
         rules = []
         for _ in range(number()):
             exe, mode = name(), number()
@@ -274,11 +278,11 @@ def parse_tracker(path):
             rules.append(dict(exe=exe, mode=mode, keywords=keywords, scope=scope))
         keywords = [name() for _ in range(number())]
         need(enabled in (0, 1) and grace <= 120 and 10 <= repeat <= 3600 and 1 <= release <= 240 and
-             30 <= idle <= 3600 and options < 8, "Invalid guard settings")
+             30 <= idle <= 3600 and options < 16 and shield <= 120 and escapes <= 20, "Invalid guard settings")
         need(all(r["mode"] in (0, 1, 2) and all(i in category_ids for i in r["scope"]) and
                  bool(r["keywords"]) == (r["mode"] == 2) for r in rules), "Invalid guard rules")
         guard = dict(enabled=enabled, grace=grace, repeat=repeat, release=release, idle=idle, options=options,
-                     rules=rules, keywords=keywords)
+                     shield=shield, escapes=escapes, rules=rules, keywords=keywords)
     need(offset == len(data), "Unexpected trailing bytes")
     ids = {t["id"] for t in tags}
     need(len(ids) == len(tags) and all(0 < i <= 0x7FFFFFFF for i in ids), "Invalid tag IDs")
@@ -559,6 +563,65 @@ def exercise(d, main, p, timeout, data, check):
     release = next(row for row in rows if row[0] == "R")
     need(release[6] == "msedge.exe" and release[7] == "知乎" and 2 <= int(release[3]) <= 4, "Release record wrong")
     check("guard_switch_to_free_time_and_log")
+
+    # strict mode (强制模式): an unanswered reminder becomes a cover; its ways out wait and are limited
+    # per day, released pages and free time come back by themselves, turning the guard off waits
+    d.command(main, CMD_GUARD_STRICT_ON)
+    until(lambda: q(Q_GUARD_STRICT) == 1 and q(Q_GUARD_ENABLED) == 1)
+    e = editor(CMD_GUARD_SETTINGS, "DayLedgerGuardSettings")     # nothing timed: opens at once
+    d.set_text(d.control(e, GS_RELEASE), "3")
+    d.set_text(d.control(e, GS_SHIELD), "1")
+    d.set_text(d.control(e, GS_ESCAPES), "2")
+    finish(e)
+    guard = parse_tracker(data)["guard"]
+    need(guard["options"] & 8 and guard["shield"] == 1 and guard["escapes"] == 2 and guard["release"] == 3,
+         "Strict settings not saved")
+    bili = "msedge.exe\t哔哩哔哩 (゜-゜)つロ 干杯~-bilibili - Microsoft Edge"
+    d.simulate(main, report)
+    d.command(main, CMD_TAG_FIRST + 0)
+    until(lambda: q(Q_ACTIVE) == 1 and q(Q_GUARD_STATE) == 1)
+    d.simulate(main, bili)
+    until(lambda: q(Q_GUARD_POPUP) == 1)                     # a reminder first
+    until(lambda: q(Q_GUARD_SHIELDED) == 1 and q(Q_GUARD_POPUP) == 0 and q(Q_GUARD_SHIELD_WINDOW) == 1)
+    shield = until(lambda: d.top(p.pid, "DayLedgerGuardShield"))
+    d.command(shield, GP_RELEASE)                            # too early: refused
+    time.sleep(0.5)
+    need(q(Q_GUARD_RELEASES_RUNNING) == 0 and q(Q_GUARD_SHIELDED) == 1, "Released before the wait")
+    until(lambda: q(Q_GUARD_ESCAPE_READY) == 1)
+    d.command(shield, GP_RELEASE)
+    until(lambda: q(Q_GUARD_SHIELDED) == 0 and q(Q_GUARD_RELEASES_RUNNING) == 1)
+    check("strict_cover_and_waiting_release")
+    until(lambda: q(Q_GUARD_RELEASES_RUNNING) == 0 and q(Q_GUARD_SHIELDED) == 1)   # ran out on the page
+    need(q(Q_GUARD_POPUP) == 0, "An expired release was reminded instead of covered")
+    time.sleep(2.5)
+    need(q(Q_GUARD_ESCAPE_READY) == 0, "More releases than the day allows")
+    d.command(shield, GP_RELEASE)
+    time.sleep(0.5)
+    need(q(Q_GUARD_RELEASES_RUNNING) == 0 and q(Q_GUARD_RELEASES_TODAY) == 2, "Release over the daily limit")
+    check("strict_snap_back_and_daily_limit")
+    d.command(shield, GP_SWITCH_FREE)                        # 记为… for the release length, then back
+    until(lambda: q(Q_ACTIVE) == 2 and q(Q_GUARD_SHIELDED) == 0 and q(Q_DETOUR_LEFT) > 0)
+    until(lambda: q(Q_ACTIVE) == 1 and q(Q_DETOUR_LEFT) == -1)
+    until(lambda: q(Q_GUARD_SHIELDED) == 1)                  # still on the page: covered at once
+    need(q(Q_GUARD_POPUP) == 0 and q(Q_GUARD_SWITCHES_TODAY) == 2, "Free time did not come back covered")
+    check("strict_free_time_comes_back")
+    d.command(shield, GP_CLOSE_TAB)
+    until(lambda: q(Q_GUARD_SHIELDED) == 0 and q(Q_GUARD_STATE) == 1 and q(Q_GUARD_SHIELD_WINDOW) == 0)
+    d.command(main, CMD_GUARD_OFF)                           # waits for the cooldown
+    cooldown = until(lambda: d.top(p.pid, "DayLedgerCooldown"))
+    need(q(Q_COOLDOWN) == 1 and q(Q_GUARD_ENABLED) == 1, "Guard turned off without the cooldown")
+    d.command(cooldown, IDOK)
+    time.sleep(0.5)
+    need(q(Q_GUARD_ENABLED) == 1, "Cooldown skipped")
+    time.sleep(2)
+    d.command(cooldown, IDOK)
+    until(lambda: q(Q_GUARD_ENABLED) == 0 and q(Q_COOLDOWN) == 0)
+    check("strict_cooldown_before_turning_off")
+    d.command(main, CMD_STOP)
+    until(lambda: q(Q_ACTIVE) == 0)
+    d.simulate(main, "")
+    d.command(main, CMD_GUARD_STRICT_OFF)                    # nothing timed: no cooldown
+    until(lambda: q(Q_GUARD_STRICT) == 0 and q(Q_COOLDOWN) == 0)
 
     d.command(main, CMD_POMODORO_ON)
     until(lambda: q(Q_POMODORO_MODE) == 1 and q(Q_POMODORO_PHASE) == PHASE_READY)

@@ -44,9 +44,27 @@ English | [简体中文](README.md)
   - allow only windows whose title contains given keywords.
   
   A rule can be limited to some categories, and the program can be picked from the ones running now.
-- The reminder offers: back to work, a **temporary release** (10 minutes by default, or 5–60 from a menu), adding a whitelist rule on the spot, or recording the time as a free-time tag from the moment the distraction began.
+- The reminder offers:
+  - back to work;
+  - a **temporary release** (10 minutes by default, or 5–60 from a menu);
+  - adding a whitelist rule on the spot;
+  - **free time** (记为…): recording the time as a free-time tag from the moment the distraction began. It also takes a length, and the timer goes back to the work tag when it runs out. A running pomodoro is held, not lost, and carries on afterwards.
 - Temporary releases are counted, together with the time actually spent on the released page. Distractions and releases are summed up on the statistics page.
 - Grace time, repeat interval, release length and the away-from-keyboard threshold are adjustable. Off by default: turn it on in 「⋯ → 专注守护设置」(focus guard settings).
+
+**Strict mode** (强制模式, in the settings or the 「⋯」 menu)
+
+- A reminder left unanswered (10 seconds by default) turns into a dark cover over the distracting window, and that program is muted.
+  - The cover goes away by itself once a whitelisted program is in front.
+  - Its main button is back to work; a browser tab can also be closed from it.
+- On the cover, a temporary release and free time open only after a 10-second wait, and each is limited per day (3 by default).
+- When a release or free time runs out while that page is still in front, it is covered at once, without grace.
+- During a focus, these wait for a 60-second cooldown:
+  - turning the guard or strict mode off;
+  - changing the guard settings;
+  - making a category, or the tag being timed, free time;
+  - quitting.
+- Stopping the timer is not held back: that is ending the work on purpose.
 
 **Pomodoro**
 
@@ -113,7 +131,7 @@ Right-click a category, a tag, or a record for more actions (for example, moving
 ## Data and privacy
 
 - Data directory: `%LOCALAPPDATA%\DayLedger\`
-  - `tracker.dat`: all records (TRACKER5 format with the category table and focus guard settings; TRACKER1–4 files still load. Once saved by this version, older builds can no longer open the file)
+  - `tracker.dat`: all records (TRACKER6 format with the category table and focus guard settings; TRACKER1–5 files still load. Once saved by this version, older builds can no longer open the file)
   - `guard.tsv`: distractions and temporary releases (a UTF-8 table that Excel opens)
   - `settings.ini`: settings
 - Everything stays on your machine; the app makes no network requests and has no telemetry. The focus guard reads the foreground window's program name and title locally only (title logging can be turned off)
@@ -125,7 +143,7 @@ Right-click a category, a tag, or a record for more actions (for example, moving
 src/time_tracker.cpp   Main program: window, custom-drawn UI, tray, Pomodoro screens, automation interface
 src/tracker_model.h    Data model, TRACKER format I/O, record editing API
 src/pomodoro.h         Pomodoro state machine (pure logic, unit-testable)
-src/focus_guard.h      Focus guard: whitelist matching, reminder rhythm, release timing, log format (pure logic, unit-testable)
+src/focus_guard.h      Focus guard: whitelist matching, reminder and cover rhythm, release timing, log format (pure logic, unit-testable)
 src/ui_kit.h           Theme, drawing helpers, icons, Chinese formatting
 src/time_tracker.rc    Icon and version resources
 src/app.manifest       DPI awareness and OS compatibility
@@ -141,10 +159,10 @@ Model, Pomodoro state machine and focus guard tests:
 ```sh
 g++ -std=c++17 -O2 -static tests/tracker_model_test.cpp -o build/tracker_model_test.exe
 ./build/tracker_model_test.exe
-# PASS: 360 checks
+# PASS: 374 checks
 g++ -std=c++17 -O2 -static tests/focus_guard_test.cpp -o build/focus_guard_test.exe
 ./build/focus_guard_test.exe
-# PASS: 72 checks
+# PASS: 92 checks
 ```
 
 Desktop smoke test (needs Windows Python and an interactive desktop):
@@ -160,7 +178,9 @@ The smoke test drives the UI through the app's built-in `WM_COMMAND` / `WM_DL_QU
 - The UI is Simplified Chinese only
 - Windows only
 - The MSVC build script has not been verified
-- The focus guard judges by program name and window title only (it cannot see page contents); exclusive full-screen games may cover the reminder
+- The focus guard judges by program name and window title only (it cannot see page contents)
+- Exclusive full-screen games may cover the reminder and the cover
+- Muting works on Windows audio sessions: a program that plays its sound through another process may not be muted
 
 ## License
 

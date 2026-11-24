@@ -1,8 +1,9 @@
 #pragma once
 // The focus guard (专注守护) without Windows: which window may be in front while a whitelist
-// category is timed, the reminder rhythm (grace, repeat after a dismiss), temporary releases
-// (临时放行: each one counted, with the time actually spent on the released window), and the lines
-// of the guard log. Driven by explicit timestamps like the pomodoro engine, so it is unit tested.
+// category is timed, the reminder rhythm (grace, repeat after a dismiss; in strict mode the cover
+// that follows an unanswered reminder), temporary releases (临时放行: each one counted, with the time
+// actually spent on the released window), and the lines of the guard log. Driven by explicit
+// timestamps like the pomodoro engine, so it is unit tested.
 
 #include <algorithm>
 #include <string>
@@ -289,8 +290,13 @@ struct GuardInput {
     int category = 0, tag = 0;          // what is being timed
 };
 
+// 强制模式 (strict): the shield's escape buttons wait this long; loosening the guard while focused
+// waits for the cooldown.
+constexpr long long kGuardEscapeWait = 10, kGuardCooldown = 60;
+
 struct GuardOutput {
     bool show = false, hide = false, refresh = false, sound = false;
+    bool cover = false;                 // 强制模式: the distracting window was just covered
     GuardResult result;                 // how the window in front was judged
     std::vector<GuardRecord> records;   // finished distractions and releases, for the log
 };
@@ -303,6 +309,10 @@ public:
     long long since = 0;                // when the current violation began
     long long alertedAt = 0, dismissedAt = 0, lastUpdate = 0;
     bool popupVisible = false;
+    bool shielded = false;              // 强制模式: distracting windows are covered until the episode ends
+    long long shieldedAt = 0;
+    bool snap = false;                  // a release or free time just ran out: the next violation is
+                                        // reminded of (and in strict mode covered) without grace
     int category = 0, tag = 0;          // what was timed when the violation began
     std::wstring exe, title, keyword;   // the latest violating window
     GuardReason reason = GuardReason::None;
@@ -331,6 +341,7 @@ public:
         if (out.result.verdict == GuardVerdict::Allowed) {
             if (state == GuardState::Alerting) endEpisode(now, L"returned", out);
             reset();
+            snap = false;
             lastRelease = out.result.release;
             return out;
         }
@@ -349,14 +360,26 @@ public:
             tag = in.tag;
         }
         if (state == GuardState::Pending) {
-            if (now - since >= static_cast<long long>(config.graceSeconds)) {
+            if (snap || now - since >= static_cast<long long>(config.graceSeconds)) {
                 state = GuardState::Alerting;
                 alertedAt = now;
                 dismissedAt = 0;
-                popupVisible = true;
-                out.show = out.sound = true;
+                out.sound = true;
+                if (config.strict() && (snap || config.shieldSeconds == 0)) coverNow(now, out);
+                else popupVisible = out.show = true;
+                snap = false;
             }
             return out;
+        }
+        if (config.strict()) {          // an unanswered reminder turns into the shield
+            if (!shielded && now - alertedAt >= static_cast<long long>(config.shieldSeconds)) coverNow(now, out);
+            else out.refresh = true;
+            return out;
+        }
+        if (shielded) {                 // strict mode was switched off: back to reminders
+            shielded = false;
+            shieldedAt = 0;
+            dismissedAt = 0;
         }
         if (!popupVisible && now - dismissedAt >= static_cast<long long>(config.repeatSeconds)) {
             popupVisible = true;
@@ -373,6 +396,16 @@ public:
         dismissedAt = now;
         return out;
     }
+
+    // 强制模式: the reminder was closed unanswered, so the window is covered now.
+    GuardOutput cover(long long now) {
+        GuardOutput out;
+        if (state == GuardState::Alerting) coverNow(now, out);
+        return out;
+    }
+
+    // Free time that was promised to end just did: the next violation gets no grace.
+    void armSnap() { snap = true; }
 
     // A user action settled the distraction ("allowed", "switched", ...).
     GuardOutput finish(long long now, const std::wstring& action) {
@@ -443,6 +476,7 @@ private:
     void expire(long long now, GuardOutput& out) {
         for (std::size_t i = 0; i < releases.size();) {
             if (now >= releases[i].until) {
+                if (lastRelease == static_cast<int>(i)) snap = true;   // its page is still in front
                 out.records.push_back(releaseRecord(releases[i], releases[i].until, L"expired"));
                 releases.erase(releases.begin() + static_cast<std::ptrdiff_t>(i));
                 if (lastRelease == static_cast<int>(i)) lastRelease = -1;
@@ -455,7 +489,17 @@ private:
         for (const auto& release : releases) out.records.push_back(releaseRecord(release, now, action));
         releases.clear();
         lastRelease = -1;
+        snap = false;
         reset();
+    }
+    void coverNow(long long now, GuardOutput& out) {
+        if (!shielded) {
+            shielded = true;
+            shieldedAt = now;
+            out.cover = true;
+        }
+        if (popupVisible) out.hide = true;
+        popupVisible = false;
     }
     void endEpisode(long long end, const std::wstring& action, GuardOutput& out) {
         GuardRecord record;
@@ -489,8 +533,8 @@ private:
     }
     void reset() {
         if (state != GuardState::Off) state = GuardState::Watching;
-        since = alertedAt = dismissedAt = 0;
-        popupVisible = false;
+        since = alertedAt = dismissedAt = shieldedAt = 0;
+        popupVisible = shielded = false;
         exe.clear();
         title.clear();
         keyword.clear();
